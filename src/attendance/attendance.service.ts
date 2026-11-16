@@ -615,12 +615,22 @@ export class AttendanceService {
       orderBy: { punchTime: 'asc' },
     });
 
-    // A day set by a regularization or an Excel import has no punches behind it. Deriving it from punches again would
-    // turn it into an absence and erase the approved or imported times, so such a row is left exactly as it is until
-    // someone records a real punch for the day.
+    // A day set by a regularization or an Excel import is not derived from punches. Deriving it from punches again would
+    // erase the approved or imported times, so such a row is left exactly as it is until someone records a real punch
+    // for the day *after* it was set. A regularized day usually still has the punch that started it (a punch-in with no
+    // punch-out): that punch predates the approval, so it must not undo it. Without this, the 01:00 / 08:00 sweeps
+    // rebuilt an approved day from that lone punch-in and turned it back into Incomplete with no Out time.
+    const approvedReg = existing?.regularization as unknown as RegularizationState | null | undefined;
+    const decidedAt =
+      existing?.source === AttendanceSource.REGULARIZED && approvedReg?.status === 'approved' && approvedReg.reviewedAt
+        ? new Date(approvedReg.reviewedAt)
+        : null;
+    const noPunchSinceSet =
+      punches.length === 0 ||
+      (!!decidedAt && !Number.isNaN(decidedAt.getTime()) && punches.every((p) => p.createdAt <= decidedAt));
     if (
       existing &&
-      punches.length === 0 &&
+      noPunchSinceSet &&
       (existing.source === AttendanceSource.REGULARIZED ||
         existing.source === AttendanceSource.EXCEL_IMPORT)
     ) {
