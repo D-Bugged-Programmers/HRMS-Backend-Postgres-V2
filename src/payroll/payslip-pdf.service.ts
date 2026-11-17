@@ -61,8 +61,18 @@ const INK_900 = '#14161d';
 const INK_600 = '#4c5262';
 const INK_400 = '#98a1b3';
 const BORDER = '#e5e7eb';
-const EARN_GREEN = '#0f9d58';
-const DEDUCT_RED = '#d93025';
+const EARN_GREEN = '#23584e';
+const DEDUCT_RED = '#b33e36';
+
+// The product theme (deep teal). Templates created before the teal theme still carry the old purple / near-black defaults;
+// those are shown in the theme colours so a payslip matches the app. Any colour an org chose itself is left exactly as set.
+const LEGACY_PRIMARY = '#5546e0';
+const LEGACY_SECONDARY = '#14161d';
+const THEME_PRIMARY = '#23584e';
+const THEME_SECONDARY = '#183b36';
+const THEME_SOFT = '#e0f4eb';
+const isLegacy = (hex: string | null | undefined, legacy: string) =>
+  (hex ?? '').trim().toLowerCase() === legacy;
 
 const FONT_MAP: Record<
   string,
@@ -465,9 +475,15 @@ export class PayslipPdfService {
     const money = (n: number | null | undefined) =>
       `${currencySymbol}${currencySymbol === 'Rs.' ? ' ' : ''}${Number(n || 0).toLocaleString('en-IN')}`;
 
-    const primary = safeHex(template.primaryColor, '#5546e0');
-    const secondary = safeHex(template.secondaryColor, '#14161d');
-    const headerColor = safeHex(template.headerColor, primary);
+    const primary = isLegacy(template.primaryColor, LEGACY_PRIMARY)
+      ? THEME_PRIMARY
+      : safeHex(template.primaryColor, THEME_PRIMARY);
+    const secondary = isLegacy(template.secondaryColor, LEGACY_SECONDARY)
+      ? THEME_SECONDARY
+      : safeHex(template.secondaryColor, THEME_SECONDARY);
+    const headerColor = isLegacy(template.headerColor, LEGACY_PRIMARY)
+      ? THEME_PRIMARY
+      : safeHex(template.headerColor, primary);
     const fonts = FONT_MAP[template.fontFamily] ?? FONT_MAP.HELVETICA;
 
     // companyLogoUrl is a durable relativeKey (see payroll-templates.service.ts's
@@ -827,14 +843,15 @@ export class PayslipPdfService {
         );
       }
 
+      // A light mint card in the theme, not a heavy dark block: the figure is what matters.
       doc
         .roundedRect(netX, y, netW, cardH, 8)
-        .fillAndStroke(secondary, secondary);
-      doc.font(fonts.regular).fontSize(8).fillColor('#FFFFFF');
+        .fillAndStroke(THEME_SOFT, THEME_SOFT);
+      doc.font(fonts.regular).fontSize(8).fillColor(INK_600);
       text('NET PAY', netX + 10, y + 12);
-      doc.font(fonts.bold).fontSize(19).fillColor('#FFFFFF');
+      doc.font(fonts.bold).fontSize(19).fillColor(secondary);
       text(money(run.netPay), netX + 10, y + 26, { width: netW - 20 });
-      doc.font(fonts.oblique).fontSize(6.6).fillColor('#d8d8e6');
+      doc.font(fonts.oblique).fontSize(6.6).fillColor(INK_600);
       text(run.netPayInWords || '', netX + 10, y + 54, {
         width: netW - 20,
         lineBreak: true,
