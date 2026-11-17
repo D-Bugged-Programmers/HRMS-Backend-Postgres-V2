@@ -225,7 +225,7 @@ export function renderSalaryStructurePdf(
       y += h;
     };
     const heading = (text: string) =>
-      line(text, '', '', { bold: true, h: rowH + 4, fill: TEAL_SOFT });
+      line(text, '', '', { bold: true, h: rowH + 6, fill: TEAL_SOFT });
 
     // header row
     ensureRoom(rowH + 4);
@@ -255,7 +255,7 @@ export function renderSalaryStructurePdf(
     const deductions = input.deductionLines ?? [];
     const dedMonthly = deductions.reduce((t, l) => t + l.amount, 0);
 
-    heading('A. Earnings');
+    heading('A  ·  EARNINGS');
     for (const e of b.earnings) {
       line(e.name, inr(e.monthly), inr(e.annual), { sub: e.basis });
     }
@@ -263,7 +263,7 @@ export function renderSalaryStructurePdf(
       bold: true,
     });
     if (employer.length > 0) {
-      heading('B. Employer Contributions (paid by the company)');
+      heading('B  ·  EMPLOYER CONTRIBUTIONS (paid by the company)');
       for (const l of employer) {
         line(l.name, inr(l.amount), inr(l.amount * 12));
       }
@@ -277,7 +277,7 @@ export function renderSalaryStructurePdf(
       );
     }
     if (deductions.length > 0) {
-      heading('C. Employee Deductions (taken from your pay)');
+      heading('C  ·  EMPLOYEE DEDUCTIONS (taken from your pay)');
       for (const l of deductions) {
         line(l.name, inr(l.amount), inr(l.amount * 12));
       }
