@@ -252,24 +252,64 @@ export function renderSalaryStructurePdf(
     const fixedWithEmployerMonthly = b.fixedMonthly + employerMonthly;
     const ctcAnnual = b.annualCTC + employerAnnual;
 
-    heading('Earnings');
+    const deductions = input.deductionLines ?? [];
+    const dedMonthly = deductions.reduce((t, l) => t + l.amount, 0);
+
+    heading('A. Earnings');
     for (const e of b.earnings) {
       line(e.name, inr(e.monthly), inr(e.annual), { sub: e.basis });
     }
-    line('Total earnings', inr(b.fixedMonthly), inr(b.fixedAnnual), {
+    line('Total A (Earnings)', inr(b.fixedMonthly), inr(b.fixedAnnual), {
       bold: true,
     });
     if (employer.length > 0) {
-      heading('Employer Contributions (paid by the company)');
+      heading('B. Employer Contributions (paid by the company)');
       for (const l of employer) {
         line(l.name, inr(l.amount), inr(l.amount * 12));
       }
       line(
-        'Total employer contributions',
+        'Total B (Employer contributions)',
         inr(employerMonthly),
         inr(employerAnnual),
         {
           bold: true,
+        },
+      );
+    }
+    if (deductions.length > 0) {
+      heading('C. Employee Deductions (taken from your pay)');
+      for (const l of deductions) {
+        line(l.name, inr(l.amount), inr(l.amount * 12));
+      }
+      line(
+        'Total C (Employee deductions)',
+        inr(dedMonthly),
+        inr(dedMonthly * 12),
+        {
+          bold: true,
+        },
+      );
+    }
+    // A + B is the fixed pay; A - C is what reaches the employee. Employer contributions never reach the employee.
+    line(
+      'TOTAL FIXED PAY (A + B)',
+      inr(fixedWithEmployerMonthly),
+      inr(b.fixedAnnual + employerAnnual),
+      {
+        bold: true,
+        fill: SHADE,
+        h: rowH + 4,
+      },
+    );
+    if (deductions.length > 0) {
+      line(
+        'NET TAKE-HOME (A - C), before income tax',
+        inr(b.fixedMonthly - dedMonthly),
+        inr(b.fixedAnnual - dedMonthly * 12),
+        {
+          bold: true,
+          fill: SHADE,
+          h: rowH + 4,
         },
       );
     }
@@ -283,44 +323,24 @@ export function renderSalaryStructurePdf(
         line(label, '', inr(v.annual));
       }
     }
-    line('COST TO COMPANY', inr(fixedWithEmployerMonthly), inr(ctcAnnual), {
-      bold: true,
-      fill: SHADE,
-      h: rowH + 4,
-    });
-
-    // What comes off the pay: shown after the CTC because it is not part of it.
-    const deductions = input.deductionLines ?? [];
-    if (deductions.length > 0) {
-      y += 14;
-      heading('Take-home: what you receive each month');
-      line(
-        'Total earnings (gross pay)',
-        inr(b.fixedMonthly),
-        inr(b.fixedAnnual),
-      );
-      for (const l of deductions) {
-        line(l.name, inr(l.amount), inr(l.amount * 12));
-      }
-      const dedMonthly = deductions.reduce((t, l) => t + l.amount, 0);
-      line('Less: total deductions', inr(dedMonthly), inr(dedMonthly * 12), {
+    line(
+      'COST TO COMPANY (fixed pay + variable)',
+      inr(fixedWithEmployerMonthly),
+      inr(ctcAnnual),
+      {
         bold: true,
-      });
-      line(
-        'Net pay = total earnings − deductions (before income tax)',
-        inr(b.fixedMonthly - dedMonthly),
-        inr((b.fixedMonthly - dedMonthly) * 12),
-        { bold: true, fill: SHADE, h: rowH + 4 },
-      );
-      ensureRoom(30);
-      doc.font('SS-Regular').fontSize(8.5).fillColor(INK_600);
-      doc.text(
-        'Net pay starts from your total earnings, not from the cost to company: employer contributions are paid by the company and never reach your bank account. A regular month with full attendance; income tax (TDS) and loan recoveries are worked out each month in payroll.',
-        MARGIN,
-        y + 8,
-        { width: CONTENT_W },
-      );
-    }
+        fill: SHADE,
+        h: rowH + 4,
+      },
+    );
+    ensureRoom(30);
+    doc.font('SS-Regular').fontSize(8.5).fillColor(INK_600);
+    doc.text(
+      'Employer contributions (B) are paid by the company and never reach your bank account; deductions (C) come out of your earnings (A). A regular month with full attendance; income tax (TDS) and loan recoveries are worked out each month in payroll.',
+      MARGIN,
+      y + 8,
+      { width: CONTENT_W },
+    );
     doc.end();
   });
 }
