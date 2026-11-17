@@ -25,14 +25,19 @@ import {
   type StructureBreakdown,
 } from './salary-structure-math';
 import { employeeCityClass, withCityHra } from './city-hra';
+import { PayrollService } from '../payroll/payroll.service';
 
 const PAGE_W = 595.28; // A4 portrait, points
 const MARGIN = 40;
 const CONTENT_W = PAGE_W - MARGIN * 2;
-const INK_900 = '#14161d';
-const INK_600 = '#4c5262';
-const BORDER = '#cfd4dc';
-const SHADE = '#f1f3f7';
+const INK_900 = '#183b36';
+const INK_600 = '#516b65';
+const BORDER = '#cfe0da';
+const SHADE = '#e0f4eb';
+// The product theme (deep teal); the column header and the total rows use it.
+const TEAL = '#23584e';
+const TEAL_SOFT = '#e9f1ee';
+const RED = '#b33e36';
 const MONTHS = [
   'January',
   'February',
@@ -59,6 +64,10 @@ export interface SalaryStructureDocInput {
   joiningDate: string;
   effectiveFrom: string;
   breakdown: StructureBreakdown;
+  /** What the employer pays on top of the pay, per month (PF, EDLI...). Part of the CTC. */
+  employerLines?: { name: string; amount: number }[];
+  /** What comes off the employee's pay in a regular month (PF, professional tax...). Not part of the CTC. */
+  deductionLines?: { name: string; amount: number }[];
 }
 
 const inr = (n: number) =>
@@ -122,7 +131,7 @@ export function renderSalaryStructurePdf(
       .stroke();
     y += 22;
 
-    doc.font('SS-Bold').fontSize(18).fillColor(INK_900);
+    doc.font('SS-Bold').fontSize(18).fillColor(TEAL);
     doc.text('SALARY STRUCTURE', MARGIN, y, { width: CONTENT_W });
     y = doc.y + 16;
 
@@ -216,12 +225,12 @@ export function renderSalaryStructurePdf(
       y += h;
     };
     const heading = (text: string) =>
-      line(text, '', '', { bold: true, h: rowH + 4 });
+      line(text, '', '', { bold: true, h: rowH + 4, fill: TEAL_SOFT });
 
     // header row
     ensureRoom(rowH + 4);
-    box(y, rowH + 4);
-    doc.font('SS-Bold').fontSize(10).fillColor(INK_900);
+    box(y, rowH + 4, TEAL);
+    doc.font('SS-Bold').fontSize(10).fillColor('#ffffff');
     doc.text('SALARY COMPONENTS', MARGIN + PAD, y + 9, {
       width: colA - PAD * 2,
     });
@@ -236,13 +245,37 @@ export function renderSalaryStructurePdf(
     y += rowH + 4;
 
     const b = input.breakdown;
+    const employer = input.employerLines ?? [];
+    const employerMonthly = employer.reduce((t, l) => t + l.amount, 0);
+    const employerAnnual = employerMonthly * 12;
+    // CTC = monthly earnings + what the employer pays on top + variable and one-time pay, so it matches the app.
+    const fixedWithEmployerMonthly = b.fixedMonthly + employerMonthly;
+    const ctcAnnual = b.annualCTC + employerAnnual;
+
     heading('Earnings');
     for (const e of b.earnings) {
       line(e.name, inr(e.monthly), inr(e.annual), { sub: e.basis });
     }
+    line('Total earnings', inr(b.fixedMonthly), inr(b.fixedAnnual), {
+      bold: true,
+    });
+    if (employer.length > 0) {
+      heading('Employer Contributions (paid by the company)');
+      for (const l of employer) {
+        line(l.name, inr(l.amount), inr(l.amount * 12));
+      }
+      line(
+        'Total employer contributions',
+        inr(employerMonthly),
+        inr(employerAnnual),
+        {
+          bold: true,
+        },
+      );
+    }
     const extras = [...b.variable, ...b.oneTime];
     if (extras.length > 0) {
-      heading('One Time Earnings');
+      heading('Variable & One Time Earnings');
       for (const v of extras) {
         const label = /variable/i.test(v.name)
           ? v.name
@@ -250,11 +283,39 @@ export function renderSalaryStructurePdf(
         line(label, '', inr(v.annual));
       }
     }
-    line('COST TO COMPANY', inr(b.fixedMonthly), inr(b.annualCTC), {
+    line('COST TO COMPANY', inr(fixedWithEmployerMonthly), inr(ctcAnnual), {
       bold: true,
       fill: SHADE,
       h: rowH + 4,
     });
+
+    // What comes off the pay: shown after the CTC because it is not part of it.
+    const deductions = input.deductionLines ?? [];
+    if (deductions.length > 0) {
+      y += 14;
+      heading('Deductions from your pay (regular month)');
+      for (const l of deductions) {
+        line(l.name, inr(l.amount), inr(l.amount * 12));
+      }
+      const dedMonthly = deductions.reduce((t, l) => t + l.amount, 0);
+      line('Total deductions', inr(dedMonthly), inr(dedMonthly * 12), {
+        bold: true,
+      });
+      line(
+        'Net monthly pay (before income tax)',
+        inr(b.fixedMonthly - dedMonthly),
+        inr((b.fixedMonthly - dedMonthly) * 12),
+        { bold: true, fill: SHADE, h: rowH + 4 },
+      );
+      ensureRoom(30);
+      doc.font('SS-Regular').fontSize(8.5).fillColor(INK_600);
+      doc.text(
+        'Net pay is the regular month with full attendance; income tax (TDS) and loan recoveries are worked out each month in payroll.',
+        MARGIN,
+        y + 8,
+        { width: CONTENT_W },
+      );
+    }
     doc.end();
   });
 }
@@ -263,6 +324,7 @@ export function renderSalaryStructurePdf(
 export class SalaryStructurePdfService {
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
+    private readonly payrollService: PayrollService,
   ) {}
 
   async build(
@@ -337,6 +399,10 @@ export class SalaryStructurePdfService {
         'This employee has no salary structure on file yet.',
       );
     }
+    // The employer's cost and the employee's deductions for a regular month, from the same calculation payroll runs.
+    const costs = await this.payrollService
+      .structureCosts(organizationId, employeeId)
+      .catch(() => null);
     const logo = org?.companyLogoUrl
       ? await readStoredFile(org.companyLogoUrl).catch(() => null)
       : null;
@@ -353,6 +419,8 @@ export class SalaryStructurePdfService {
         : '',
       effectiveFrom: breakdown.effectiveFrom ?? asOf,
       breakdown,
+      employerLines: costs?.employerLines,
+      deductionLines: costs?.deductionLines,
     });
     const filename = `${`${employee.employeeId}-Salary Structure`
       .replace(/[\\/:*?"<>|\r\n]+/g, ' ')

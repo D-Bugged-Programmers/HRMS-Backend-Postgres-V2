@@ -70,6 +70,7 @@ import { HoldPayrollDto } from './dto/hold-payroll.dto';
 import {
   computeStructurePreview,
   employerMonthlyForStructure,
+  structureCostLines,
   monthlyFiguresForStructure,
 } from './structure-preview';
 import { StructurePreviewDto } from './dto/structure-preview.dto';
@@ -1653,6 +1654,34 @@ export class PayrollService {
       orderBy: { displayOrder: 'asc' },
     });
     return { settings, components, today };
+  }
+
+  // The employer's cost lines and the employee's deduction lines for one employee's saved structure, for a regular month.
+  // Used by the CTC views and the Salary Structure document, so every place shows the same figures.
+  async structureCosts(organizationId: string, employeeId: string) {
+    const { settings, components, today } =
+      await this.packageContext(organizationId);
+    const user = await this.scopedPrisma.user.findFirst({
+      where: { id: employeeId, organizationId },
+      select: {
+        id: true,
+        workLocation: { select: { cityClass: true } },
+        department: {
+          select: { workLocation: { select: { cityClass: true } } },
+        },
+      },
+    });
+    const rows = await this.scopedPrisma.employeeSalaryComponent.findMany({
+      where: { organizationId, employeeId },
+    });
+    const cityClass = user
+      ? (effectiveWorkLocation(user)?.cityClass ?? 'NON_METRO')
+      : 'NON_METRO';
+    return structureCostLines({
+      components: withCityHra(components, cityClass),
+      settings,
+      rows: resolveCurrentRows(rows, today),
+    });
   }
 
   // What the employer pays on top of each employee's pay every month (PF, EDLI, admin charge, ESI, gratuity and bonus

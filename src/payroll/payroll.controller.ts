@@ -124,11 +124,16 @@ export class PayrollController {
   // The same for the caller's own structure - any authenticated employee, since it is their own CTC.
   @Get('employer-cost/me')
   async employerCostMine(@CurrentUser() caller: Caller) {
-    const [mine] = await this.payrollService.employerCost(
+    const costs = await this.payrollService.structureCosts(
       caller.organizationId,
       caller.id,
     );
-    return { employerMonthly: mine?.employerMonthly ?? 0 };
+    return {
+      employerMonthly: costs.employerTotal,
+      lines: costs.employerLines,
+      deductionMonthly: costs.deductionTotal,
+      deductionLines: costs.deductionLines,
+    };
   }
 
   // The checklist before running a month: missing salary structures, bank details, unmarked attendance, joiners and

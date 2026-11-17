@@ -222,7 +222,35 @@ function evaluateStructure(
       amount: Math.round(l.amount),
     }))
     .filter((l) => l.amount > 0);
+  // What comes off the employee's pay in a regular month (PF, professional tax, ESI...), worked out with the same resolver.
+  const deductionComponents = components.filter(
+    (c) =>
+      c.type === SalaryComponentType.DEDUCTION &&
+      !c.isEmployerContribution &&
+      isComponentApplicable(
+        c,
+        overrides.get(c.code) ?? null,
+        PREVIEW_MONTH,
+        settings,
+      ),
+  );
+  const deducted = resolveGroup(
+    deductionComponents,
+    overrides,
+    { ...afterEarnings, TOTAL_DEDUCTIONS: 0 },
+    1,
+    Math.round,
+  );
+  const deductionLines = deducted.results
+    .map((l) => ({
+      code: l.code,
+      name: l.name,
+      amount: Math.round(l.amount),
+    }))
+    .filter((l) => l.amount > 0);
   return {
+    deductionLines,
+    deductionTotal: deductionLines.reduce((s, l) => s + l.amount, 0),
     earnedLines: earned.results.map((l) => ({
       code: l.code,
       name: l.name,
@@ -277,6 +305,57 @@ export function employerMonthlyForStructure(args: {
     overrides,
     fullMonthBase(args.settings),
   ).employerTotal;
+}
+
+/**
+ * The employer's cost lines and the employee's deduction lines for a saved structure, for one regular month: what the CTC
+ * adds on top of the pay (PF, EDLI, admin charge, ESI...) and what comes off the pay (PF, professional tax...). Pass the
+ * components with their HRA already following the work location (see city-hra.ts).
+ */
+export function structureCostLines(args: {
+  components: SalaryComponent[];
+  settings: OverlaidSettings;
+  rows: SavedStructureRow[];
+}): {
+  employerLines: { code: string; name: string; amount: number }[];
+  employerTotal: number;
+  deductionLines: { code: string; name: string; amount: number }[];
+  deductionTotal: number;
+} {
+  const none = {
+    employerLines: [],
+    employerTotal: 0,
+    deductionLines: [],
+    deductionTotal: 0,
+  };
+  const components = args.components.filter((c) => c.isActive);
+  if (!args.rows.some((r) => r.isEnabled !== false)) return none;
+  const overrides = new Map<string, EmployeeSalaryComponent>();
+  for (const r of args.rows) {
+    overrides.set(
+      r.componentCode,
+      override(r.componentCode, {
+        valueType: r.valueType as CalcType,
+        fixedAmount: r.fixedAmount ?? null,
+        percentageValue: r.percentageValue ?? null,
+        percentageOf: r.percentageOf ?? null,
+        amountBasis: (r.amountBasis ?? 'MONTHLY') as 'MONTHLY' | 'ANNUAL',
+        isEnabled: r.isEnabled !== false,
+      }),
+    );
+  }
+  const e = evaluateStructure(
+    components,
+    args.settings,
+    overrides,
+    fullMonthBase(args.settings),
+  );
+  return {
+    employerLines: e.employerLines,
+    employerTotal: e.employerTotal,
+    deductionLines: e.deductionLines,
+    deductionTotal: e.deductionTotal,
+  };
 }
 
 /**
