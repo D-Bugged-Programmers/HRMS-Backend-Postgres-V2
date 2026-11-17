@@ -293,16 +293,21 @@ export function renderSalaryStructurePdf(
     const deductions = input.deductionLines ?? [];
     if (deductions.length > 0) {
       y += 14;
-      heading('Deductions from your pay (regular month)');
+      heading('Take-home: what you receive each month');
+      line(
+        'Total earnings (gross pay)',
+        inr(b.fixedMonthly),
+        inr(b.fixedAnnual),
+      );
       for (const l of deductions) {
         line(l.name, inr(l.amount), inr(l.amount * 12));
       }
       const dedMonthly = deductions.reduce((t, l) => t + l.amount, 0);
-      line('Total deductions', inr(dedMonthly), inr(dedMonthly * 12), {
+      line('Less: total deductions', inr(dedMonthly), inr(dedMonthly * 12), {
         bold: true,
       });
       line(
-        'Net monthly pay (before income tax)',
+        'Net pay = total earnings − deductions (before income tax)',
         inr(b.fixedMonthly - dedMonthly),
         inr((b.fixedMonthly - dedMonthly) * 12),
         { bold: true, fill: SHADE, h: rowH + 4 },
@@ -310,7 +315,7 @@ export function renderSalaryStructurePdf(
       ensureRoom(30);
       doc.font('SS-Regular').fontSize(8.5).fillColor(INK_600);
       doc.text(
-        'Net pay is the regular month with full attendance; income tax (TDS) and loan recoveries are worked out each month in payroll.',
+        'Net pay starts from your total earnings, not from the cost to company: employer contributions are paid by the company and never reach your bank account. A regular month with full attendance; income tax (TDS) and loan recoveries are worked out each month in payroll.',
         MARGIN,
         y + 8,
         { width: CONTENT_W },
