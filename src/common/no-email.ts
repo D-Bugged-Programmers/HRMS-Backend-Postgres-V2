@@ -22,9 +22,12 @@ export interface LoginPolicy {
 
 export function readLoginPolicy(policies: unknown): LoginPolicy {
   const p = (policies ?? {}) as { loginMethod?: unknown; allowNoEmail?: unknown };
+  const method: LoginMethod = (LOGIN_METHODS as readonly unknown[]).includes(p.loginMethod) ? (p.loginMethod as LoginMethod) : 'EMAIL_OR_ID';
   return {
-    method: (LOGIN_METHODS as readonly unknown[]).includes(p.loginMethod) ? (p.loginMethod as LoginMethod) : 'EMAIL_OR_ID',
-    allowNoEmail: p.allowNoEmail === true,
+    method,
+    // The sign-in method decides it: where people can sign in with their employee ID ("Email or employee ID" or "Employee ID only") an email is
+    // optional; only "Email only" requires one. (The stored allowNoEmail switch alone used to decide, so a default company had to turn it on.)
+    allowNoEmail: method !== 'EMAIL',
   };
 }
 

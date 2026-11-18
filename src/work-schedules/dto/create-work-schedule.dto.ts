@@ -6,10 +6,12 @@ import {
   IsBoolean,
   IsInt,
   IsOptional,
+  IsNumber,
   IsString,
   Max,
   Min,
   MinLength,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
 
@@ -49,13 +51,47 @@ export class CreateWorkScheduleDto {
   @Max(6, { each: true })
   workingDays!: number[];
 
-  @ApiProperty({ example: '09:30' })
-  @IsString()
-  startTime!: string;
+  // Flexible shift: no fixed start or end time - people work any time and the hours worked decide Present / Half Day.
+  @ApiPropertyOptional({ default: false })
+  @IsOptional()
+  @IsBoolean()
+  isFlexible?: boolean;
 
-  @ApiProperty({ example: '18:30' })
+  @ApiPropertyOptional({
+    example: 8,
+    description: 'Hours worked for a full Present day (flexible shifts).',
+  })
+  @ValidateIf((o: CreateWorkScheduleDto) => o.isFlexible === true)
+  @IsNumber()
+  @Min(1)
+  @Max(24)
+  flexFullDayHours?: number;
+
+  @ApiPropertyOptional({
+    example: 4,
+    description: 'Hours worked for a Half Day (flexible shifts).',
+  })
+  @ValidateIf((o: CreateWorkScheduleDto) => o.isFlexible === true)
+  @IsNumber()
+  @Min(0.5)
+  @Max(24)
+  flexHalfDayHours?: number;
+
+  @ApiPropertyOptional({
+    example: '09:30',
+    description: 'Not used for a flexible shift.',
+  })
+  @ValidateIf((o: CreateWorkScheduleDto) => o.isFlexible !== true)
   @IsString()
-  endTime!: string;
+  startTime?: string;
+
+  @ApiPropertyOptional({
+    example: '18:30',
+    description: 'Not used for a flexible shift.',
+  })
+  @ValidateIf((o: CreateWorkScheduleDto) => o.isFlexible !== true)
+  @IsString()
+  endTime?: string;
 
   // Mandatory, at least 1: the attendance engine takes it off the worked time before judging Present / Half Day.
   @ApiProperty({ example: 60 })

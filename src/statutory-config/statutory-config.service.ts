@@ -193,28 +193,49 @@ export class StatutoryConfigService {
       );
     }
 
-    // Versioning is append-only: a new version must start strictly after
-    // every existing version's effectiveFrom for this module. Without this
-    // check, a backdated create() would still blindly close out whichever
-    // row currently has effectiveTo: null — even when that row's
-    // effectiveFrom is AFTER the new (earlier) date — producing an inverted
-    // range (effectiveFrom > effectiveTo) that can never resolve in
-    // getEffective() and silently orphans that version's data.
+    // A new version normally starts after the latest one. A past date (before the latest
+    // version) is allowed only before the first payroll run - the set-up case, where history
+    // from before go-live is being entered. The version is then slotted
+    // into the timeline (below) so ranges never overlap or invert.
     const latest = await this.scopedPrisma.statutoryConfigVersion.findFirst({
       where: { organizationId, module },
       orderBy: { effectiveFrom: 'desc' },
     });
     if (latest && dto.effectiveFrom < latest.effectiveFrom) {
-      throw new BadRequestException(
-        `New version must start after the most recent version's effective date (${dmyText(latest.effectiveFrom)}). Versions must be created in chronological order — backdating before the latest version is not supported.`,
-      );
+      // Back-dating is for org set-up only: once any payroll run exists (draft included), history is fixed.
+      const anyRun = await this.scopedPrisma.payrollRun.findFirst({
+        where: { organizationId },
+        select: { id: true },
+      });
+      if (anyRun) {
+        throw new BadRequestException(
+          `New version must start after the most recent version's effective date (${dmyText(latest.effectiveFrom)}). Past dates can only be added while setting up the organization, before the first payroll run.`,
+        );
+      }
     }
 
     await this.assertNotFinalized(module, dto.effectiveFrom, organizationId);
 
-    const current = await this.scopedPrisma.statutoryConfigVersion.findFirst({
-      where: { organizationId, module, effectiveTo: null },
-    });
+    // The version just before the new date is closed on the day before it; the version just
+    // after it (past-date case) bounds the new version's own end date.
+    const [prev, next] = await Promise.all([
+      this.scopedPrisma.statutoryConfigVersion.findFirst({
+        where: {
+          organizationId,
+          module,
+          effectiveFrom: { lt: dto.effectiveFrom },
+        },
+        orderBy: { effectiveFrom: 'desc' },
+      }),
+      this.scopedPrisma.statutoryConfigVersion.findFirst({
+        where: {
+          organizationId,
+          module,
+          effectiveFrom: { gt: dto.effectiveFrom },
+        },
+        orderBy: { effectiveFrom: 'asc' },
+      }),
+    ]);
     // Closing out the current version and creating the new one must commit
     // together — previously these were two independent writes, so a crash/
     // timeout between them left the org with the current version closed but
@@ -223,9 +244,9 @@ export class StatutoryConfigService {
     // silently fail (or fall back incorrectly) for every employee until
     // someone noticed and manually created a new version.
     const created = await this.scopedPrisma.$transaction(async (tx) => {
-      if (current) {
+      if (prev) {
         await tx.statutoryConfigVersion.updateMany({
-          where: { id: current.id, organizationId },
+          where: { id: prev.id, organizationId },
           data: { effectiveTo: dayBefore(dto.effectiveFrom) },
         });
       }
@@ -234,6 +255,7 @@ export class StatutoryConfigService {
           organizationId,
           module,
           effectiveFrom: dto.effectiveFrom,
+          effectiveTo: next ? dayBefore(next.effectiveFrom) : null,
           config: dto.config as Prisma.InputJsonValue,
           isEnabled: dto.isEnabled ?? true,
           notes: dto.notes ?? '',
@@ -264,11 +286,19 @@ export class StatutoryConfigService {
     if (!row)
       throw new NotFoundException('Statutory config version not found.');
 
+    // A version already in force can be deleted only during org set-up (no payroll run yet);
+    // a scheduled future one can always be removed.
     const today = localDateStr(await this.getOrgTimezone(organizationId));
     if (row.effectiveFrom <= today) {
-      throw new BadRequestException(
-        'Only a future-dated version can be deleted — past and current versions are permanent history.',
-      );
+      const anyRun = await this.scopedPrisma.payrollRun.findFirst({
+        where: { organizationId },
+        select: { id: true },
+      });
+      if (anyRun) {
+        throw new BadRequestException(
+          'Only a future-dated version can be deleted once payroll has run - past and current versions are permanent history.',
+        );
+      }
     }
 
     const count = await this.scopedPrisma.statutoryConfigVersion.count({
@@ -293,7 +323,8 @@ export class StatutoryConfigService {
           module,
           effectiveTo: dayBefore(row.effectiveFrom),
         },
-        data: { effectiveTo: null },
+        // The version before it takes over the deleted one's range (open-ended if it was the latest).
+        data: { effectiveTo: row.effectiveTo },
       }),
     ]);
 
@@ -316,7 +347,12 @@ export class StatutoryConfigService {
     const today = localDateStr(await this.getOrgTimezone(organizationId));
     const versions = await this.scopedPrisma.statutoryConfigVersion.findMany({
       where: { organizationId },
-      select: { module: true, effectiveFrom: true, effectiveTo: true, isEnabled: true },
+      select: {
+        module: true,
+        effectiveFrom: true,
+        effectiveTo: true,
+        isEnabled: true,
+      },
     });
     return summariseModules(Object.values(StatutoryModule), versions, today);
   }

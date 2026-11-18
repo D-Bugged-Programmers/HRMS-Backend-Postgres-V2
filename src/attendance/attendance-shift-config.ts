@@ -32,6 +32,9 @@ export interface ShiftConfig {
   // resolveAttendanceDateForPunch for how this changes punch-to-date
   // attribution and the check-in/check-out pairing window.
   crossesMidnight: boolean;
+  // Flexible shift: no fixed start or end (shift times are 00:00-23:59 placeholders). Never late or early-out; the hours worked
+  // decide Present / Half Day and overtime counts beyond minHoursForPresent.
+  flexible?: boolean;
   // IANA timezone the shift times are wall-clock in (the organisation's). Shift start/end, grace thresholds and the
   // shift-day boundary are evaluated in it; absent = the schema default for organisations, Asia/Kolkata.
   timezone?: string;
@@ -51,6 +54,7 @@ export interface DepartmentShiftFields {
   weeklyOffs: unknown;
   breakMinutes: number;
   crossesMidnight: boolean;
+  isFlexibleShift?: boolean;
 }
 
 export interface OrganizationAttendancePrefs {
@@ -160,6 +164,7 @@ function resolveShiftConfigWithoutZone(
       ),
       breakMinutes: department.breakMinutes,
       crossesMidnight: department.crossesMidnight,
+      flexible: department.isFlexibleShift === true,
     };
   }
 

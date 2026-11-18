@@ -1,3 +1,4 @@
+import { CompanyBrandsModule } from '../company-brands/company-brands.module';
 import { Module } from '@nestjs/common';
 import { ReportsController } from './reports.controller';
 import { ReportsService } from './reports.service';
@@ -27,6 +28,7 @@ import { FieldTrackingModule } from '../field-tracking/field-tracking.module';
     NotificationsModule,
     AuditLogModule,
     FieldTrackingModule,
+    CompanyBrandsModule,
   ],
   controllers: [
     StatutoryFilingsController,

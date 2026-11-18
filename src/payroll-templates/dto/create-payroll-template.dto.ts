@@ -2,6 +2,8 @@ import { IsIndianMobile } from '../../common/indian-mobile';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  IsArray,
   IsBoolean,
   IsEmail,
   IsEnum,
@@ -185,6 +187,13 @@ export class CreatePayrollTemplateDto {
   @IsOptional()
   @IsBoolean()
   showEmployerContributions?: boolean;
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsString({ each: true })
+  @MaxLength(60, { each: true })
+  hiddenEmployerContributionCodes?: string[];
   @ApiPropertyOptional()
   @IsOptional()
   @IsBoolean()

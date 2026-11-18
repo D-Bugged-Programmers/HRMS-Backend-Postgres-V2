@@ -23,8 +23,10 @@ import {
   IsIn,
   IsInt,
   IsOptional,
+  IsString,
   Matches,
   Max,
+  MaxLength,
   Min,
 } from 'class-validator';
 import { ExportAuditInterceptor } from '../common/sensitive-audit';
@@ -65,6 +67,12 @@ export class ReturnQueryDto {
   @IsOptional()
   @IsIn(['xlsx', 'csv', 'pdf'])
   format?: ReportFormat;
+
+  // 'ALL' (or left out) = every company with the organization's codes; 'MAIN' = people with no sister company; or a sister company's id.
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class BonusQueryDto {
@@ -74,6 +82,12 @@ export class BonusQueryDto {
     message: 'financialYear must look like 2026-27.',
   })
   financialYear: string = currentFinancialYear();
+
+  // 'ALL' (or left out) = every company; 'MAIN' = people with no sister company; or a sister company's id.
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 @ApiTags('reports')
@@ -93,10 +107,13 @@ export class StatutoryReturnsController {
   @Get('statutory-dues')
   async statutoryDues(@Query() q: ReturnQueryDto, @CurrentUser() c: Caller) {
     const [pf, esi, pt, lwf] = await Promise.all([
-      this.ecr.build(q.month, q.year, c.organizationId, { skipInvalid: true }),
-      this.service.esic(q.month, q.year, c.organizationId),
-      this.service.pt(q.month, q.year, c.organizationId),
-      this.service.lwf(q.month, q.year, c.organizationId),
+      this.ecr.build(q.month, q.year, c.organizationId, {
+        skipInvalid: true,
+        companyId: q.companyId,
+      }),
+      this.service.esic(q.month, q.year, c.organizationId, q.companyId),
+      this.service.pt(q.month, q.year, c.organizationId, q.companyId),
+      this.service.lwf(q.month, q.year, c.organizationId, q.companyId),
     ]);
     return {
       month: q.month,
@@ -112,7 +129,7 @@ export class StatutoryReturnsController {
 
   @Get('esic-return/preview')
   esicPreview(@Query() q: ReturnQueryDto, @CurrentUser() c: Caller) {
-    return this.service.esic(q.month, q.year, c.organizationId);
+    return this.service.esic(q.month, q.year, c.organizationId, q.companyId);
   }
 
   @Get('esic-return')
@@ -122,7 +139,12 @@ export class StatutoryReturnsController {
     @CurrentUser() c: Caller,
     @Res() res: Response,
   ) {
-    const r = await this.service.esic(q.month, q.year, c.organizationId);
+    const r = await this.service.esic(
+      q.month,
+      q.year,
+      c.organizationId,
+      q.companyId,
+    );
     if (r.members === 0) {
       throw new BadRequestException(
         'No ESIC-covered members found in locked payroll for this month — nothing to upload.',
@@ -160,7 +182,7 @@ export class StatutoryReturnsController {
   @Get('pt-return/preview')
   ptPreview(@Query() q: ReturnQueryDto, @CurrentUser() c: Caller) {
     return this.service
-      .pt(q.month, q.year, c.organizationId)
+      .pt(q.month, q.year, c.organizationId, q.companyId)
       .then(({ members, ...rest }) => ({
         ...rest,
         employees: members.length,
@@ -178,6 +200,7 @@ export class StatutoryReturnsController {
       q.month,
       q.year,
       c.organizationId,
+      q.companyId,
     );
     await sendReportBranded(res, this.scopedPrisma, c.organizationId, {
       ...report,
@@ -196,6 +219,7 @@ export class StatutoryReturnsController {
       q.month,
       q.year,
       c.organizationId,
+      q.companyId,
     );
     await sendReportBranded(res, this.scopedPrisma, c.organizationId, {
       ...report,
@@ -206,13 +230,17 @@ export class StatutoryReturnsController {
   // Annual statutory bonus payable for a financial year (HR/Admin).
   @Get('statutory-bonus')
   statutoryBonus(@Query() q: BonusQueryDto, @CurrentUser() c: Caller) {
-    return this.service.statutoryBonus(q.financialYear, c.organizationId);
+    return this.service.statutoryBonus(
+      q.financialYear,
+      c.organizationId,
+      q.companyId,
+    );
   }
 
   @Get('lwf-return/preview')
   lwfPreview(@Query() q: ReturnQueryDto, @CurrentUser() c: Caller) {
     return this.service
-      .lwf(q.month, q.year, c.organizationId)
+      .lwf(q.month, q.year, c.organizationId, q.companyId)
       .then(({ members, ...rest }) => ({
         ...rest,
         employees: members.length,
@@ -230,6 +258,7 @@ export class StatutoryReturnsController {
       q.month,
       q.year,
       c.organizationId,
+      q.companyId,
     );
     await sendReportBranded(res, this.scopedPrisma, c.organizationId, {
       ...report,

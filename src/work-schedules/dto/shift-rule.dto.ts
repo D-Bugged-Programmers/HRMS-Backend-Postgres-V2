@@ -56,6 +56,11 @@ export class SaveShiftRuleDto {
   @IsString({ each: true })
   employeeIds?: string[];
 
+  // Makes this a rule of that work schedule: it follows the departments the schedule is assigned to (gender rules only).
+  @IsOptional()
+  @IsString()
+  workScheduleId?: string;
+
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;

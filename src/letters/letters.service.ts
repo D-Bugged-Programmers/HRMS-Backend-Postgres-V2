@@ -549,6 +549,9 @@ export class LettersService {
     const companyName = branding?.brandId
       ? branding.companyName
       : organization.companyName || 'the Company';
+    const registration = branding?.brandId
+      ? branding.registration
+      : organization;
     const policies = (organization.policies ?? {}) as {
       currencySymbol?: string;
     };
@@ -588,14 +591,15 @@ export class LettersService {
           ? branding.address
           : organization.registeredAddress) || '',
       // Organization Settings > Registration Details ('—' when not filled in).
-      companyGstin: organization.gstin?.trim() || '—',
-      companyPan: organization.pan?.trim() || '—',
-      companyTan: organization.tan?.trim() || '—',
-      companyCin: organization.cin?.trim() || '—',
-      companyRegistrationNumber: organization.registrationNumber?.trim() || '—',
-      companyLin: organization.lin?.trim() || '—',
-      companyMsmeNumber: organization.msmeRegistrationNumber?.trim() || '—',
-      companyLabourLicense: organization.labourLicenseNumber?.trim() || '—',
+      // A sister company's letter shows ITS registration details (blank = '—', never the parent's).
+      companyGstin: registration.gstin?.trim() || '—',
+      companyPan: registration.pan?.trim() || '—',
+      companyTan: registration.tan?.trim() || '—',
+      companyCin: registration.cin?.trim() || '—',
+      companyRegistrationNumber: registration.registrationNumber?.trim() || '—',
+      companyLin: registration.lin?.trim() || '—',
+      companyMsmeNumber: registration.msmeRegistrationNumber?.trim() || '—',
+      companyLabourLicense: registration.labourLicenseNumber?.trim() || '—',
       issueDate: formatDateDisplay(new Date()),
       // Available on every dataProfile (not just BASIC) since it's a
       // plain employee-record field, same as designation/department above

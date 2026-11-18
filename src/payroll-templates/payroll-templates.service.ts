@@ -61,6 +61,7 @@ const DRAFT_DEFAULTS: PayrollTemplate = {
   showPFNumber: true,
   showBankDetails: true,
   showEmployerContributions: true,
+  hiddenEmployerContributionCodes: [],
   showCTC: true,
   showYTD: true,
   showQRCode: true,

@@ -6,6 +6,7 @@
 //   reports sees only those reports' requests, and only the request types a manager can decide (not finance/loan
 //   types). An approver never counts their own requests. Respects the recipient's "email notifications" preference
 //   and an org that has disabled the template (no email at all, unlike the generic fallback behaviour elsewhere).
+import { isOvertimePayEnabled } from '../overtime/overtime-pay';
 import { managerIdsOf } from '../common/managers';
 import { REQUEST_TYPE_MODULE, disabledModulesOf } from '../module-access/module-gate';
 import { NotificationCategory } from '@prisma/client';
@@ -229,11 +230,14 @@ export class ApprovalsDigestService {
         where: { organizationId, status: 'PENDING' },
         _count: { _all: true },
       }),
-      p.overtimeRecord.groupBy({
-        by: ['employeeId'],
-        where: { organizationId, status: 'PENDING' },
-        _count: { _all: true },
-      }),
+      // Overtime switched off for the org: it is left out of the digest.
+      (await isOvertimePayEnabled(p, organizationId))
+        ? p.overtimeRecord.groupBy({
+            by: ['employeeId'],
+            where: { organizationId, status: 'PENDING' },
+            _count: { _all: true },
+          })
+        : Promise.resolve([]),
       p.leaveEncashment.groupBy({
         by: ['employeeId'],
         where: { organizationId, status: 'PENDING' },

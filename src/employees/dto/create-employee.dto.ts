@@ -1,7 +1,26 @@
 import { IsIndianMobile } from '../../common/indian-mobile';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsEmail, IsEnum, IsNotEmpty, IsOptional, IsString, IsUUID, Matches, MaxLength, ValidateIf, IsArray, ArrayMaxSize } from 'class-validator';
-import { Gender, LocationRequirement, Role, SelfieRequirement } from '@prisma/client';
+import {
+  IsBoolean,
+  IsIn,
+  IsEmail,
+  IsEnum,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  MaxLength,
+  ValidateIf,
+  IsArray,
+  ArrayMaxSize,
+} from 'class-validator';
+import {
+  Gender,
+  LocationRequirement,
+  Role,
+  SelfieRequirement,
+} from '@prisma/client';
 import { NormalizeEmail, Trim } from '../../common/normalize-input';
 import { IsReasonableJoiningDate } from '../../common/is-reasonable-joining-date.validator';
 import {
@@ -54,6 +73,12 @@ export class CreateEmployeeDto {
   @IsBoolean()
   alwaysPresent?: boolean;
 
+  // Overtime for this person (overrides rule sets and the company policy); null / left out = follow them.
+  @ApiPropertyOptional({ enum: ['ELIGIBLE', 'NOT_ELIGIBLE'], nullable: true })
+  @IsOptional()
+  @IsIn(['ELIGIBLE', 'NOT_ELIGIBLE'])
+  overtimeEligibility?: 'ELIGIBLE' | 'NOT_ELIGIBLE' | null;
+
   // Live tracking of a field employee (only when the company has the feature on; Admin / HR only). Switching it on tells the person
   // and asks them to agree in the app; it is applied through FieldTrackingService, never written straight to the record.
   @ApiPropertyOptional()
@@ -64,7 +89,9 @@ export class CreateEmployeeDto {
   // YYYY-MM-DD the marking starts from (today when left out as it is switched on).
   @ApiPropertyOptional()
   @IsOptional()
-  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'alwaysPresentFrom must be YYYY-MM-DD.' })
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, {
+    message: 'alwaysPresentFrom must be YYYY-MM-DD.',
+  })
   alwaysPresentFrom?: string;
 
   // The company (brand) whose name and logo this person's payslips, letters and emails carry. Blank/omitted = the default company

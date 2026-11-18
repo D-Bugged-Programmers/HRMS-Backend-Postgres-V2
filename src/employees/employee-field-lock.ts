@@ -14,6 +14,8 @@ const LOCKED_FIELDS_FOR_EMPLOYEE: (keyof UpdateEmployeeDto)[] = [
   'brandId',
   'alwaysPresent',
   'alwaysPresentFrom',
+  // Overtime eligibility is set by Admin / HR, never by the employee.
+  'overtimeEligibility',
   // Live tracking is switched on or off by Admin / HR, never by the employee for themselves.
   'fieldTrackingEnabled',
   'requireWorkLocationForPunch',

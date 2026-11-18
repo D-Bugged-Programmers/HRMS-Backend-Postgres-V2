@@ -392,6 +392,8 @@ model Department {
   lateInThresholdMinutes   Int     @default(15)
   earlyOutThresholdMinutes Int     @default(15)
   minHoursForPresent       Float   @default(8)
+  // Set by a flexible work schedule: no fixed shift times (00:00-23:59 placeholders); hours worked decide the status.
+  isFlexibleShift          Boolean @default(false)
   minHoursForHalfDay       Float   @default(4)
   // [0]=Sunday ... 6=Saturday.
   weeklyOffs               Json    @default("[0]")
@@ -649,6 +651,8 @@ model User {
   joiningChecklists                JoiningChecklist[]                @relation("JoiningChecklistEmployee")
   // Marked present on every working day without punching: the nightly sweep writes a Present day for the person's own shift timings
   // (never absent, even on unpaid leave), from alwaysPresentFrom (YYYY-MM-DD) up to their last working day. Payroll counts the days as normal.
+  // Overtime for this person, set on the employee: overrides any overtime rule set and the company policy. null = follow them.
+  overtimeEligibility              OvertimeEligibility?
   alwaysPresent                    Boolean                           @default(false)
   // Live tracking for field staff: set by Admin / HR. While true (and the company has the feature on) the app shares
   // the person's location during their shift, after they have consented (fieldTrackingConsentAt).
@@ -1011,6 +1015,10 @@ model WorkLocation {
   city        String    @default("")
   cityClass   CityClass @default(NON_METRO)
 
+  // False = no geo-fence for this location (it is just an address / state / city). The fence fields below then hold placeholders
+  // (0, 0, 200 m) and punches are not checked against it.
+  geoFenceEnabled Boolean @default(true)
+
   latitude     Float
   longitude    Float
   radiusMeters Int   @default(200)
@@ -1065,6 +1073,12 @@ model WorkSchedule {
   endTime      String
   breakMinutes Int    @default(60)
 
+  // Flexible shift: no fixed start or end - they may work any time, and the hours worked decide Present / Half Day. startTime /
+  // endTime then hold placeholders (00:00-23:59) and the two hour figures below apply.
+  isFlexible         Boolean @default(false)
+  flexFullDayHours   Float?
+  flexHalfDayHours   Float?
+
   // Days in this list are excluded from workingDays' plain "off every
   // week" treatment and instead off only on the given occurrence(s) of the
   // month — e.g. [{"day":6,"occurrences":[2,4]}] = 2nd/4th Saturday off,
@@ -1106,6 +1120,9 @@ model ShiftRule {
   // A per-person override: when set, the rule applies to exactly these people (any gender, any department) and wins over
   // gender and department rules.
   employeeIds   String[] @default([])
+  // Set when the rule was made inside a work schedule: it then applies to the departments that schedule is assigned to (departmentIds
+  // is kept in step with them), and is ignored while the schedule has no department.
+  workScheduleId String?
   isActive      Boolean  @default(true)
 
   createdAt DateTime @default(now())
@@ -1113,6 +1130,7 @@ model ShiftRule {
 
   @@unique([organizationId, name])
   @@index([organizationId])
+  @@index([workScheduleId])
   @@map("shift_rules")
 }
 
@@ -1889,6 +1907,8 @@ model PayrollTemplate {
   showPFNumber              Boolean @default(true)
   showBankDetails           Boolean @default(true)
   showEmployerContributions Boolean @default(true)
+  // Employer contribution lines (by salary-component code) left off the printed payslip; empty = all shown.
+  hiddenEmployerContributionCodes String[] @default([])
   showCTC                   Boolean @default(true)
   showYTD                   Boolean @default(true)
   showQRCode                Boolean @default(true)
@@ -2301,6 +2321,11 @@ model AttendanceImportBatch {
 
   @@index([organizationId])
   @@map("attendance_import_batches")
+}
+
+enum OvertimeEligibility {
+  ELIGIBLE
+  NOT_ELIGIBLE
 }
 
 enum OvertimeType {
@@ -3014,6 +3039,20 @@ model CompanyBrand {
   contactEmail String?
   phone        String?
   website      String?
+
+  // The sister company's own registration details (same as Organization Settings > Registration details). Never borrowed from the
+  // parent company: a document of this company shows these, or nothing.
+  gstin String?
+  pan String?
+  tan String?
+  cin String?
+  registrationNumber String?
+  lin String?
+  msmeRegistrationNumber String?
+  epfoEstablishmentCode String?
+  esicEmployerCode String?
+  ptRegistrationNumber String?
+  labourLicenseNumber String?
 
   // This brand's own employee ID series: the format is a literal prefix plus one counter token (e.g. 'SA-{00000}') and the counter
   // holds the last number issued. Null format = people in this brand take their ID from the company's series.
@@ -4294,6 +4333,10 @@ model TdsChallan {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id])
 
+  // The company the tax belongs to: a sister company's id, or null for the organization's own (main) company. Each company has its
+  // own TAN, so each deposits its own challans and files its own statements.
+  brandId String?
+
   // The month the tax was DEDUCTED in (not the month it was deposited).
   month         Int
   year          Int
@@ -4316,6 +4359,7 @@ model TdsChallan {
 
   @@index([organizationId, financialYear, quarter])
   @@index([organizationId, year, month])
+  @@index([organizationId, brandId])
   @@map("tds_challans")
 }
 
@@ -4325,6 +4369,10 @@ model TdsStatement {
   id             String       @id @default(uuid())
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Sister company this statement is filed for; null = the organization's own (main) company. One statement per company per quarter
+  // (the null case is enforced in code, as the database treats nulls as distinct).
+  brandId String?
 
   financialYear String
   quarter       Int
@@ -4337,7 +4385,7 @@ model TdsStatement {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  @@unique([organizationId, financialYear, quarter])
+  @@unique([organizationId, financialYear, quarter, brandId])
   @@map("tds_statements")
 }
 

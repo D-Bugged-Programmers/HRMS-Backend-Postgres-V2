@@ -31,7 +31,7 @@ export class EmployeeIdService {
           const id = formatDocumentNumber(brand.employeeIdFormat, counter);
           const taken = await tx.user.findFirst({ where: { organizationId, employeeId: id }, select: { id: true } });
           if (!taken) {
-            await tx.companyBrand.update({ where: { id: brandId }, data: { employeeIdCounter: counter } });
+            await tx.companyBrand.updateMany({ where: { id: brandId, organizationId }, data: { employeeIdCounter: counter } });
             return id;
           }
         }

@@ -6,6 +6,7 @@
 // than re-deriving current settings/statutory-overlay for the period, since a run's own snapshot is
 // authoritative for what applied at that time even if settings changed since. bankTransferReport's account
 // fields read from personalData.bank* (see that method).
+import { BrandingLookupService } from '../company-brands/branding-lookup.service';
 import { previousMonthPeriod } from './report-period';
 import { EXPORTABLE_RUNS, isExportableRun } from '../payroll/exportable-runs';
 import { EMPLOYEE_RELATION_ORDER_BY } from '../common/employee-order';
@@ -98,6 +99,7 @@ export function annualisedCtc(
 export class PayrollReportsService {
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
+    private readonly brandingLookup: BrandingLookupService,
   ) {}
 
   private async fetchRuns(
@@ -106,9 +108,15 @@ export class PayrollReportsService {
   ) {
     // Final-settlement runs are included: a leaver's last pay (and its statutory lines) belongs in the same
     // register, bank file and returns as the regular run; rows carry a Type to tell them apart.
+    // A chosen company: only its people. (Blank / ALL = everyone, as before.)
+    const scope = await this.brandingLookup.companyScope(
+      organizationId,
+      query.companyId,
+    );
     const where: Prisma.PayrollRunWhereInput = {
       organizationId,
       ...EXPORTABLE_RUNS,
+      ...scope.runWhere,
     };
     if (query.month) where.month = query.month;
     if (query.year) where.year = query.year;
@@ -485,11 +493,19 @@ export class PayrollReportsService {
       | 'ptRegistrationNumber'
       | 'tan'
       | 'pan',
+    companyId?: string,
   ): Promise<string | undefined> {
-    const org = await this.scopedPrisma.organization.findFirst({
-      where: { id: organizationId },
-      select: { [field]: true },
-    });
+    // A chosen sister company prints its OWN number (or none), never the parent's.
+    const scope = await this.brandingLookup.companyScope(
+      organizationId,
+      companyId,
+    );
+    const org = scope.registration
+      ? scope.registration
+      : await this.scopedPrisma.organization.findFirst({
+          where: { id: organizationId },
+          select: { [field]: true },
+        });
     const value = (org as Record<string, string | null> | null)?.[field];
     return value ? `${label}: ${value}` : undefined;
   }
@@ -646,6 +662,7 @@ export class PayrollReportsService {
         organizationId,
         'EPFO Establishment Code',
         'epfoEstablishmentCode',
+        query.companyId,
       ),
       columns,
       rows,
@@ -714,6 +731,7 @@ export class PayrollReportsService {
         organizationId,
         'ESIC Employer Code',
         'esicEmployerCode',
+        query.companyId,
       ),
       columns,
       rows,
@@ -733,6 +751,7 @@ export class PayrollReportsService {
         organizationId,
         'PT Registration Number',
         'ptRegistrationNumber',
+        query.companyId,
       ),
     );
   }

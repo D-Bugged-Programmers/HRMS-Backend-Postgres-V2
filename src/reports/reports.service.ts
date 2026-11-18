@@ -597,7 +597,7 @@ export class ReportsService {
       name: d.name,
       head: d.departmentHead?.name ?? '-',
       employeeCount: countByDept.get(d.id) ?? 0,
-      shift: `${d.shiftStartTime} - ${d.shiftEndTime}`,
+      shift: d.isFlexibleShift ? (d.shiftStartTime === '00:00' && d.shiftEndTime === '23:59' ? 'Flexible' : `Flexible, ${d.shiftStartTime} - ${d.shiftEndTime}`) : `${d.shiftStartTime} - ${d.shiftEndTime}`,
     }));
 
     const columns: ReportColumn[] = [

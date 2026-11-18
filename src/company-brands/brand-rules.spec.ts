@@ -1,11 +1,34 @@
-import { employeeIdPrefixOf, isValidEmployeeIdFormat, nextEmployeeId, prefixesClash, resolveBranding, type BrandFields, type OrgBranding } from './brand-rules';
+import {
+  employeeIdPrefixOf,
+  isValidEmployeeIdFormat,
+  nextEmployeeId,
+  prefixesClash,
+  resolveBranding,
+  type BrandFields,
+  type OrgBranding,
+} from './brand-rules';
 
 const ORG: OrgBranding = {
-  companyName: 'Parent Co', name: 'parent', legalName: 'Parent Co Pvt Ltd', companyLogoUrl: 'org/logo.png', emailLogoUrl: 'org/email.png',
-  registeredAddress: 'Parent Street', contactEmail: 'hr@parent.test', phone: '111', website: 'https://parent.test',
+  companyName: 'Parent Co',
+  name: 'parent',
+  legalName: 'Parent Co Pvt Ltd',
+  companyLogoUrl: 'org/logo.png',
+  emailLogoUrl: 'org/email.png',
+  registeredAddress: 'Parent Street',
+  contactEmail: 'hr@parent.test',
+  phone: '111',
+  website: 'https://parent.test',
 };
 const BRAND: BrandFields = {
-  id: 'b1', name: 'Sister A', legalName: null, logoUrl: 'org/a.png', emailLogoUrl: null, address: 'A Street', contactEmail: null, phone: null, website: null,
+  id: 'b1',
+  name: 'Sister A',
+  legalName: null,
+  logoUrl: 'org/a.png',
+  emailLogoUrl: null,
+  address: 'A Street',
+  contactEmail: null,
+  phone: null,
+  website: null,
 };
 
 describe('employee ID format', () => {
@@ -13,7 +36,15 @@ describe('employee ID format', () => {
     expect(isValidEmployeeIdFormat('SA-{00000}')).toBe(true);
     expect(isValidEmployeeIdFormat('SIS_B/{0001}')).toBe(true);
   });
-  it.each(['{00000}', 'SA-', 'SA-{0}', 'SA-{00000}-X', 'SA {00000}', 'WAYTOOLONGPREFIX1-{00000}', 'SA-{YYYY}{00000}'])('rejects %s', (f) => {
+  it.each([
+    '{00000}',
+    'SA-',
+    'SA-{0}',
+    'SA-{00000}-X',
+    'SA {00000}',
+    'WAYTOOLONGPREFIX1-{00000}',
+    'SA-{YYYY}{00000}',
+  ])('rejects %s', (f) => {
     expect(isValidEmployeeIdFormat(f)).toBe(false);
   });
   it('reads the prefix and the next ID', () => {
@@ -39,14 +70,27 @@ describe('prefixesClash', () => {
 describe('resolveBranding', () => {
   it('is exactly the organization when there is no brand', () => {
     expect(resolveBranding(ORG, null)).toEqual({
-      brandId: null, companyName: 'Parent Co', legalName: 'Parent Co Pvt Ltd', logoUrl: 'org/logo.png', emailLogoUrl: 'org/email.png',
-      address: 'Parent Street', contactEmail: 'hr@parent.test', phone: '111', website: 'https://parent.test',
+      registration: expect.any(Object),
+      brandId: null,
+      companyName: 'Parent Co',
+      legalName: 'Parent Co Pvt Ltd',
+      logoUrl: 'org/logo.png',
+      emailLogoUrl: 'org/email.png',
+      address: 'Parent Street',
+      contactEmail: 'hr@parent.test',
+      phone: '111',
+      website: 'https://parent.test',
     });
   });
 
   it('uses the brand where it has a value and the organization where it does not', () => {
     const r = resolveBranding(ORG, BRAND);
-    expect(r).toMatchObject({ brandId: 'b1', companyName: 'Sister A', logoUrl: 'org/a.png', address: 'A Street' });
+    expect(r).toMatchObject({
+      brandId: 'b1',
+      companyName: 'Sister A',
+      logoUrl: 'org/a.png',
+      address: 'A Street',
+    });
     expect(r.contactEmail).toBe('hr@parent.test');
     expect(r.legalName).toBe('Parent Co Pvt Ltd');
   });
@@ -56,11 +100,17 @@ describe('resolveBranding', () => {
   });
 
   it('falls back to the organization name, then its internal name, when there is no company name', () => {
-    expect(resolveBranding({ ...ORG, companyName: '  ' }, null).companyName).toBe('parent');
+    expect(
+      resolveBranding({ ...ORG, companyName: '  ' }, null).companyName,
+    ).toBe('parent');
   });
 
   it('treats a blank brand field as unset', () => {
-    expect(resolveBranding(ORG, { ...BRAND, name: ' ', logoUrl: '' }).companyName).toBe('Parent Co');
-    expect(resolveBranding(ORG, { ...BRAND, name: ' ', logoUrl: '' }).logoUrl).toBe('org/logo.png');
+    expect(
+      resolveBranding(ORG, { ...BRAND, name: ' ', logoUrl: '' }).companyName,
+    ).toBe('Parent Co');
+    expect(
+      resolveBranding(ORG, { ...BRAND, name: ' ', logoUrl: '' }).logoUrl,
+    ).toBe('org/logo.png');
   });
 });

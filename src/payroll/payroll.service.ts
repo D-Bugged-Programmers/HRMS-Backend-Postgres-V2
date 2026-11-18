@@ -9,6 +9,7 @@
 // afterLock() marks approved-unprocessed leave encashments PROCESSED so a future run can't double-count
 // them. afterPay()'s notification/email failures are swallowed deliberately — the payment transition has
 // already committed by that point and must not be rolled back by a PDF/email failure.
+import { isOvertimePayEnabled } from '../overtime/overtime-pay';
 import { sandwichKindsOf, type LeaveRules } from '../leaves/leave-rules';
 import { employeeDob, missingPastMonths } from './fy-employment';
 import { holidayInEffect } from '../holidays/holiday-in-effect';
@@ -636,6 +637,7 @@ export class PayrollService {
           },
         },
       }),
+      // Overtime switched off for the org: no overtime reaches the payslip.
       this.scopedPrisma.overtimeRecord.findMany({
         where: {
           organizationId,
@@ -643,6 +645,8 @@ export class PayrollService {
           status: OvertimeStatus.APPROVED,
           date: { gte: `${monthPrefix}-01`, lte: monthEndStr },
         },
+        // take: 0 returns nothing - used when the org has switched Overtime off.
+        take: (await isOvertimePayEnabled(this.scopedPrisma, organizationId)) ? undefined : 0,
       }),
       // The holidays that apply to this employee (company-wide plus their own department's), optional ones excluded.
       this.scopedPrisma.holiday.findMany({
@@ -4328,6 +4332,7 @@ export class PayrollService {
       this.scopedPrisma.overtimeRecord.findMany({
         where: { organizationId, employeeId: { in: ids }, status: 'PENDING', date: { startsWith: monthPrefix } },
         select: { employeeId: true },
+        take: (await isOvertimePayEnabled(this.scopedPrisma, organizationId)) ? undefined : 0,
       }),
       this.scopedPrisma.attendance.findMany({
         where: { organizationId, employeeId: { in: ids }, date: { startsWith: monthPrefix }, regularization: { path: ['status'], equals: 'pending' } },

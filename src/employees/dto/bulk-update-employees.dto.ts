@@ -1,5 +1,13 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ArrayMaxSize, ArrayMinSize, IsArray, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
+import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
+  IsOptional,
+  IsString,
+  IsUUID,
+  MaxLength,
+} from 'class-validator';
 
 /** Body of POST /employees/bulk-update - give several employees the same department, reporting manager, work location or designation. */
 export class BulkUpdateEmployeesDto {
@@ -13,5 +21,9 @@ export class BulkUpdateEmployeesDto {
   @ApiPropertyOptional() @IsOptional() @IsUUID() departmentId?: string;
   @ApiPropertyOptional() @IsOptional() @IsUUID() reportingManagerId?: string;
   @ApiPropertyOptional() @IsOptional() @IsUUID() workLocationId?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(100) designation?: string;
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  designation?: string;
 }

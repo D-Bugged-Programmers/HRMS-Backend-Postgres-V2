@@ -57,7 +57,10 @@ import {
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { PrismaService } from '../prisma/prisma.service';
-import { effectiveWorkLocation } from '../common/effective-work-location';
+import {
+  effectiveGeoFence,
+  effectiveWorkLocation,
+} from '../common/effective-work-location';
 import { isKeyAllowedForOrg, signFileToken } from '../files/file-token';
 import {
   isInsideGeoFenceWithAccuracy,
@@ -713,7 +716,7 @@ export class AttendanceService {
         const tz = shiftConfig.timezone ?? DEFAULT_ORG_TIMEZONE;
         inTime = buildShiftDateTime(dateStr, shiftConfig.shiftStartTime, tz);
         outTime = buildShiftDateTime(shiftConfig.crossesMidnight ? addDaysStr(dateStr, 1) : dateStr, shiftConfig.shiftEndTime, tz);
-        workDurationMinutes = shiftMinutes(shiftConfig.shiftStartTime, shiftConfig.shiftEndTime, shiftConfig.crossesMidnight, shiftConfig.breakMinutes);
+        workDurationMinutes = shiftConfig.flexible ? Math.round(shiftConfig.minHoursForPresent * 60) + (shiftConfig.breakMinutes ?? 0) : shiftMinutes(shiftConfig.shiftStartTime, shiftConfig.shiftEndTime, shiftConfig.crossesMidnight, shiftConfig.breakMinutes);
       }
     }
 
@@ -901,6 +904,12 @@ export class AttendanceService {
           0,
           Math.round((outTime.getTime() - inTime.getTime()) / 60000),
         );
+        // A flexible shift counts only the time inside its allowed window (the whole day when none was set).
+        if (shiftConfig.flexible) {
+          const from = Math.max(inTime.getTime(), shiftStart.getTime());
+          const to = Math.min(outTime.getTime(), shiftEnd.getTime());
+          workDurationMinutes = Math.max(0, Math.round((to - from) / 60000));
+        }
         isLate =
           inTime.getTime() - shiftStart.getTime() >
           shiftConfig.lateInThresholdMinutes * 60000;
@@ -952,6 +961,12 @@ export class AttendanceService {
       ) {
         status = AttendanceStatus.WEEKLY_OFF;
       }
+      isLate = false;
+      isEarlyOut = false;
+    }
+
+    // A flexible shift has no start or end to be late for or to leave before.
+    if (shiftConfig.flexible) {
       isLate = false;
       isEarlyOut = false;
     }
@@ -1164,11 +1179,20 @@ export class AttendanceService {
       isHolidayDay || isWeeklyOff(dateStr, shiftConfig.weeklyOffs);
     const overshootMinutes = isOffDay
       ? Math.max(0, workDurationMinutes - (shiftConfig.breakMinutes ?? 0))
-      : Math.max(
-          0,
-          Math.round((outTime.getTime() - shiftEnd.getTime()) / 60000) -
-            policy.startAfterMinutes,
-        );
+      : shiftConfig.flexible
+        ? // Flexible shift: overtime is what is worked beyond the full-day hours (after the unpaid break).
+          Math.max(
+            0,
+            workDurationMinutes -
+              (shiftConfig.breakMinutes ?? 0) -
+              Math.round(shiftConfig.minHoursForPresent * 60) -
+              policy.startAfterMinutes,
+          )
+        : Math.max(
+            0,
+            Math.round((outTime.getTime() - shiftEnd.getTime()) / 60000) -
+              policy.startAfterMinutes,
+          );
 
     // One day, one benefit: work already claimed as comp-off is not also suggested as overtime.
     if (isOffDay) {
@@ -1835,11 +1859,12 @@ export class AttendanceService {
       }
     }
 
-    const fence = employee ? effectiveWorkLocation(employee) : null;
+    const fence = employee ? effectiveGeoFence(employee) : null;
     // Only ENFORCED looks at the work location at all: RECORD_ONLY stores the point and NOT_NEEDED takes none.
+    // A location with its geo-fence switched off still counts as an assigned location (it is just not enforced).
     if (
       locationMode === 'ENFORCED' &&
-      !fence &&
+      !(employee ? effectiveWorkLocation(employee) : null) &&
       employee?.requireWorkLocationForPunch
     ) {
       // Per-employee, not org-wide: an office-based employee is marked
@@ -3110,7 +3135,7 @@ export class AttendanceService {
         department: { include: { workLocation: true } },
       },
     });
-    const fence = employee ? effectiveWorkLocation(employee) : null;
+    const fence = employee ? effectiveGeoFence(employee) : null;
     if (!fence || fence.isActive === false) {
       return { geoFence: null };
     }
@@ -3129,16 +3154,19 @@ export class AttendanceService {
     if (!employee) throw new NotFoundException('Employee not found.');
     const [record, overtime, org] = await Promise.all([
       this.scopedPrisma.attendance.findFirst({ where: { organizationId, employeeId, date } }),
-      this.scopedPrisma.overtimeRecord.findMany({ where: { organizationId, employeeId, date }, orderBy: { createdAt: 'asc' } }),
+      (await isOvertimePayEnabled(this.scopedPrisma, organizationId))
+        ? this.scopedPrisma.overtimeRecord.findMany({ where: { organizationId, employeeId, date }, orderBy: { createdAt: 'asc' } })
+        : Promise.resolve([]),
       this.prisma.organization.findUnique({ where: { id: organizationId } }),
     ]);
     const shift = resolveShiftConfig(shiftDepartmentFor(employee.department, employee, await this.shiftRulesOf(this.scopedPrisma, organizationId)), org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null, org?.timezone ?? DEFAULT_ORG_TIMEZONE);
-    const shiftNetMinutes = shiftMinutes(shift.shiftStartTime, shift.shiftEndTime, shift.crossesMidnight, shift.breakMinutes);
+    // A flexible shift's expected time is its full-day hours (there is no start / end to span).
+    const shiftNetMinutes = shift.flexible ? Math.round(shift.minHoursForPresent * 60) : shiftMinutes(shift.shiftStartTime, shift.shiftEndTime, shift.crossesMidnight, shift.breakMinutes);
     return {
       date,
       record,
       overtime,
-      shift: { startTime: shift.shiftStartTime, endTime: shift.shiftEndTime, minutes: shiftNetMinutes },
+      shift: { startTime: shift.shiftStartTime, endTime: shift.shiftEndTime, minutes: shiftNetMinutes, flexible: shift.flexible === true },
       extraMinutes: extraMinutesBeyondShift(record?.workDurationMinutes ?? 0, shiftNetMinutes),
     };
   }
@@ -3328,7 +3356,7 @@ export class AttendanceService {
     return {
       ...result,
       data: result.data.map((record) => {
-        const fence = effectiveWorkLocation(record.employee);
+        const fence = effectiveGeoFence(record.employee);
         const checkinInsideGeoFence =
           fence &&
           record.checkinLatitude !== null &&

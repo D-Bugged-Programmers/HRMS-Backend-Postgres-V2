@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  IsBoolean,
   IsEnum,
   IsIn,
   IsNotEmpty,
@@ -95,6 +96,12 @@ export class CreateWorkLocationDto {
   @Min(-180)
   @Max(180)
   longitude?: number;
+
+  // false = no geo-fence: only the address / state / city are kept, and punches are not checked against this location.
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  geoFenceEnabled?: boolean;
 
   // A zero/negative radius silently breaks the punch-in/out distance check
   // (attendance-shift-config.ts) rather than rejecting the request.

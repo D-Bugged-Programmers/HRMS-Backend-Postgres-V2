@@ -8,8 +8,12 @@ describe('no-email helpers', () => {
     expect(isPlaceholderEmail(null)).toBe(false);
   });
   it('reads the company choices with safe defaults', () => {
-    expect(readLoginPolicy({})).toEqual({ method: 'EMAIL_OR_ID', allowNoEmail: false });
+    expect(readLoginPolicy({})).toEqual({ method: 'EMAIL_OR_ID', allowNoEmail: true });
     expect(readLoginPolicy({ loginMethod: 'ID_ONLY', allowNoEmail: true })).toEqual({ method: 'ID_ONLY', allowNoEmail: true });
+    // The method decides whether an email is optional, whatever the stored switch says.
+    expect(readLoginPolicy({ loginMethod: 'ID_ONLY', allowNoEmail: false }).allowNoEmail).toBe(true);
+    expect(readLoginPolicy({ loginMethod: 'EMAIL_OR_ID', allowNoEmail: false }).allowNoEmail).toBe(true);
+    expect(readLoginPolicy({ loginMethod: 'EMAIL', allowNoEmail: true }).allowNoEmail).toBe(false);
     expect(readLoginPolicy({ loginMethod: 'bogus' }).method).toBe('EMAIL_OR_ID');
   });
   it('refuses the way of signing in the company switched off', () => {

@@ -152,6 +152,28 @@ export class ShiftRulesService {
     });
   }
 
+  // The departments a work schedule is assigned to, after checking the schedule is this company's.
+  private async scheduleDepartmentIds(
+    workScheduleId: string,
+    organizationId: string,
+  ): Promise<string[]> {
+    const schedule = await this.db.workSchedule.findFirst({
+      where: { id: workScheduleId, organizationId },
+      select: { id: true, isFlexible: true },
+    });
+    if (!schedule) throw new BadRequestException('Work schedule not found.');
+    if (schedule.isFlexible) {
+      throw new BadRequestException(
+        'A flexible shift has no fixed times, so it cannot have shift rules.',
+      );
+    }
+    const departments = await this.db.department.findMany({
+      where: { organizationId, workScheduleId },
+      select: { id: true },
+    });
+    return departments.map((d) => d.id);
+  }
+
   async create(dto: SaveShiftRuleDto, organizationId: string, actor: Actor) {
     const name = dto.name?.trim();
     const employeeIds = [...new Set(dto.employeeIds ?? [])];
@@ -167,19 +189,29 @@ export class ShiftRulesService {
     }
     // A rule that names people applies to them alone, so gender and departments do not apply.
     const gender = employeeIds.length ? null : (dto.gender ?? null);
+    // A schedule's own rule covers the departments that schedule is assigned to (none yet = it does nothing until assigned).
+    // (A rule for named people covers exactly those people, whatever the schedule's departments.)
+    const scheduleDepartments = dto.workScheduleId
+      ? await this.scheduleDepartmentIds(dto.workScheduleId, organizationId)
+      : [];
     const departmentIds = employeeIds.length
       ? []
-      : [...new Set(dto.departmentIds ?? [])];
-    await this.validate(
-      {
-        startTime: dto.startTime,
-        endTime: dto.endTime,
-        breakMinutes: dto.breakMinutes ?? null,
-        departmentIds,
-        employeeIds,
-      },
-      organizationId,
-    );
+      : dto.workScheduleId
+        ? scheduleDepartments
+        : [...new Set(dto.departmentIds ?? [])];
+    const ownedAndUnassigned =
+      !!dto.workScheduleId && !employeeIds.length && departmentIds.length === 0;
+    if (!ownedAndUnassigned)
+      await this.validate(
+        {
+          startTime: dto.startTime,
+          endTime: dto.endTime,
+          breakMinutes: dto.breakMinutes ?? null,
+          departmentIds,
+          employeeIds,
+        },
+        organizationId,
+      );
     if (
       await this.db.shiftRule.findFirst({ where: { organizationId, name } })
     ) {
@@ -187,12 +219,14 @@ export class ShiftRulesService {
         `A shift rule named "${name}" already exists.`,
       );
     }
-    const clash = await this.findClash(
-      organizationId,
-      gender,
-      departmentIds,
-      employeeIds,
-    );
+    const clash = ownedAndUnassigned
+      ? null
+      : await this.findClash(
+          organizationId,
+          gender,
+          departmentIds,
+          employeeIds,
+        );
     if (clash && (dto.isActive ?? true)) {
       throw new ConflictException(
         `"${clash.name}" already sets the shift for the same people. Edit or turn that one off first.`,
@@ -208,6 +242,7 @@ export class ShiftRulesService {
         breakMinutes: dto.breakMinutes ?? null,
         departmentIds,
         employeeIds,
+        workScheduleId: dto.workScheduleId ?? null,
         isActive: dto.isActive ?? true,
       },
     });
@@ -247,12 +282,16 @@ export class ShiftRulesService {
         dto.breakMinutes === undefined ? cur.breakMinutes : dto.breakMinutes,
       departmentIds: employeeIds.length
         ? []
-        : dto.departmentIds
-          ? [...new Set(dto.departmentIds)]
-          : cur.departmentIds,
+        : cur.workScheduleId
+          ? await this.scheduleDepartmentIds(cur.workScheduleId, organizationId)
+          : dto.departmentIds
+            ? [...new Set(dto.departmentIds)]
+            : cur.departmentIds,
       employeeIds,
     };
-    await this.validate(next, organizationId);
+    const ownedAndUnassigned =
+      !!cur.workScheduleId && next.departmentIds.length === 0;
+    if (!ownedAndUnassigned) await this.validate(next, organizationId);
     const name = dto.name?.trim();
     if (
       name &&
@@ -263,7 +302,7 @@ export class ShiftRulesService {
         `A shift rule named "${name}" already exists.`,
       );
     }
-    if (dto.isActive ?? cur.isActive) {
+    if ((dto.isActive ?? cur.isActive) && !ownedAndUnassigned) {
       const clash = await this.findClash(
         organizationId,
         gender,
@@ -366,6 +405,7 @@ export class ShiftRulesService {
             shiftStartTime: true,
             shiftEndTime: true,
             breakMinutes: true,
+            isFlexibleShift: true,
           },
         },
       },
@@ -392,6 +432,8 @@ export class ShiftRulesService {
         me?.department?.shiftEndTime ?? prefs.defaultShiftEndTime ?? '18:30',
       breakMinutes:
         me?.department?.breakMinutes ?? prefs.defaultBreakMinutes ?? 0,
+      // A flexible shift has no fixed times; the apps show "Flexible" instead.
+      flexible: me?.department?.isFlexibleShift === true,
     };
     return rule
       ? {
@@ -399,6 +441,7 @@ export class ShiftRulesService {
           endTime: rule.endTime,
           breakMinutes: rule.breakMinutes ?? base.breakMinutes,
           ruleName: rule.name,
+          flexible: false,
         }
       : { ...base, ruleName: null };
   }

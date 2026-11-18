@@ -27,7 +27,12 @@ describe('resolveShiftConfig', () => {
   };
 
   it('department fields win when a department is present', () => {
-    expect(resolveShiftConfig(department, orgPrefs)).toEqual(department);
+    expect(resolveShiftConfig(department, orgPrefs)).toEqual({ ...department, flexible: false });
+  });
+
+  it('a flexible department is flagged flexible; the org fallback never is', () => {
+    expect(resolveShiftConfig({ ...department, isFlexibleShift: true }, orgPrefs).flexible).toBe(true);
+    expect(resolveShiftConfig(null, orgPrefs).flexible).toBeUndefined();
   });
 
   it('falls back to org prefs when no department', () => {

@@ -2,6 +2,7 @@
 // Responsibilities: reads finalized PayrollRun snapshots (regular and final-settlement runs, merged to one line per
 //   member), decrypts the UAN, resolves the PF wage ceiling in force, and hands the rows to buildEcr.
 // Important: the PF wage base is the one payroll stored on each run, never recomputed here.
+import { BrandingLookupService } from '../company-brands/branding-lookup.service';
 import { EXPORTABLE_RUNS } from '../payroll/exportable-runs';
 import { Inject, Injectable } from '@nestjs/common';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
@@ -40,6 +41,7 @@ const EXIT_REASON_TEXT: Record<string, string> = {
 export class EcrService {
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
+    private readonly brandingLookup: BrandingLookupService,
   ) {}
 
   // Members whose last working day falls in the month, with the date of exit the EPFO member portal asks for - filled from
@@ -51,7 +53,10 @@ export class EcrService {
       where: {
         organizationId,
         status: { in: ['PROCESSED', 'PAID'] },
-        lastWorkingDay: { gte: `${year}-${pad(month)}-01`, lte: `${year}-${pad(month)}-${pad(last)}` },
+        lastWorkingDay: {
+          gte: `${year}-${pad(month)}-01`,
+          lte: `${year}-${pad(month)}-${pad(last)}`,
+        },
       },
       select: { employeeId: true, lastWorkingDay: true },
       orderBy: { lastWorkingDay: 'asc' },
@@ -59,7 +64,10 @@ export class EcrService {
     if (settlements.length === 0) return [];
     const ids = settlements.map((s) => s.employeeId);
     const [users, cases] = await Promise.all([
-      this.scopedPrisma.user.findMany({ where: { organizationId, id: { in: ids } }, select: { id: true, name: true, personalData: true } }),
+      this.scopedPrisma.user.findMany({
+        where: { organizationId, id: { in: ids } },
+        select: { id: true, name: true, personalData: true },
+      }),
       this.scopedPrisma.offboardingCase.findMany({
         where: { organizationId, employeeId: { in: ids } },
         orderBy: { createdAt: 'desc' },
@@ -68,7 +76,9 @@ export class EcrService {
     ]);
     const userById = new Map(users.map((u) => [u.id, u]));
     const statusById = new Map<string, string>();
-    for (const c of cases) if (!statusById.has(c.employeeId)) statusById.set(c.employeeId, c.exitStatus);
+    for (const c of cases)
+      if (!statusById.has(c.employeeId))
+        statusById.set(c.employeeId, c.exitStatus);
     return settlements.map((s) => {
       const u = userById.get(s.employeeId);
       const pd = (u?.personalData ?? {}) as Record<string, unknown>;
@@ -77,7 +87,9 @@ export class EcrService {
         name: u?.name ?? '',
         uan: typeof pd.uanNumber === 'string' ? pd.uanNumber.trim() : '',
         dateOfExit: s.lastWorkingDay.slice(0, 10),
-        reason: EXIT_REASON_TEXT[statusById.get(s.employeeId) ?? ''] ?? 'Cessation of service',
+        reason:
+          EXIT_REASON_TEXT[statusById.get(s.employeeId) ?? ''] ??
+          'Cessation of service',
       };
     });
   }
@@ -86,13 +98,24 @@ export class EcrService {
     month: number,
     year: number,
     organizationId: string,
-    opts: { skipInvalid: boolean },
+    opts: { skipInvalid: boolean; companyId?: string },
   ) {
+    // One company's return: only its people, and its own EPFO establishment code.
+    const scope = await this.brandingLookup.companyScope(
+      organizationId,
+      opts.companyId,
+    );
     const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
     const asOf = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
     const runs = await this.scopedPrisma.payrollRun.findMany({
-      where: { organizationId, month, year, ...EXPORTABLE_RUNS },
+      where: {
+        organizationId,
+        month,
+        year,
+        ...EXPORTABLE_RUNS,
+        ...scope.runWhere,
+      },
       orderBy: [{ isFinalSettlement: 'asc' }, { createdAt: 'asc' }],
     });
     // Only members who are on PF this month (a PF line, even a zero one for a full-LOP month).
@@ -182,13 +205,20 @@ export class EcrService {
       pfRuns.reduce((s, r) => s + amountOf(r.employerContributions, code), 0);
     const dueMonth = month === 12 ? 1 : month + 1;
     const dueYear = month === 12 ? year + 1 : year;
-    const estCode = org?.epfoEstablishmentCode?.trim() || '';
+    const estCode =
+      (scope.registration
+        ? scope.registration.epfoEstablishmentCode
+        : org?.epfoEstablishmentCode
+      )?.trim() || '';
     return {
       month,
       year,
       wageCeiling,
       fileName: `ECR_${(estCode || 'ESTABLISHMENT').replace(/[^A-Za-z0-9]/g, '')}_${String(month).padStart(2, '0')}${year}.txt`,
       establishmentCode: estCode,
+      company: scope.company,
+      // A sister company with no EPFO code on file: say so, instead of printing the parent's.
+      establishmentCodeMissing: !!scope.company && !estCode,
       content: result.lines.join('\r\n'),
       members: merged.size,
       lines: result.lines.length,

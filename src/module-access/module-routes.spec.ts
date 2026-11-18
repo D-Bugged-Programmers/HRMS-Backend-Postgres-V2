@@ -1,4 +1,4 @@
-import { moduleForPath } from './module-routes';
+import { ORG_ITEM_LABELS, SCREEN_SWITCH_LABELS, moduleForPath } from './module-routes';
 
 describe('moduleForPath', () => {
   it('maps module routes to their flag', () => {
@@ -15,5 +15,24 @@ describe('moduleForPath', () => {
     expect(moduleForPath('/dashboard/hr')).toBeNull();
     expect(moduleForPath('/dashboard/pending-counts')).toBeNull();
     expect(moduleForPath('/')).toBeNull();
+  });
+});
+
+describe('Organization menu switches', () => {
+  it('are menu-and-page only: none of them refuses an API route', () => {
+    expect(Object.keys(ORG_ITEM_LABELS).length).toBeGreaterThan(0);
+    for (const path of ['/departments', '/designations', '/grades', '/holidays', '/work-locations', '/org-list-items']) {
+      expect(moduleForPath(path)).toBeNull();
+    }
+  });
+});
+
+describe('Screen switches', () => {
+  it('hide things in the apps only: none of them refuses an API route', () => {
+    expect(Object.keys(SCREEN_SWITCH_LABELS)).toContain('module.mobile_app');
+    for (const path of ['/tds/monthly', '/overtime', '/reports/payroll', '/employees/bulk', '/approvals']) {
+      const m = moduleForPath(path);
+      expect(m === null || !(m in SCREEN_SWITCH_LABELS)).toBe(true);
+    }
   });
 });

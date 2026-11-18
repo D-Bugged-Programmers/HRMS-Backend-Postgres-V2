@@ -3,6 +3,7 @@
 // Important: strictly the CALLER's own records (employeeId = caller.id, organizationId = caller's), whatever their role. A kind whose
 //   module the company switched off is left out. Withdrawing reuses the existing rules for leave and attendance regularization; Work From Home
 //   and loans can be withdrawn only while still pending; the other kinds cannot be withdrawn here.
+import { isOvertimePayEnabled } from '../overtime/overtime-pay';
 import { BadRequestException, ConflictException, Inject, Injectable } from '@nestjs/common';
 import { AuditModule, LoanStatus, WfhApprovalStatus, WorkArrangement, type Attendance, type Prisma, type User } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
@@ -59,7 +60,8 @@ export class MyRequestsService {
     const org = caller.organizationId;
     const me = caller.id;
     const off = await this.moduleAccess.disabledFor(org);
-    const on = (k: RequestKind) => !off.has(KIND_MODULE[k]);
+    const overtimeOn = await isOvertimePayEnabled(this.prisma, org);
+    const on = (k: RequestKind) => !off.has(KIND_MODULE[k]) && (overtimeOn || k !== 'overtime');
     const now = new Date();
     const from = new Date(now.getTime() - 90 * DAY).toISOString().slice(0, 10);
     const to = new Date(now.getTime() + 90 * DAY).toISOString().slice(0, 10);

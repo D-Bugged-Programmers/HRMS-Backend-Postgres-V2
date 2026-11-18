@@ -544,6 +544,9 @@ function validateAttendancePrefs(p: Record<string, unknown>) {
   ) {
     bad(`${path('notifySalaryRevision')} must be true or false.`);
   }
+  if (p.enableOvertime !== undefined && typeof p.enableOvertime !== 'boolean') {
+    bad(`${path('enableOvertime')} must be true or false.`);
+  }
 }
 
 const NUMBERING_TOKENS =

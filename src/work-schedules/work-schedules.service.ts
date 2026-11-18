@@ -62,6 +62,61 @@ function validateNoOverlap(
 // would otherwise save and then turn every normal working day into a half-day against the minimum-hours rule.
 export const MAX_SHIFT_HOURS = 12;
 
+// Placeholder times stored for a flexible shift (no real start or end).
+export const FLEX_START = '00:00';
+export const FLEX_END = '23:59';
+
+// The allowed working window of a flexible shift: both times or neither (neither = any time of day). Returns what to store.
+export function flexibleWindow(
+  start: string | null | undefined,
+  end: string | null | undefined,
+  full: number,
+  breakMinutes: number,
+): { startTime: string; endTime: string } {
+  const hasStart = !!start;
+  const hasEnd = !!end;
+  if (!hasStart && !hasEnd) return { startTime: FLEX_START, endTime: FLEX_END };
+  if (hasStart !== hasEnd) {
+    throw new BadRequestException(
+      'Give both the allowed start and end time, or leave both blank for any time.',
+    );
+  }
+  const [sh, sm] = (start as string).split(':').map(Number);
+  const [eh, em] = (end as string).split(':').map(Number);
+  const span = eh * 60 + em - (sh * 60 + sm);
+  if (span <= 0) {
+    throw new BadRequestException(
+      'The allowed window must end after it starts, on the same day.',
+    );
+  }
+  if (span < full * 60 + breakMinutes) {
+    throw new BadRequestException(
+      'The allowed window is shorter than the full-day hours plus the break.',
+    );
+  }
+  return { startTime: start as string, endTime: end as string };
+}
+
+function validateFlexibleHours(
+  full: number | undefined,
+  half: number | undefined,
+  breakMinutes: number,
+) {
+  if (full === undefined || half === undefined) {
+    throw new BadRequestException(
+      'A flexible shift needs the full-day hours and the half-day hours.',
+    );
+  }
+  if (half >= full)
+    throw new BadRequestException(
+      'Half-day hours must be less than the full-day hours.',
+    );
+  if (breakMinutes >= full * 60)
+    throw new BadRequestException(
+      'The break must be shorter than the full-day hours.',
+    );
+}
+
 export function shiftHours(startTime: string, endTime: string): number {
   const toMinutes = (t: string) => {
     const [h, m] = t.split(':').map(Number);
@@ -124,16 +179,40 @@ export class WorkSchedulesService {
   ) {
     const alternateWeeklyOffs = dto.alternateWeeklyOffs ?? [];
     validateNoOverlap(dto.workingDays, alternateWeeklyOffs);
-    validateShiftLength(dto.startTime, dto.endTime);
-    validateBreak(dto.startTime, dto.endTime, dto.breakMinutes);
+    const flexible = dto.isFlexible === true;
+    let flexWindow = { startTime: FLEX_START, endTime: FLEX_END };
+    if (flexible) {
+      validateFlexibleHours(
+        dto.flexFullDayHours,
+        dto.flexHalfDayHours,
+        dto.breakMinutes,
+      );
+      flexWindow = flexibleWindow(
+        dto.startTime,
+        dto.endTime,
+        dto.flexFullDayHours as number,
+        dto.breakMinutes,
+      );
+    } else {
+      validateShiftLength(dto.startTime as string, dto.endTime as string);
+      validateBreak(
+        dto.startTime as string,
+        dto.endTime as string,
+        dto.breakMinutes,
+      );
+    }
 
     const schedule = await this.scopedPrisma.workSchedule.create({
       data: {
         organizationId,
         name: dto.name.trim(),
         workingDays: dto.workingDays,
-        startTime: dto.startTime,
-        endTime: dto.endTime,
+        // A flexible shift has no times: placeholders keep every time-based calculation inside one calendar day.
+        startTime: flexible ? flexWindow.startTime : (dto.startTime as string),
+        endTime: flexible ? flexWindow.endTime : (dto.endTime as string),
+        isFlexible: flexible,
+        flexFullDayHours: flexible ? dto.flexFullDayHours : null,
+        flexHalfDayHours: flexible ? dto.flexHalfDayHours : null,
         breakMinutes: dto.breakMinutes,
         alternateWeeklyOffs:
           alternateWeeklyOffs as unknown as Prisma.InputJsonValue,
@@ -171,17 +250,44 @@ export class WorkSchedulesService {
       dto.alternateWeeklyOffs ??
       (existing.alternateWeeklyOffs as unknown as AlternateWeeklyOffDto[]);
     validateNoOverlap(workingDays, alternateWeeklyOffs);
+    const flexible = dto.isFlexible ?? existing.isFlexible;
+    let flexWindow = { startTime: FLEX_START, endTime: FLEX_END };
+    if (flexible) {
+      const fullHours =
+        dto.flexFullDayHours ?? existing.flexFullDayHours ?? undefined;
+      validateFlexibleHours(
+        fullHours,
+        dto.flexHalfDayHours ?? existing.flexHalfDayHours ?? undefined,
+        dto.breakMinutes ?? existing.breakMinutes,
+      );
+      // The window: what was sent (blank = any time), else the schedule's own when it was already flexible, else any time.
+      const sent = dto.startTime !== undefined || dto.endTime !== undefined;
+      flexWindow = flexibleWindow(
+        sent
+          ? dto.startTime
+          : existing.isFlexible
+            ? existing.startTime
+            : undefined,
+        sent ? dto.endTime : existing.isFlexible ? existing.endTime : undefined,
+        fullHours as number,
+        dto.breakMinutes ?? existing.breakMinutes,
+      );
+    }
     // Only when the shift times are being changed, so an older schedule can still be renamed or reassigned.
-    if (dto.startTime !== undefined || dto.endTime !== undefined) {
+    if (
+      !flexible &&
+      (dto.startTime !== undefined || dto.endTime !== undefined)
+    ) {
       validateShiftLength(
         dto.startTime ?? existing.startTime,
         dto.endTime ?? existing.endTime,
       );
     }
     if (
-      dto.startTime !== undefined ||
-      dto.endTime !== undefined ||
-      dto.breakMinutes !== undefined
+      !flexible &&
+      (dto.startTime !== undefined ||
+        dto.endTime !== undefined ||
+        dto.breakMinutes !== undefined)
     ) {
       validateBreak(
         dto.startTime ?? existing.startTime,
@@ -195,8 +301,25 @@ export class WorkSchedulesService {
       data: {
         ...(dto.name !== undefined && { name: dto.name.trim() }),
         ...(dto.workingDays !== undefined && { workingDays: dto.workingDays }),
-        ...(dto.startTime !== undefined && { startTime: dto.startTime }),
-        ...(dto.endTime !== undefined && { endTime: dto.endTime }),
+        ...(flexible
+          ? {
+              startTime: flexWindow.startTime,
+              endTime: flexWindow.endTime,
+              isFlexible: true,
+              flexFullDayHours:
+                dto.flexFullDayHours ?? existing.flexFullDayHours,
+              flexHalfDayHours:
+                dto.flexHalfDayHours ?? existing.flexHalfDayHours,
+            }
+          : {
+              ...(dto.startTime !== undefined && { startTime: dto.startTime }),
+              ...(dto.endTime !== undefined && { endTime: dto.endTime }),
+              ...(dto.isFlexible === false && {
+                isFlexible: false,
+                flexFullDayHours: null,
+                flexHalfDayHours: null,
+              }),
+            }),
         ...(dto.breakMinutes !== undefined && {
           breakMinutes: dto.breakMinutes,
         }),
@@ -215,6 +338,9 @@ export class WorkSchedulesService {
     if (
       dto.startTime !== undefined ||
       dto.endTime !== undefined ||
+      dto.isFlexible !== undefined ||
+      dto.flexFullDayHours !== undefined ||
+      dto.flexHalfDayHours !== undefined ||
       dto.workingDays !== undefined ||
       dto.alternateWeeklyOffs !== undefined ||
       dto.breakMinutes !== undefined
@@ -224,6 +350,15 @@ export class WorkSchedulesService {
         data: {
           shiftStartTime: updated.startTime,
           shiftEndTime: updated.endTime,
+          isFlexibleShift: updated.isFlexible,
+          ...(updated.isFlexible &&
+          updated.flexFullDayHours != null &&
+          updated.flexHalfDayHours != null
+            ? {
+                minHoursForPresent: updated.flexFullDayHours,
+                minHoursForHalfDay: updated.flexHalfDayHours,
+              }
+            : {}),
           weeklyOffs: computeWeeklyOffs(
             updated.workingDays as number[],
             updated.alternateWeeklyOffs as unknown as AlternateWeeklyOffDto[],
@@ -270,6 +405,10 @@ export class WorkSchedulesService {
         `This work schedule is assigned to ${assignedDepartments.length} department(s) (${assignedDepartments.map((d) => d.name).join(', ')}) and can't be deleted — reassign them first.`,
       );
     }
+    // The schedule's own shift rules go with it.
+    await this.scopedPrisma.shiftRule.deleteMany({
+      where: { organizationId, workScheduleId: id },
+    });
     await this.scopedPrisma.workSchedule.deleteMany({
       where: { id, organizationId },
     });
@@ -330,6 +469,15 @@ export class WorkSchedulesService {
           workScheduleId: id,
           shiftStartTime: schedule.startTime,
           shiftEndTime: schedule.endTime,
+          isFlexibleShift: schedule.isFlexible,
+          ...(schedule.isFlexible &&
+          schedule.flexFullDayHours != null &&
+          schedule.flexHalfDayHours != null
+            ? {
+                minHoursForPresent: schedule.flexFullDayHours,
+                minHoursForHalfDay: schedule.flexHalfDayHours,
+              }
+            : {}),
           weeklyOffs: weeklyOffs,
           breakMinutes: schedule.breakMinutes,
         },
@@ -340,6 +488,12 @@ export class WorkSchedulesService {
         actor.id,
       );
     }
+    // The schedule's own shift rules follow the departments it is now assigned to.
+    await this.scopedPrisma.shiftRule.updateMany({
+      // Only gender rules follow the schedule's departments; a rule for named people covers its people wherever they work.
+      where: { organizationId, workScheduleId: id, employeeIds: { isEmpty: true } },
+      data: { departmentIds: dto.departmentIds },
+    });
 
     await this.auditLogService.log({
       actorId: actor.id,

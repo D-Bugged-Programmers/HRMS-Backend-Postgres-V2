@@ -11,6 +11,7 @@ import {
   Post,
   Query,
   UseGuards,
+  BadRequestException,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Role, User } from '@prisma/client';
@@ -18,7 +19,10 @@ import { OvertimeService } from './overtime.service';
 import { OvertimeRuleSetsService } from './overtime-rule-sets.service';
 import { OvertimeReportService } from './overtime-report.service';
 import { IsNumber, IsOptional, IsString, ValidateIf } from 'class-validator';
-import { SaveOvertimeRuleSetDto, PreviewOvertimeRuleDto } from './dto/overtime-rule-set.dto';
+import {
+  SaveOvertimeRuleSetDto,
+  PreviewOvertimeRuleDto,
+} from './dto/overtime-rule-set.dto';
 import { LogOvertimeDto } from './dto/log-overtime.dto';
 import { ReviewOvertimeDto } from './dto/review-overtime.dto';
 import { QueryOvertimeDto } from './dto/query-overtime.dto';
@@ -89,21 +93,35 @@ export class OvertimeController {
   @Post('rule-sets')
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
-  createRuleSet(@Body() dto: SaveOvertimeRuleSetDto, @CurrentUser() caller: Caller) {
+  createRuleSet(
+    @Body() dto: SaveOvertimeRuleSetDto,
+    @CurrentUser() caller: Caller,
+  ) {
     return this.ruleSets.create(dto, caller.organizationId, caller);
   }
 
   @Post('rule-sets/preview')
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
-  previewRuleSet(@Body() dto: PreviewOvertimeRuleDto, @CurrentUser() caller: Caller) {
-    return this.ruleSets.preview(dto.employeeId, dto.date, caller.organizationId);
+  previewRuleSet(
+    @Body() dto: PreviewOvertimeRuleDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.ruleSets.preview(
+      dto.employeeId,
+      dto.date,
+      caller.organizationId,
+    );
   }
 
   @Patch('rule-sets/:id')
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
-  updateRuleSet(@Param('id') id: string, @Body() dto: SaveOvertimeRuleSetDto, @CurrentUser() caller: Caller) {
+  updateRuleSet(
+    @Param('id') id: string,
+    @Body() dto: SaveOvertimeRuleSetDto,
+    @CurrentUser() caller: Caller,
+  ) {
     return this.ruleSets.update(id, dto, caller.organizationId, caller);
   }
 
@@ -113,7 +131,6 @@ export class OvertimeController {
   removeRuleSet(@Param('id') id: string, @CurrentUser() caller: Caller) {
     return this.ruleSets.remove(id, caller.organizationId, caller);
   }
-
 
   // No @Roles() — the org's overtime multipliers, for the log form.
   @Get('rates')
@@ -145,6 +162,30 @@ export class OvertimeController {
       employeeId,
       date,
     );
+  }
+
+  // Admin / HR: a month's overtime pay per person - estimated from approved records, and as it stands on the payslip.
+  @Get('pay-summary')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  paySummary(
+    @Query('month') month: string,
+    @Query('year') year: string,
+    @CurrentUser() caller: Caller,
+  ) {
+    const m = Number(month);
+    const y = Number(year);
+    if (
+      !Number.isInteger(m) ||
+      m < 1 ||
+      m > 12 ||
+      !Number.isInteger(y) ||
+      y < 2000 ||
+      y > 2100
+    ) {
+      throw new BadRequestException('month (1-12) and year are required.');
+    }
+    return this.overtimeService.paySummary(m, y, caller.organizationId);
   }
 
   // No @Roles() — any authenticated caller can view (self-scoped for

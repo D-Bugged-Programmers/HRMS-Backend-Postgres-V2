@@ -10,7 +10,7 @@ import { formatDocumentNumber } from '../organizations/document-numbering';
 const FORMAT_RE = /^([A-Za-z0-9_\-./]{1,12})\{(\d{3,8})\}$/;
 
 export const EMPLOYEE_ID_FORMAT_MESSAGE =
-  "Use 1-12 letters, digits or - _ . / followed by a counter such as {00000}, for example SA-{00000}.";
+  'Use 1-12 letters, digits or - _ . / followed by a counter such as {00000}, for example SA-{00000}.';
 
 export function isValidEmployeeIdFormat(format: string): boolean {
   return FORMAT_RE.test(format);
@@ -36,7 +36,7 @@ export function nextEmployeeId(format: string, counter: number): string {
   return formatDocumentNumber(format, counter + 1);
 }
 
-export interface OrgBranding {
+export interface OrgBranding extends Partial<RegistrationFields> {
   companyName: string | null;
   name: string;
   legalName: string | null;
@@ -48,7 +48,25 @@ export interface OrgBranding {
   website: string | null;
 }
 
-export interface BrandFields {
+export const REGISTRATION_KEYS = [
+  'gstin',
+  'pan',
+  'tan',
+  'cin',
+  'registrationNumber',
+  'lin',
+  'msmeRegistrationNumber',
+  'epfoEstablishmentCode',
+  'esicEmployerCode',
+  'ptRegistrationNumber',
+  'labourLicenseNumber',
+] as const;
+export type RegistrationFields = Record<
+  (typeof REGISTRATION_KEYS)[number],
+  string | null
+>;
+
+export interface BrandFields extends Partial<RegistrationFields> {
   id: string;
   name: string;
   legalName: string | null;
@@ -71,22 +89,36 @@ export interface ResolvedBranding {
   contactEmail: string | null;
   phone: string | null;
   website: string | null;
+  // The registration details that belong on this company's documents: the brand's own when there is a brand (never the parent's),
+  // else the organization's.
+  registration: RegistrationFields;
 }
 
-const text = (v: string | null | undefined): string | null => (v && v.trim() ? v.trim() : null);
+const text = (v: string | null | undefined): string | null =>
+  v && v.trim() ? v.trim() : null;
 
 /** The branding for a document: each field from the brand when it has one, else from the organization. */
-export function resolveBranding(org: OrgBranding, brand: BrandFields | null | undefined): ResolvedBranding {
+export function resolveBranding(
+  org: OrgBranding,
+  brand: BrandFields | null | undefined,
+): ResolvedBranding {
   const orgName = text(org.companyName) ?? org.name;
   return {
     brandId: brand?.id ?? null,
     companyName: text(brand?.name) ?? orgName,
     legalName: text(brand?.legalName) ?? text(org.legalName),
     logoUrl: text(brand?.logoUrl) ?? text(org.companyLogoUrl),
-    emailLogoUrl: text(brand?.emailLogoUrl) ?? text(brand?.logoUrl) ?? text(org.emailLogoUrl) ?? text(org.companyLogoUrl),
+    emailLogoUrl:
+      text(brand?.emailLogoUrl) ??
+      text(brand?.logoUrl) ??
+      text(org.emailLogoUrl) ??
+      text(org.companyLogoUrl),
     address: text(brand?.address) ?? text(org.registeredAddress),
     contactEmail: text(brand?.contactEmail) ?? text(org.contactEmail),
     phone: text(brand?.phone) ?? text(org.phone),
     website: text(brand?.website) ?? text(org.website),
+    registration: Object.fromEntries(
+      REGISTRATION_KEYS.map((k) => [k, text(brand ? brand[k] : org[k])]),
+    ) as RegistrationFields,
   };
 }

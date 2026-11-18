@@ -111,4 +111,12 @@ export class CalculateSettlementDto {
   @IsOptional()
   @IsBoolean()
   deathOrDisablement?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Pay gratuity in this settlement even though it is switched off in Statutory Compliance. Normal eligibility rules (service years, coverage, formula, cap) still apply.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  includeGratuity?: boolean;
 }

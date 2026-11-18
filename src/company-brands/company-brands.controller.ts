@@ -1,6 +1,15 @@
 // Purpose: the company brands API - the sister-company names, logos and employee ID series under Organization.
 // Important: ADMIN and HR may read the list (HR picks a company on the employee form); only an ADMIN may add, change or delete one.
-import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Role, User } from '@prisma/client';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -33,7 +42,11 @@ export class CompanyBrandsController {
 
   @Patch(':id')
   @Roles(Role.ADMIN)
-  update(@Param('id') id: string, @Body() dto: UpdateCompanyBrandDto, @CurrentUser() caller: Caller) {
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateCompanyBrandDto,
+    @CurrentUser() caller: Caller,
+  ) {
     return this.service.update(id, dto, caller, caller.organizationId);
   }
 

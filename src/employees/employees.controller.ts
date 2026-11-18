@@ -20,6 +20,7 @@ import { CreateEmployeeDto } from './dto/create-employee.dto';
 import { BulkCreateEmployeesDto } from './dto/bulk-create-employees.dto';
 import { UpdateEmployeeDto } from './dto/update-employee.dto';
 import { BulkSetAlwaysPresentDto } from './dto/bulk-set-always-present.dto';
+import { BulkSetOvertimeDto } from './dto/bulk-set-overtime.dto';
 import { BulkResetPasswordsDto, CredentialsExportLogDto } from './dto/bulk-reset-passwords.dto';
 import { BulkSetCompanyDto } from './dto/bulk-set-company.dto';
 import { BulkUpdateEmployeesDto } from './dto/bulk-update-employees.dto';
@@ -137,6 +138,14 @@ export class EmployeesController {
   @UseGuards(RolesGuard)
   bulkSetAlwaysPresent(@Body() dto: BulkSetAlwaysPresentDto, @CurrentUser() caller: Caller) {
     return this.employeesService.bulkSetAlwaysPresent(dto.employeeIds, dto.alwaysPresent, dto.from, caller, caller.organizationId);
+  }
+
+  // Sets overtime eligibility for several employees (overrides the rule sets). Before the :id routes.
+  @Post('bulk-overtime')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  bulkSetOvertime(@Body() dto: BulkSetOvertimeDto, @CurrentUser() caller: Caller) {
+    return this.employeesService.bulkSetOvertimeEligibility(dto.employeeIds, dto.eligibility, caller, caller.organizationId);
   }
 
   // Moves several employees to the same department / reporting manager / work location / designation in one step. Each one goes

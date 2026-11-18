@@ -6,6 +6,7 @@
 // Important: departmentHeadDashboard() intentionally ports a quirk from the original release — a manager with no
 // department matches every other no-department user via departmentId: null, not zero rows.
 // computeHeadcountTrend() is shared with the Reports module so headcount numbers stay consistent everywhere.
+import { isOvertimePayEnabled } from '../overtime/overtime-pay';
 import { reviewerScope } from '../common/dept-scope';
 import { employedOnWhere } from '../common/managers';
 import { REQUEST_TYPE_MODULE, disabledModulesOf, gate } from '../module-access/module-gate';
@@ -870,13 +871,13 @@ export class DashboardService {
       this.pendingScope(organizationId, employeeIds),
       { id: actor.id, role: actor.role },
     );
-    const off = await disabledModulesOf(organizationId);
+    const off = await this.offWithOvertime(await disabledModulesOf(organizationId), organizationId);
     const [leaves, regularizations, wfh, overtime, compOffs] =
       await Promise.all([
         gate(off, 'module.leave', async () => this.scopedPrisma.leave.count({ where: where.leaves }), 0),
         gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({ where: where.regularizations }), 0),
         gate(off, 'module.attendance', async () => this.countPendingWfhRequests(where.wfh), 0),
-        gate(off, 'module.attendance', async () => this.scopedPrisma.overtimeRecord.count({ where: where.overtime }), 0),
+        gate(off, 'module.overtime', async () => this.scopedPrisma.overtimeRecord.count({ where: where.overtime }), 0),
         gate(off, 'module.leave', async () => this.scopedPrisma.compOff.count({ where: where.compOffs }), 0),
       ]);
     const [reimbursements, loans, encashments, resignations] = isHr
@@ -1009,7 +1010,7 @@ export class DashboardService {
         }), [] as never),
         // A multi-day request is several rows shown as ONE item below, so the cap counts requests, not days.
         gate(off, 'module.attendance', async () => this.wfhRowsForPending(where.wfh, { employee: employeeSelect }, WANT), [] as never),
-        gate(off, 'module.attendance', async () => this.scopedPrisma.overtimeRecord.findMany({
+        gate(off, 'module.overtime', async () => this.scopedPrisma.overtimeRecord.findMany({
           where: where.overtime,
           include: { employee: employeeSelect },
           orderBy: { createdAt: 'desc' },
@@ -1979,11 +1980,32 @@ export class DashboardService {
       daysAway: number;
     }[] = [];
 
-    const challan = await this.scopedPrisma.tdsChallan.count({
-      where: { organizationId, month: prevMonth, year: prevYear },
+    // Each company deposits under its own TAN: the reminder stays until every company that ran payroll has a challan recorded.
+    const runCompanies = await this.scopedPrisma.payrollRun.findMany({
+      where: {
+        organizationId,
+        month: prevMonth,
+        year: prevYear,
+        isFinalSettlement: false,
+        runSequence: 0,
+        status: { in: EXPORTABLE_RUN_STATUSES },
+      },
+      select: { brandId: true },
+      distinct: ['brandId'],
     });
+    const challanCompanies = new Set(
+      (
+        await this.scopedPrisma.tdsChallan.findMany({
+          where: { organizationId, month: prevMonth, year: prevYear },
+          select: { brandId: true },
+        })
+      ).map((c) => c.brandId),
+    );
+    const challanMissing = runCompanies.some(
+      (r) => !challanCompanies.has(r.brandId),
+    );
     // TDS: due by the 7th. Shown from the 1st; once past, it stays (as overdue) until the challan is recorded.
-    if (challan === 0) {
+    if (challanMissing) {
       out.push({
         key: 'TDS',
         label: 'TDS challan',
@@ -2112,5 +2134,11 @@ export class DashboardService {
       upcomingBirthdays: milestones.upcomingBirthdays.slice(0, 10),
       upcomingAnniversaries: milestones.upcomingAnniversaries.slice(0, 10),
     };
+  }
+
+  // The module-gate set with a synthetic 'module.overtime' added when the org has switched Overtime off, so overtime counts and
+  // pending items drop out of the dashboard.
+  private async offWithOvertime(off: Set<string>, organizationId: string): Promise<Set<string>> {
+    return (await isOvertimePayEnabled(this.scopedPrisma, organizationId)) ? off : new Set([...off, 'module.overtime']);
   }
 }

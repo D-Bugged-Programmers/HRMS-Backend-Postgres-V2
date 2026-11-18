@@ -244,6 +244,7 @@ export class EmployeesService {
             organizationId,
             employeeId,
             brandId,
+            ...(dto.overtimeEligibility ? { overtimeEligibility: dto.overtimeEligibility } : {}),
             ...(dto.alwaysPresent ? { alwaysPresent: true, alwaysPresentFrom: dto.alwaysPresentFrom ?? null } : {}),
             email: dto.email || placeholderEmailFor(employeeId),
             password: hashedPassword,
@@ -647,6 +648,7 @@ export class EmployeesService {
       role?: unknown;
       employeeType?: unknown;
       liveTracking?: unknown;
+      overtime?: unknown;
     }>,
     actor: Actor & { id: string; role: Role },
     organizationId: string,
@@ -736,6 +738,12 @@ export class EmployeesService {
       const roleInput = asString(row.role).trim();
       const employeeTypeInput = asString(row.employeeType).trim();
       const liveTrackingInput = asString(row.liveTracking).trim().toLowerCase();
+      // Optional Yes / No: overtime for this person (overrides rule sets); blank = follow the rule sets and company policy.
+      const overtimeInput = asString(row.overtime).trim().toLowerCase();
+      if (overtimeInput && !['yes', 'y', 'true', '1', 'on', 'no', 'n', 'false', '0', 'off'].includes(overtimeInput)) {
+        failed.push({ row, error: 'Overtime must be Yes, No or blank.' });
+        return;
+      }
 
       if (!name) {
         failed.push({ row, error: 'Name is required.' });
@@ -893,6 +901,7 @@ export class EmployeesService {
         role,
         employeeType: employeeType.value,
         ...(wantsTracking(liveTrackingInput) ? { fieldTrackingEnabled: true } : {}),
+        ...(overtimeInput ? { overtimeEligibility: wantsTracking(overtimeInput) ? ('ELIGIBLE' as const) : ('NOT_ELIGIBLE' as const) } : {}),
       };
       // The same field rules the form's API enforces (name pattern and length, phone and email formats, lengths): an imported
       // row is held to exactly what a person typing it into the form would be.
@@ -2480,6 +2489,32 @@ export class EmployeesService {
         }
       }
     }
+    return { updated: allowed.length, skipped: employeeIds.length - allowed.length };
+  }
+
+  // Sets overtime eligibility for several employees at once (override of the rule sets); FOLLOW_POLICY clears it.
+  async bulkSetOvertimeEligibility(
+    employeeIds: string[],
+    eligibility: 'ELIGIBLE' | 'NOT_ELIGIBLE' | 'FOLLOW_POLICY',
+    actor: Actor & { id: string; role: Role },
+    organizationId: string,
+  ) {
+    const targets = await this.scopedPrisma.user.findMany({ where: { id: { in: employeeIds }, organizationId }, select: { id: true, role: true } });
+    const allowed = targets.filter((t) => actor.role === Role.ADMIN || t.role !== Role.ADMIN);
+    if (allowed.length > 0) {
+      await this.scopedPrisma.user.updateMany({
+        where: { id: { in: allowed.map((t) => t.id) }, organizationId },
+        data: { overtimeEligibility: eligibility === 'FOLLOW_POLICY' ? null : eligibility },
+      });
+    }
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'EMPLOYEES_OVERTIME_ELIGIBILITY_SET',
+      module: 'EMPLOYEE',
+      organizationId,
+      targetId: 'bulk',
+      details: { eligibility, employeeIds: allowed.map((t) => t.id) },
+    });
     return { updated: allowed.length, skipped: employeeIds.length - allowed.length };
   }
 

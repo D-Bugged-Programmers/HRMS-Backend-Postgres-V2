@@ -4,7 +4,7 @@
 //   Center clears the cache the moment a Super Admin changes a flag, so a switch takes effect immediately on that server.
 import { ForbiddenException, Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { employeeLimitMessage, employeeRoom } from './employee-room';
-import { ACCOUNT_LABELS } from './module-routes';
+import { ACCOUNT_LABELS, ORG_ITEM_LABELS, SCREEN_SWITCH_LABELS } from './module-routes';
 import { registerModuleGate } from './module-gate';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
@@ -93,7 +93,7 @@ export class ModuleAccessService implements OnModuleInit {
       // Effective access = plan includes it AND the company switch is on (the role check is separate). A company switch can only
       // take a module away, never add one the plan does not include.
       const inPlan = await this.planModulesFor(organizationId);
-      if (inPlan) for (const f of flags) if (!inPlan.has(f.key) && !(f.key in ACCOUNT_LABELS)) disabled.add(f.key);
+      if (inPlan) for (const f of flags) if (!inPlan.has(f.key) && !(f.key in ACCOUNT_LABELS) && !(f.key in ORG_ITEM_LABELS) && !(f.key in SCREEN_SWITCH_LABELS)) disabled.add(f.key);
       this.cache.set(organizationId, { at: Date.now(), disabled });
       return disabled;
     } catch (e) {

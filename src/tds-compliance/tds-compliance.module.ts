@@ -1,3 +1,4 @@
+import { CompanyBrandsModule } from '../company-brands/company-brands.module';
 import { Module } from '@nestjs/common';
 import { AuditLogModule } from '../audit-log/audit-log.module';
 import { PrivacyModule } from '../privacy/privacy.module';
@@ -13,6 +14,7 @@ import { EmailTemplatesModule } from '../email-templates/email-templates.module'
     PrivacyModule,
     NotificationsModule,
     EmailTemplatesModule,
+    CompanyBrandsModule,
   ],
   controllers: [TdsComplianceController],
   providers: [TdsComplianceService],

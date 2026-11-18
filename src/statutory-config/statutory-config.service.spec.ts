@@ -34,6 +34,8 @@ function build(versions: Row[] = [], opts: { finalizedRun?: Row | null } = {}) {
       if (k === 'organizationId') return true;
       if (k === 'OR') return true;
       if (v && typeof v === 'object' && 'lte' in v) return r[k] <= v.lte;
+      if (v && typeof v === 'object' && 'lt' in v) return r[k] < v.lt;
+      if (v && typeof v === 'object' && 'gt' in v) return r[k] > v.gt;
       return v === undefined || r[k] === v;
     });
   const model = {
@@ -44,6 +46,10 @@ function build(versions: Row[] = [], opts: { finalizedRun?: Row | null } = {}) {
       if (date)
         rows = rows.filter(
           (r) => r.effectiveTo === null || r.effectiveTo >= date,
+        );
+      if (a?.orderBy?.effectiveFrom === 'asc')
+        rows = [...rows].sort((x, y) =>
+          x.effectiveFrom > y.effectiveFrom ? 1 : -1,
         );
       if (a?.orderBy?.effectiveFrom === 'desc')
         rows = [...rows].sort((x, y) =>
@@ -222,10 +228,57 @@ describe('statutory config: adding a version', () => {
     ).rejects.toThrow(/already starts on 01-11-2026/);
   });
 
-  it('a version cannot be back-dated before the latest one (it would leave an inverted date range)', async () => {
-    const { service } = build([
+  it('before any payroll run, a past date is slotted in and the old version is bounded by it', async () => {
+    const { service, store } = build([
       { module: 'PF', effectiveFrom: '2026-11-01', config: pf() },
     ]);
+    await service.create(
+      'PF' as never,
+      { effectiveFrom: '2023-04-01', config: pf() } as never,
+      'u1',
+      'org',
+    );
+    const past = store.find((r) => r.effectiveFrom === '2023-04-01');
+    expect(past?.effectiveTo).toBe('2026-10-31');
+    expect(
+      store.find((r) => r.effectiveFrom === '2026-11-01')?.effectiveTo,
+    ).toBeNull();
+  });
+
+  it('a past date is inserted between two versions without overlapping either', async () => {
+    const { service, store } = build([
+      {
+        module: 'PF',
+        effectiveFrom: '2023-04-01',
+        effectiveTo: '2025-03-31',
+        config: pf(),
+      },
+      {
+        module: 'PF',
+        effectiveFrom: '2025-04-01',
+        effectiveTo: null,
+        config: pf(),
+      },
+    ]);
+    await service.create(
+      'PF' as never,
+      { effectiveFrom: '2024-04-01', config: pf() } as never,
+      'u1',
+      'org',
+    );
+    expect(
+      store.find((r) => r.effectiveFrom === '2023-04-01')?.effectiveTo,
+    ).toBe('2024-03-31');
+    expect(
+      store.find((r) => r.effectiveFrom === '2024-04-01')?.effectiveTo,
+    ).toBe('2025-03-31');
+  });
+
+  it('once any payroll run exists, a past date is refused', async () => {
+    const { service } = build(
+      [{ module: 'PF', effectiveFrom: '2026-11-01', config: pf() }],
+      { finalizedRun: { month: 1, year: 2020 } },
+    );
     await expect(
       service.create(
         'PF' as never,
@@ -233,7 +286,7 @@ describe('statutory config: adding a version', () => {
         'u1',
         'org',
       ),
-    ).rejects.toThrow(/must start after the most recent version/);
+    ).rejects.toThrow(/only be added while setting up the organization/);
   });
 
   it('a version cannot start in a month whose payroll is already locked or paid', async () => {
@@ -267,15 +320,24 @@ describe('statutory config: deleting a version', () => {
     },
   ];
 
-  it('only a future-dated version can be deleted; the one before it is reopened', async () => {
+  it('deleting the latest version reopens the one before it', async () => {
     const { service, store } = build(two);
     await service.remove('PF' as never, 'v2', 'org');
     expect(store).toHaveLength(1);
     expect(store[0].effectiveTo).toBeNull();
   });
 
-  it('past and current versions are permanent history', async () => {
-    const { service } = build(two);
+  it('a past version can be deleted while no payroll run exists (org set-up)', async () => {
+    const { service, store } = build(two);
+    await service.remove('PF' as never, 'v1', 'org');
+    expect(store).toHaveLength(1);
+    expect(store[0].effectiveFrom).toBe('2027-01-01');
+  });
+
+  it('a past version stays as history once any payroll run exists', async () => {
+    const { service } = build(two, {
+      finalizedRun: { month: 5, year: 2025 },
+    });
     await expect(service.remove('PF' as never, 'v1', 'org')).rejects.toThrow(
       /Only a future-dated version can be deleted/,
     );

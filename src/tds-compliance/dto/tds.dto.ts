@@ -37,6 +37,13 @@ export class TdsMonthQueryDto {
   @IsOptional()
   @IsIn(FORMATS)
   format?: ReportFormat;
+
+  // 'ALL' (or left out) = every company; 'MAIN' = the organization's own company; or a sister company's id.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class TdsQuarterQueryDto {
@@ -55,6 +62,13 @@ export class TdsQuarterQueryDto {
   @IsOptional()
   @IsIn(FORMATS)
   format?: ReportFormat;
+
+  // 'ALL' (or left out) = every company; 'MAIN' = the organization's own company; or a sister company's id.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class TdsYearQueryDto {
@@ -66,12 +80,26 @@ export class TdsYearQueryDto {
   @IsOptional()
   @IsIn(FORMATS)
   format?: ReportFormat;
+
+  // 'ALL' (or left out) = every company; 'MAIN' = the organization's own company; or a sister company's id.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class ChallanListQueryDto {
   @ApiProperty({ example: '2026-27' })
   @Matches(TAX_YEAR, { message: TAX_YEAR_MSG })
   financialYear!: string;
+
+  // 'ALL' (or left out) = every company; 'MAIN' = the organization's own company; or a sister company's id.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class CreateChallanDto {
@@ -136,6 +164,13 @@ export class CreateChallanDto {
   @IsString()
   @MaxLength(500)
   notes?: string;
+
+  // 'ALL' (or left out) = every company; 'MAIN' = the organization's own company; or a sister company's id.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class UpdateChallanDto {
@@ -216,10 +251,18 @@ export class SetStatementDto {
   @IsOptional()
   @IsValidCalendarDateString()
   filedOn?: string;
+
+  // 'ALL' (or left out) = every company; 'MAIN' = the organization's own company; or a sister company's id.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class Form130QueryDto {
   @ApiProperty({ example: '2026-27' })
   @Matches(TAX_YEAR, { message: TAX_YEAR_MSG })
   financialYear!: string;
+
 }

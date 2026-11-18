@@ -935,7 +935,9 @@ export class SettlementsService {
       organizationId,
     );
     const enabled = version ? version.isEnabled : settings.gratuityEnabled;
-    if (!enabled) return none;
+    // HR can pay gratuity in this settlement even when it is switched off in Statutory Compliance; every other rule still applies.
+    const forcedOn = !enabled && dto.includeGratuity === true;
+    if (!enabled && !forcedOn) return none;
 
     const cfg = (version?.config ?? {}) as {
       applyFiftyPercentRule?: boolean;
@@ -1020,6 +1022,10 @@ export class SettlementsService {
       if (headcount >= GRATUITY_COVERAGE_HEADCOUNT) {
         warning = `Gratuity is set as "not covered by the Act" but the organization has ${headcount} active employees - an establishment with ${GRATUITY_COVERAGE_HEADCOUNT} or more is generally covered, and the Act's formula and 5-year minimum are then the legal floor. Confirm with your CA.`;
       }
+    }
+    if (forcedOn && amount > 0) {
+      warning =
+        'Gratuity is included at your request although it is switched off in Statutory Compliance. It will not be accrued in monthly payroll.';
     }
     return { amount, exempt, taxable: Math.max(0, amount - exempt), warning };
   }

@@ -408,35 +408,20 @@ const REQUIRED_FOR_COMPLETION = [
   'dateOfBirth',
   'gender',
   'maritalStatus',
-  'bloodGroup',
   'currentAddress',
-  'fatherName',
-  'fatherContact',
-  'motherName',
-  'motherContact',
   'emergencyContact1Name',
   'emergencyContact1Number',
-  'emergencyContact2Name',
-  'emergencyContact2Number',
-  'totalExperience',
-  'currentOrganization',
-  'relevantExperience',
-  'bankAccountHolderName',
-  'bankName',
-  'bankAccountNo',
-  'bankIFSC',
   // Needed for TDS: without a PAN the tax is deducted at the higher rate (if the company switches that on).
   'panNumber',
-  // The Aadhaar number and the cancelled cheque (the bank proof) are asked for as well.
-  'aadharNumber',
-  'cancelledChequeUrl',
+  // Optional (do not hold up the profile): blood group, parents, a second emergency contact, professional experience, bank details with the cancelled
+  // cheque. The Aadhaar number is required only where PF or ESI applies (see aadhaarRequiredFor); the UAN only where PF applies (uanRequiredFor).
 ] as const;
 
 export function isProfileComplete(
   personalData: Record<string, unknown>,
   // hasContactNumber / hasProfilePhoto: facts about the employee record (not the personal data). When given and false, the
   // profile is not complete - the same two things the completeness percentage counts.
-  opts: { uanRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
+  opts: { uanRequired?: boolean; aadhaarRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
 ): boolean {
   if (opts.hasContactNumber === false || opts.hasProfilePhoto === false) return false;
   const filled = (field: string) => {
@@ -444,10 +429,23 @@ export function isProfileComplete(
     return typeof value === 'string' && value.trim().length > 0;
   };
   if (!REQUIRED_FOR_COMPLETION.every(filled)) return false;
+  // Aadhaar only where PF or ESI applies to this person.
+  if (opts.aadhaarRequired && !filled('aadharNumber')) return false;
   // UAN only where PF applies, and not from someone who said they have none yet (first PF job).
   return (
     !opts.uanRequired || personalData.noUanYet === true || filled('uanNumber')
   );
+}
+
+// Aadhaar is the identity proof behind the PF and ESI registrations, so it is asked for only where one of them applies to this person: the company has
+// PF or ESI on and their employment type is covered by it. Otherwise it stays optional.
+export function aadhaarRequiredFor(input: {
+  pfEnabled: boolean;
+  esiEnabled: boolean;
+  employeeType?: string | null;
+}): boolean {
+  const d = statutoryDefaultsForType(input.employeeType);
+  return (input.pfEnabled && d.pf) || (input.esiEnabled && d.esi);
 }
 
 // PF applies to this person: the company has PF on and their employment type is covered by it (an intern, trainee or
@@ -533,7 +531,7 @@ export function mergePersonalData(
   current: Record<string, unknown>,
   patch: Record<string, unknown>,
   mandatoryDocumentsUploaded: boolean,
-  opts: { uanRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
+  opts: { uanRequired?: boolean; aadhaarRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
 ): Record<string, unknown> {
   const merged = { ...current, ...dropReSignedFileUrls(current, patch) };
   const completed =

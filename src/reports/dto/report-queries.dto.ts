@@ -5,8 +5,10 @@ import {
   IsIn,
   IsInt,
   IsOptional,
+  IsString,
   IsUUID,
   Max,
+  MaxLength,
   Min,
 } from 'class-validator';
 import { LeaveStatus } from '@prisma/client';
@@ -45,12 +47,18 @@ export class LeaveReportQueryDto extends FormatQueryDto {
   @IsEnum(LeaveStatus)
   status?: LeaveStatus;
 
-  @ApiPropertyOptional({ example: '2026-06-01', description: 'Leave overlapping this date or later' })
+  @ApiPropertyOptional({
+    example: '2026-06-01',
+    description: 'Leave overlapping this date or later',
+  })
   @IsOptional()
   @IsValidCalendarDateString()
   from?: string;
 
-  @ApiPropertyOptional({ example: '2026-06-30', description: 'Leave overlapping this date or earlier' })
+  @ApiPropertyOptional({
+    example: '2026-06-30',
+    description: 'Leave overlapping this date or earlier',
+  })
   @IsOptional()
   @IsValidCalendarDateString()
   to?: string;
@@ -71,12 +79,18 @@ export class EmployeeLeaveHistoryReportQueryDto extends FormatQueryDto {
   @IsUUID()
   employeeId!: string;
 
-  @ApiPropertyOptional({ example: '2026-06-01', description: 'Leave overlapping this date or later' })
+  @ApiPropertyOptional({
+    example: '2026-06-01',
+    description: 'Leave overlapping this date or later',
+  })
   @IsOptional()
   @IsValidCalendarDateString()
   from?: string;
 
-  @ApiPropertyOptional({ example: '2026-06-30', description: 'Leave overlapping this date or earlier' })
+  @ApiPropertyOptional({
+    example: '2026-06-30',
+    description: 'Leave overlapping this date or earlier',
+  })
   @IsOptional()
   @IsValidCalendarDateString()
   to?: string;
@@ -117,6 +131,14 @@ export class PayrollReportQueryDto extends FormatQueryDto {
   @IsOptional()
   @IsIn(['standard', 'bulk'])
   layout?: 'standard' | 'bulk';
+
+  // 'ALL' (or left out) = every company; 'MAIN' = people with no sister company; or a sister company's id. A sister company's report
+  // lists only its people and prints its own registration codes.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 export class PayrollAuditReportQueryDto extends FormatQueryDto {

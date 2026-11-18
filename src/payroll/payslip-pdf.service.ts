@@ -1,4 +1,9 @@
-import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import * as path from 'path';
 import PDFDocument from 'pdfkit';
 import * as QRCode from 'qrcode';
@@ -18,7 +23,13 @@ import {
 } from './format-date';
 import { lastDayOfMonth } from './payroll-date-math';
 import { compareEmployeeId } from '../common/employee-order';
-import { BULK_PAYSLIP_CONCURRENCY, BULK_PAYSLIP_MAX, bulkPayslipFilename, mapInBatches, mergePdfBuffers } from './bulk-payslips';
+import {
+  BULK_PAYSLIP_CONCURRENCY,
+  BULK_PAYSLIP_MAX,
+  bulkPayslipFilename,
+  mapInBatches,
+  mergePdfBuffers,
+} from './bulk-payslips';
 import { readStoredFile } from '../files/file-storage.config';
 import { attachWatermark } from '../common/pdf-watermark';
 import { decryptPersonalData } from '../common/personal-data-crypto';
@@ -286,7 +297,16 @@ export class PayslipPdfService {
 
   // A sister company's payslip: its name, logo and address replace the template's header values. A run with no brand keeps the
   // template exactly as it is, so a company with no sister companies gets the payslip it always did.
-  private async withBrand<T extends { companyName: string; companyAddress: string | null; companyEmail: string | null; companyWebsite: string | null; companyContactNumber: string | null; companyLogoUrl: string | null }>(
+  private async withBrand<
+    T extends {
+      companyName: string;
+      companyAddress: string | null;
+      companyEmail: string | null;
+      companyWebsite: string | null;
+      companyContactNumber: string | null;
+      companyLogoUrl: string | null;
+    },
+  >(
     template: T,
     brandId: string | null | undefined,
     organizationId: string,
@@ -312,24 +332,54 @@ export class PayslipPdfService {
     month: number,
     year: number,
     organizationId: string,
-  ): Promise<{ buffer: Buffer; filename: string; count: number; skipped: number }> {
+  ): Promise<{
+    buffer: Buffer;
+    filename: string;
+    count: number;
+    skipped: number;
+  }> {
     const runs = await this.scopedPrisma.payrollRun.findMany({
-      where: { organizationId, month, year, isFinalSettlement: false, runSequence: 0 },
-      select: { id: true, status: true, employee: { select: { employeeId: true, name: true } } },
+      where: {
+        organizationId,
+        month,
+        year,
+        isFinalSettlement: false,
+        runSequence: 0,
+      },
+      select: {
+        id: true,
+        status: true,
+        employee: { select: { employeeId: true, name: true } },
+      },
     });
-    const finalStatuses: PayrollRunStatus[] = [PayrollRunStatus.APPROVED, PayrollRunStatus.LOCKED, PayrollRunStatus.PAID];
+    const finalStatuses: PayrollRunStatus[] = [
+      PayrollRunStatus.APPROVED,
+      PayrollRunStatus.LOCKED,
+      PayrollRunStatus.PAID,
+    ];
     const ready = runs
       .filter((r) => finalStatuses.includes(r.status))
-      .sort((a, b) => compareEmployeeId(a.employee.employeeId, b.employee.employeeId) || a.employee.name.localeCompare(b.employee.name));
+      .sort(
+        (a, b) =>
+          compareEmployeeId(a.employee.employeeId, b.employee.employeeId) ||
+          a.employee.name.localeCompare(b.employee.name),
+      );
     if (ready.length === 0) {
-      throw new BadRequestException('There are no finalized payslips for this month yet.');
+      throw new BadRequestException(
+        'There are no finalized payslips for this month yet.',
+      );
     }
     if (ready.length > BULK_PAYSLIP_MAX) {
       throw new BadRequestException(
         `This month has ${ready.length} payslips, more than the ${BULK_PAYSLIP_MAX} that can be downloaded at once. Download them by department instead.`,
       );
     }
-    const pdfs = await mapInBatches(ready, BULK_PAYSLIP_CONCURRENCY, async (r) => (await this.buildPayslipPdfBuffer(r.id, organizationId)).buffer);
+    const pdfs = await mapInBatches(
+      ready,
+      BULK_PAYSLIP_CONCURRENCY,
+      async (r) =>
+        (await this.buildPayslipPdfBuffer(r.id, organizationId)).buffer,
+    );
     return {
       buffer: await mergePdfBuffers(pdfs),
       filename: bulkPayslipFilename(month, year),
@@ -372,10 +422,16 @@ export class PayslipPdfService {
             organizationId,
           )
         : Promise.resolve(null),
-      this.getOrgPrintInfo(organizationId),
+      this.getOrgPrintInfo(organizationId, run.brandId),
     ]);
 
-    return this.renderPayslipPdf(run, await this.withBrand(template, run.brandId, organizationId), settings, ytd, printInfo);
+    return this.renderPayslipPdf(
+      run,
+      await this.withBrand(template, run.brandId, organizationId),
+      settings,
+      ytd,
+      printInfo,
+    );
   }
 
   // The payslip as it was when this revision of the run was finalised (the run itself now holds the corrected figures).
@@ -421,7 +477,7 @@ export class PayslipPdfService {
             organizationId,
           )
         : Promise.resolve(null),
-      this.getOrgPrintInfo(organizationId),
+      this.getOrgPrintInfo(organizationId, run.brandId),
     ]);
     const rendered = await this.renderPayslipPdf(
       asFinalised,
@@ -443,7 +499,10 @@ export class PayslipPdfService {
   // The watermark image itself still comes from the template's own
   // companyLogoUrl (renderPayslipPdf's existing logoBuffer) so a payslip's
   // watermark always matches whatever logo its own header already shows.
-  private async getOrgPrintInfo(organizationId: string): Promise<PrintInfo> {
+  private async getOrgPrintInfo(
+    organizationId: string,
+    brandId?: string | null,
+  ): Promise<PrintInfo> {
     const org = await this.scopedPrisma.organization.findFirst({
       where: { id: organizationId },
       select: {
@@ -460,16 +519,21 @@ export class PayslipPdfService {
         policies: true,
       },
     });
-    // Organization Settings > Registration Details, printed under the header contact line when filled in.
+    // Organization Settings > Registration Details, printed under the header contact line when filled in. A sister company's
+    // payslip prints that company's own details (nothing from the parent where it has none).
+    const reg = brandId
+      ? await this.brandingLookup.forBrand(organizationId, brandId)
+      : null;
+    const r = reg?.brandId ? reg.registration : org;
     const registrationLine = [
-      ['GSTIN', org?.gstin],
-      ['CIN', org?.cin],
-      ['Reg. No', org?.registrationNumber],
-      ['PAN', org?.pan],
-      ['TAN', org?.tan],
-      ['LIN', org?.lin],
-      ['MSME', org?.msmeRegistrationNumber],
-      ['Labour Lic.', org?.labourLicenseNumber],
+      ['GSTIN', r?.gstin],
+      ['CIN', r?.cin],
+      ['Reg. No', r?.registrationNumber],
+      ['PAN', r?.pan],
+      ['TAN', r?.tan],
+      ['LIN', r?.lin],
+      ['MSME', r?.msmeRegistrationNumber],
+      ['Labour Lic.', r?.labourLicenseNumber],
     ]
       .filter(([, v]) => typeof v === 'string' && v.trim())
       .map(([k, v]) => `${k}: ${(v as string).trim()}`)
@@ -567,14 +631,15 @@ export class PayslipPdfService {
     } catch {
       /* no signing secret configured: the payslip is still produced, just without the QR */
     }
-    const qrBuffer = template.showQRCode && qrLink
-      ? await QRCode.toBuffer(qrLink, {
-          type: 'png',
-          margin: 0,
-          width: 200,
-          color: { dark: secondary, light: '#FFFFFFFF' },
-        }).catch(() => null)
-      : null;
+    const qrBuffer =
+      template.showQRCode && qrLink
+        ? await QRCode.toBuffer(qrLink, {
+            type: 'png',
+            margin: 0,
+            width: 200,
+            color: { dark: secondary, light: '#FFFFFFFF' },
+          }).catch(() => null)
+        : null;
 
     const buffer = await new Promise<Buffer>((resolve, reject) => {
       const doc = new PDFDocument({
@@ -952,16 +1017,29 @@ export class PayslipPdfService {
       });
       // The days not paid are already taken out of the earnings; say where the reduction came from, below the deductions
       // (not part of Total Deductions).
-      const cut = (run.attendanceSummary ?? {}) as Record<string, number | undefined>;
+      const cut = (run.attendanceSummary ?? {}) as Record<
+        string,
+        number | undefined
+      >;
       let noteEndY = dedEndY;
       const cutLines: string[] = [];
-      if ((cut.lwpPayCut ?? 0) > 0) cutLines.push(`Leave without pay (LWP) - ${cut.unpaidLeaveDays ?? 0} day(s): - ${money(cut.lwpPayCut as number)}`);
-      if ((cut.lopPayCut ?? 0) > 0) cutLines.push(`Absent / unmarked (LOP) - ${cut.lopDays ?? 0} day(s): - ${money(cut.lopPayCut as number)}`);
+      if ((cut.lwpPayCut ?? 0) > 0)
+        cutLines.push(
+          `Leave without pay (LWP) - ${cut.unpaidLeaveDays ?? 0} day(s): - ${money(cut.lwpPayCut as number)}`,
+        );
+      if ((cut.lopPayCut ?? 0) > 0)
+        cutLines.push(
+          `Absent / unmarked (LOP) - ${cut.lopDays ?? 0} day(s): - ${money(cut.lopPayCut as number)}`,
+        );
       if (cutLines.length > 0) {
         doc.font(fonts.bold).fontSize(6.8).fillColor('#6b7280');
-        text('Pay already reduced in the earnings:', rightX, noteEndY + 6, { width: colW });
+        text('Pay already reduced in the earnings:', rightX, noteEndY + 6, {
+          width: colW,
+        });
         doc.font(fonts.regular).fontSize(6.8).fillColor('#6b7280');
-        cutLines.forEach((line, i) => text(line, rightX, noteEndY + 16 + i * 9, { width: colW }));
+        cutLines.forEach((line, i) =>
+          text(line, rightX, noteEndY + 16 + i * 9, { width: colW }),
+        );
         noteEndY += 16 + cutLines.length * 9;
       }
       y = Math.max(earnEndY, noteEndY) + 18;
@@ -981,31 +1059,27 @@ export class PayslipPdfService {
       y += bandH + 18;
 
       // ── Employer contributions ─────────────────────────────────────────
-      if (
-        template.showEmployerContributions &&
-        employerContributions.length > 0
-      ) {
+      // Lines the template hides (per component code) are left off, and the CTC below sums only what is printed.
+      const hiddenEr = new Set(template.hiddenEmployerContributionCodes ?? []);
+      const erShown = employerContributions.filter(
+        (c) => !hiddenEr.has(c.code),
+      );
+      if (template.showEmployerContributions && erShown.length > 0) {
         doc.font(fonts.bold).fontSize(9).fillColor(INK_900);
         text('EMPLOYER CONTRIBUTIONS', MARGIN, y);
         y += 14;
         // Every contribution is listed, four to a row — only the first four used to print while the CTC total
         // below summed them all, so the printed lines did not add up to the printed total.
         const ecColW = Math.min(140, CONTENT_W / 4);
-        for (
-          let rowStart = 0;
-          rowStart < employerContributions.length;
-          rowStart += 4
-        ) {
-          employerContributions
-            .slice(rowStart, rowStart + 4)
-            .forEach((c, i) => {
-              doc.font(fonts.regular).fontSize(7.2).fillColor(INK_600);
-              text(c.name, MARGIN + i * ecColW, y, { width: ecColW - 8 });
-              doc.font(fonts.bold).fontSize(9).fillColor(INK_900);
-              text(money(c.amount), MARGIN + i * ecColW, y + 10, {
-                width: ecColW - 8,
-              });
+        for (let rowStart = 0; rowStart < erShown.length; rowStart += 4) {
+          erShown.slice(rowStart, rowStart + 4).forEach((c, i) => {
+            doc.font(fonts.regular).fontSize(7.2).fillColor(INK_600);
+            text(c.name, MARGIN + i * ecColW, y, { width: ecColW - 8 });
+            doc.font(fonts.bold).fontSize(9).fillColor(INK_900);
+            text(money(c.amount), MARGIN + i * ecColW, y + 10, {
+              width: ecColW - 8,
             });
+          });
           y += 26;
         }
         doc.font(fonts.oblique).fontSize(6.6).fillColor(INK_400);
@@ -1019,7 +1093,7 @@ export class PayslipPdfService {
         if (template.showCTC) {
           const totalCTC =
             (run.grossSalary || 0) +
-            employerContributions.reduce((sum, c) => sum + (c.amount || 0), 0);
+            erShown.reduce((sum, c) => sum + (c.amount || 0), 0);
           doc.font(fonts.bold).fontSize(7.5).fillColor(INK_900);
           text('Total CTC (this period)', MARGIN, y);
           text(money(totalCTC), MARGIN, y, {

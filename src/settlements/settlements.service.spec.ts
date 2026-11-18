@@ -82,7 +82,13 @@ function build(o: Opts = {}) {
     },
     leave: { count: async () => 0 },
     resignation: { findFirst: async () => o.resignation ?? null },
-    offboardingCase: { findFirst: async () => o.openCase ?? null, updateMany: async (a: Row) => { linked.push(a); return { count: 1 }; } },
+    offboardingCase: {
+      findFirst: async () => o.openCase ?? null,
+      updateMany: async (a: Row) => {
+        linked.push(a);
+        return { count: 1 };
+      },
+    },
     leaveEncashment: { count: async () => 0 },
     settlement: {
       findFirst: async (a: Row) => {
@@ -225,12 +231,26 @@ describe('final settlement: the exit it belongs to', () => {
 });
 
 describe('final settlement: automatic link and system drafts', () => {
-  it('a settlement figured for the exit\'s last working day is linked to the open offboarding case by itself', async () => {
-    const { service, linked, settlements } = build({ openCase: { lastWorkingDay: '2026-10-08', createdAt: new Date('2026-09-01T00:00:00Z'), exitStatus: 'RELEASED', id: 'c1' } });
-    await service.calculate(dto({ lastWorkingDay: '2026-10-08' }), admin, 'org');
+  it("a settlement figured for the exit's last working day is linked to the open offboarding case by itself", async () => {
+    const { service, linked, settlements } = build({
+      openCase: {
+        lastWorkingDay: '2026-10-08',
+        createdAt: new Date('2026-09-01T00:00:00Z'),
+        exitStatus: 'RELEASED',
+        id: 'c1',
+      },
+    });
+    await service.calculate(
+      dto({ lastWorkingDay: '2026-10-08' }),
+      admin,
+      'org',
+    );
     expect(linked).toHaveLength(1);
     expect(linked[0].data).toEqual({ settlementId: settlements[0].id });
-    expect(linked[0].where).toMatchObject({ employeeId: 'e1', lastWorkingDay: '2026-10-08' });
+    expect(linked[0].where).toMatchObject({
+      employeeId: 'e1',
+      lastWorkingDay: '2026-10-08',
+    });
   });
 
   it('a draft prepared by the system is recorded as calculated by nobody, so the reviewer satisfies maker-checker', async () => {
@@ -243,7 +263,9 @@ describe('final settlement: automatic link and system drafts', () => {
   it('a draft calculated by a person records that person', async () => {
     const { service, settlements } = build();
     await service.calculate(dto(), admin, 'org');
-    expect(settlements[0].calculatedById).toBe((admin as unknown as { id: string }).id);
+    expect(settlements[0].calculatedById).toBe(
+      (admin as unknown as { id: string }).id,
+    );
   });
 });
 
@@ -259,7 +281,12 @@ describe('final settlement: who can be settled', () => {
   it('someone excluded from payroll is settled even without a salary structure', async () => {
     const { service } = build({
       salaryLines: 0,
-      employee: { id: 'e1', isActive: true, joiningDate: JOINED, excludeFromPayroll: true },
+      employee: {
+        id: 'e1',
+        isActive: true,
+        joiningDate: JOINED,
+        excludeFromPayroll: true,
+      },
     });
     await expect(service.calculate(dto(), admin, 'org')).resolves.toBeDefined();
   });
@@ -481,6 +508,38 @@ describe('final settlement: gratuity', () => {
     expect((await service.calculate(dto(), admin, 'org')).gratuityAmount).toBe(
       0,
     );
+  });
+
+  it('is paid when switched off if HR chooses to include it, with a note saying so', async () => {
+    const { service } = build({ gratuityOn: false, basic: 26000 });
+    const r = await service.calculate(
+      dto({ includeGratuity: true }),
+      admin,
+      'org',
+    );
+    expect(r.gratuityAmount).toBeGreaterThan(0);
+    expect((r as { warnings?: string[] }).warnings?.join(' ')).toMatch(
+      /switched off in Statutory Compliance/,
+    );
+  });
+
+  it('including it does not waive the five-year minimum', async () => {
+    const recent = {
+      id: 'e1',
+      name: 'Asha',
+      isActive: true,
+      joiningDate: new Date('2024-01-01T00:00:00Z'),
+      employeeType: 'FULL_TIME',
+    };
+    const { service } = build({
+      gratuityOn: false,
+      basic: 26000,
+      employee: recent,
+    });
+    expect(
+      (await service.calculate(dto({ includeGratuity: true }), admin, 'org'))
+        .gratuityAmount,
+    ).toBe(0);
   });
 
   it('is 0 under five years of service, unless the exit is by death or disablement', async () => {

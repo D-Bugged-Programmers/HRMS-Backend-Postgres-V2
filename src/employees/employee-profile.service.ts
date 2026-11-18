@@ -64,6 +64,7 @@ import {
   CONTACT_NUMBER_KEYS,
   mergePersonalData,
   uanRequiredFor,
+  aadhaarRequiredFor,
 } from './personal-data';
 import { assertNotSelfApproval, inReviewerScope } from '../common/dept-scope';
 
@@ -194,7 +195,7 @@ export class EmployeeProfileService {
       withAccountFields(withRootGender(employee.personalData as Record<string, unknown>, employee.gender), employee),
       requirements,
       documents,
-      { uanRequired: await this.uanRequired(employee, organizationId) },
+      await this.profileNeeds(employee, organizationId),
     );
   }
 
@@ -365,14 +366,22 @@ export class EmployeeProfileService {
     employee: { employeeType: string | null },
     organizationId: string,
   ): Promise<boolean> {
+    return (await this.profileNeeds(employee, organizationId)).uanRequired;
+  }
+
+  // What the profile must contain for this person because of the company's statutory switches: a UAN where PF applies, the Aadhaar number where PF or ESI applies.
+  private async profileNeeds(
+    employee: { employeeType: string | null },
+    organizationId: string,
+  ): Promise<{ uanRequired: boolean; aadhaarRequired: boolean }> {
     const settings = await this.scopedPrisma.payrollSettings.findFirst({
       where: { organizationId },
-      select: { pfEnabled: true },
+      select: { pfEnabled: true, esiEnabled: true },
     });
-    return uanRequiredFor({
-      pfEnabled: settings?.pfEnabled ?? false,
-      employeeType: employee.employeeType,
-    });
+    return {
+      uanRequired: uanRequiredFor({ pfEnabled: settings?.pfEnabled ?? false, employeeType: employee.employeeType }),
+      aadhaarRequired: aadhaarRequiredFor({ pfEnabled: settings?.pfEnabled ?? false, esiEnabled: settings?.esiEnabled ?? false, employeeType: employee.employeeType }),
+    };
   }
 
   private async refreshProfileCompletion(id: string, organizationId: string) {
@@ -383,7 +392,7 @@ export class EmployeeProfileService {
       withRootGender(employee.personalData as Record<string, unknown>, employee.gender),
       {},
       mandatoryDocumentsUploaded,
-      { uanRequired: await this.uanRequired(employee, organizationId), hasContactNumber: !!employee.contactNumber, hasProfilePhoto: !!employee.profileImage },
+      { ...(await this.profileNeeds(employee, organizationId)), hasContactNumber: !!employee.contactNumber, hasProfilePhoto: !!employee.profileImage },
     );
     const current = employee.personalData as Record<string, unknown>;
     if (merged.profileCompleted === current.profileCompleted) return;
@@ -498,7 +507,7 @@ export class EmployeeProfileService {
       }
     }
     const merged = mergePersonalData(before, patch, mandatoryDocumentsUploaded, {
-      uanRequired: await this.uanRequired(employee, organizationId),
+      ...(await this.profileNeeds(employee, organizationId)),
       hasContactNumber: !!employee.contactNumber,
       hasProfilePhoto: !!employee.profileImage,
     });
@@ -718,7 +727,7 @@ export class EmployeeProfileService {
       documents: documents.map(withSignedFileUrl),
       assets,
       // The profile form marks UAN required when PF applies to this person.
-      uanRequired: await this.uanRequired(employee, organizationId),
+      ...(await this.profileNeeds(employee, organizationId)),
     };
   }
 

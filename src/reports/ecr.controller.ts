@@ -16,7 +16,15 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Role, User } from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
-import { IsBoolean, IsInt, IsOptional, Max, Min } from 'class-validator';
+import {
+  IsBoolean,
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 import { ExportAuditInterceptor } from '../common/sensitive-audit';
 import { EXPENSIVE_OP_THROTTLE_LIMIT } from '../common/throttle.constants';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -46,6 +54,12 @@ export class EcrQueryDto {
   @Transform(({ value }) => value === true || value === 'true')
   @IsBoolean()
   skipInvalid?: boolean;
+
+  // 'ALL' (or left out) = every company with the organization's codes; 'MAIN' = people with no sister company; or a sister company's id.
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  companyId?: string;
 }
 
 @ApiTags('reports')
@@ -61,12 +75,20 @@ export class EcrController {
   async preview(@Query() q: EcrQueryDto, @CurrentUser() c: Caller) {
     const r = await this.ecrService.build(q.month, q.year, c.organizationId, {
       skipInvalid: true,
+      companyId: q.companyId,
     });
     // The file body is not part of the check response.
     const { content: _content, ...rest } = r;
     void _content;
     // Members leaving this month, with the date of exit to mark on the EPFO member portal.
-    return { ...rest, exits: await this.ecrService.exitsInMonth(q.month, q.year, c.organizationId) };
+    return {
+      ...rest,
+      exits: await this.ecrService.exitsInMonth(
+        q.month,
+        q.year,
+        c.organizationId,
+      ),
+    };
   }
 
   @Get()
@@ -77,6 +99,7 @@ export class EcrController {
     @Res() res: Response,
   ) {
     const r = await this.ecrService.build(q.month, q.year, c.organizationId, {
+      companyId: q.companyId,
       skipInvalid: q.skipInvalid ?? false,
     });
     if (r.members === 0) {

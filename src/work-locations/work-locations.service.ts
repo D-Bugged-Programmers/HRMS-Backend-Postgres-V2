@@ -37,33 +37,50 @@ export class WorkLocationsService {
     createdById: string,
     organizationId: string,
   ) {
-    const fenceType = dto.fenceType ?? FenceType.CIRCLE;
-    const boundary = dto.boundary;
+    const geoFenceEnabled = dto.geoFenceEnabled !== false;
+    const fenceType = geoFenceEnabled
+      ? (dto.fenceType ?? FenceType.CIRCLE)
+      : FenceType.CIRCLE;
+    const boundary = geoFenceEnabled ? dto.boundary : undefined;
 
-    this.assertValidGeometry(fenceType, boundary, dto.latitude, dto.longitude);
-    await this.assertNameUnique(dto.name, organizationId);
-
-    const summary = deriveCircleSummary(
-      fenceType,
-      boundary,
-      dto.latitude as number,
-      dto.longitude as number,
-      dto.radiusMeters ?? 200,
-    );
-    const radiusMeters =
-      fenceType === FenceType.CIRCLE
-        ? Number(dto.radiusMeters) || 200
-        : summary.radiusMeters;
-    await this.assertFenceUnique(
-      {
+    // No geo-fence: nothing to validate; the fence columns hold placeholders and are never used.
+    if (geoFenceEnabled) {
+      this.assertValidGeometry(
         fenceType,
         boundary,
-        latitude: summary.latitude,
-        longitude: summary.longitude,
-        radiusMeters,
-      },
-      organizationId,
-    );
+        dto.latitude,
+        dto.longitude,
+      );
+    }
+    await this.assertNameUnique(dto.name, organizationId);
+
+    const summary = geoFenceEnabled
+      ? deriveCircleSummary(
+          fenceType,
+          boundary,
+          dto.latitude as number,
+          dto.longitude as number,
+          dto.radiusMeters ?? 200,
+        )
+      : { latitude: 0, longitude: 0, radiusMeters: 200 };
+    const radiusMeters =
+      fenceType === FenceType.CIRCLE
+        ? geoFenceEnabled
+          ? Number(dto.radiusMeters) || 200
+          : 200
+        : summary.radiusMeters;
+    if (geoFenceEnabled) {
+      await this.assertFenceUnique(
+        {
+          fenceType,
+          boundary,
+          latitude: summary.latitude,
+          longitude: summary.longitude,
+          radiusMeters,
+        },
+        organizationId,
+      );
+    }
 
     const location = await this.scopedPrisma.workLocation.create({
       data: {
@@ -75,6 +92,7 @@ export class WorkLocationsService {
         city: dto.city?.trim() ?? '',
         // The class follows the city unless it was chosen: a metro city is METRO, any other NON_METRO.
         cityClass: dto.cityClass ?? cityClassForCity(dto.city),
+        geoFenceEnabled,
         fenceType,
         boundary:
           fenceType === FenceType.CIRCLE
@@ -117,13 +135,20 @@ export class WorkLocationsService {
     return wrapAll(
       data.map((loc) => ({
         ...loc,
-        employeeCount: employeeUse.find((u) => u.workLocationId === loc.id)?._count._all ?? 0,
-        departmentCount: departmentUse.find((u) => u.workLocationId === loc.id)?._count._all ?? 0,
+        employeeCount:
+          employeeUse.find((u) => u.workLocationId === loc.id)?._count._all ??
+          0,
+        departmentCount:
+          departmentUse.find((u) => u.workLocationId === loc.id)?._count._all ??
+          0,
       })),
     );
   }
 
-  private findManyForList(query: ListWorkLocationsQueryDto, organizationId: string) {
+  private findManyForList(
+    query: ListWorkLocationsQueryDto,
+    organizationId: string,
+  ) {
     return this.scopedPrisma.workLocation.findMany({
       where: {
         organizationId,
@@ -178,33 +203,62 @@ export class WorkLocationsService {
       'radiusMeters',
     ] as const;
     const touchesGeometry = GEOMETRY_KEYS.some((k) => dto[k] !== undefined);
+    const geoFenceEnabled = dto.geoFenceEnabled ?? existing.geoFenceEnabled;
+    // Switching the fence on for a location that had none: the geometry must be given in full (the stored values are placeholders).
+    const switchingOn =
+      dto.geoFenceEnabled === true && !existing.geoFenceEnabled;
+    const switchingOff =
+      dto.geoFenceEnabled === false && existing.geoFenceEnabled;
 
     const geometryData: Pick<
       Prisma.WorkLocationUpdateManyMutationInput,
       'fenceType' | 'boundary' | 'latitude' | 'longitude' | 'radiusMeters'
     > = {};
 
-    if (touchesGeometry) {
-      const fenceType = dto.fenceType ?? existing.fenceType;
+    if (switchingOff) {
+      // No fence: placeholders, so nothing else reads a stale fence.
+      geometryData.fenceType = FenceType.CIRCLE;
+      geometryData.boundary = Prisma.JsonNull;
+      geometryData.latitude = 0;
+      geometryData.longitude = 0;
+      geometryData.radiusMeters = 200;
+    } else if (geoFenceEnabled && (touchesGeometry || switchingOn)) {
+      const fenceType =
+        dto.fenceType ?? (switchingOn ? FenceType.CIRCLE : existing.fenceType);
       const boundary = (
-        dto.boundary !== undefined ? dto.boundary : existing.boundary
+        dto.boundary !== undefined
+          ? dto.boundary
+          : switchingOn
+            ? undefined
+            : existing.boundary
       ) as Boundary | undefined;
       const latitude =
-        dto.latitude !== undefined ? dto.latitude : existing.latitude;
+        dto.latitude !== undefined
+          ? dto.latitude
+          : switchingOn
+            ? undefined
+            : existing.latitude;
       const longitude =
-        dto.longitude !== undefined ? dto.longitude : existing.longitude;
+        dto.longitude !== undefined
+          ? dto.longitude
+          : switchingOn
+            ? undefined
+            : existing.longitude;
       const radiusMeters =
         dto.radiusMeters !== undefined
           ? dto.radiusMeters
-          : existing.radiusMeters;
+          : switchingOn
+            ? 200
+            : existing.radiusMeters;
 
       this.assertValidGeometry(fenceType, boundary, latitude, longitude);
 
       const summary = deriveCircleSummary(
         fenceType,
         boundary,
-        latitude,
-        longitude,
+        // assertValidGeometry above has refused a missing value.
+        latitude as number,
+        longitude as number,
         radiusMeters || 200,
       );
 
@@ -243,8 +297,13 @@ export class WorkLocationsService {
         // A city typed without a class re-suggests the class; a class chosen by hand always wins.
         ...(dto.cityClass !== undefined
           ? { cityClass: dto.cityClass }
-          : dto.city !== undefined && { cityClass: cityClassForCity(dto.city) }),
+          : dto.city !== undefined && {
+              cityClass: cityClassForCity(dto.city),
+            }),
         ...(dto.isActive !== undefined && { isActive: dto.isActive }),
+        ...(dto.geoFenceEnabled !== undefined && {
+          geoFenceEnabled: dto.geoFenceEnabled,
+        }),
         ...geometryData,
       },
     });
@@ -332,6 +391,7 @@ export class WorkLocationsService {
       where: {
         organizationId,
         fenceType: fence.fenceType,
+        geoFenceEnabled: true,
         ...(excludeId && { id: { not: excludeId } }),
       },
       select: {

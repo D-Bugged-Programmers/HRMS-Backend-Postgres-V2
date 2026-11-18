@@ -90,6 +90,11 @@ class BulkEmployeeRowDto {
   @ApiPropertyOptional()
   @IsOptional()
   liveTracking?: unknown;
+
+  // Optional Yes / No: overtime for this person (overrides rule sets); blank = follow them.
+  @ApiPropertyOptional()
+  @IsOptional()
+  overtime?: unknown;
 }
 
 export class BulkCreateEmployeesDto {

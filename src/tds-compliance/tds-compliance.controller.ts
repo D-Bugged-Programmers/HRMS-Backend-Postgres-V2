@@ -72,7 +72,12 @@ export class TdsComplianceController {
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
   monthly(@Query() q: TdsMonthQueryDto, @CurrentUser() c: Caller) {
-    return this.service.monthlySummary(q.month, q.year, c.organizationId);
+    return this.service.monthlySummary(
+      q.month,
+      q.year,
+      c.organizationId,
+      q.companyId,
+    );
   }
 
   @Get('monthly/report')
@@ -89,6 +94,7 @@ export class TdsComplianceController {
       q.month,
       q.year,
       c.organizationId,
+      q.companyId,
     );
     await sendReportBranded(res, this.scopedPrisma, c.organizationId, {
       ...report,
@@ -104,6 +110,7 @@ export class TdsComplianceController {
       q.financialYear,
       q.quarter,
       c.organizationId,
+      q.companyId,
     );
   }
 
@@ -121,6 +128,7 @@ export class TdsComplianceController {
       q.financialYear,
       q.quarter,
       c.organizationId,
+      q.companyId,
     );
     await sendReportBranded(res, this.scopedPrisma, c.organizationId, {
       ...report,
@@ -141,6 +149,7 @@ export class TdsComplianceController {
     const report = await this.service.annexureIIReport(
       q.financialYear,
       c.organizationId,
+      q.companyId,
     );
     await sendReportBranded(res, this.scopedPrisma, c.organizationId, {
       ...report,
@@ -152,7 +161,11 @@ export class TdsComplianceController {
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
   challans(@Query() q: ChallanListQueryDto, @CurrentUser() c: Caller) {
-    return this.service.listChallans(q.financialYear, c.organizationId);
+    return this.service.listChallans(
+      q.financialYear,
+      c.organizationId,
+      q.companyId,
+    );
   }
 
   @Post('challans')
@@ -184,7 +197,11 @@ export class TdsComplianceController {
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
   statements(@Query() q: ChallanListQueryDto, @CurrentUser() c: Caller) {
-    return this.service.listStatements(q.financialYear, c.organizationId);
+    return this.service.listStatements(
+      q.financialYear,
+      c.organizationId,
+      q.companyId,
+    );
   }
 
   @Put('statements')

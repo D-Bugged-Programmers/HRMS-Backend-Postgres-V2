@@ -14,9 +14,13 @@ function build(
 ) {
   const challans: Row[] = (o.challans ?? []).map((c) => ({
     organizationId: 'org',
+    brandId: null,
     ...c,
   }));
-  const statements: Row[] = o.statements ?? [];
+  const statements: Row[] = (o.statements ?? []).map((st) => ({
+    brandId: null,
+    ...st,
+  }));
   const match = (r: Row, w: Row = {}) =>
     Object.entries(w).every(([k, v]) =>
       v && typeof v === 'object' && 'not' in (v as Row)
@@ -70,6 +74,17 @@ function build(
       log: async (e: Row) => {
         audit.push(e);
       },
+    } as never,
+    // No sister company: every employee works for the organization itself.
+    {
+      forEmployee: async () => ({ brandId: null }),
+      // No company chosen = everyone, as before.
+      companyScope: async (_org: string, id?: string) => ({
+        runWhere: id === 'MAIN' ? { brandId: null } : {},
+        registration: null,
+        company: null,
+        brandId: id === 'MAIN' ? null : undefined,
+      }),
     } as never,
   );
   return { service, challans };
@@ -286,5 +301,87 @@ describe('Form 130 readiness', () => {
     const b = await noPayroll.service.form130Readiness('e1', '2026-27', 'org');
     expect(b.ready).toBe(false);
     expect(b.blockers.join(' ')).toMatch(/No finalized payroll/);
+  });
+
+  it("a sister company's employee is judged on THAT company's TAN, never the parent's", async () => {
+    const { service } = build({ org, runs: [run], employeePan: 'ABCDE1234F' });
+    (service as unknown as { brandingLookup: unknown }).brandingLookup = {
+      forEmployee: async () => ({
+        brandId: 'b1',
+        companyName: 'Sister A',
+        legalName: null,
+        address: null,
+        contactEmail: null,
+        phone: null,
+        registration: { tan: null, pan: 'PQRSX5678L' },
+      }),
+    };
+    const r = await service.form130Readiness('e1', '2026-27', 'org');
+    expect(r.ready).toBe(false);
+    expect(r.blockers.join(' ')).toMatch(/TAN is not set/);
+  });
+});
+
+describe('TDS challans and statements per company', () => {
+  const withBrands = (o: Parameters<typeof build>[0] = {}) => {
+    const b = build(o);
+    (b.service as unknown as { brandingLookup: unknown }).brandingLookup = {
+      forEmployee: async () => ({ brandId: null }),
+      companyScope: async (_org: string, id?: string) =>
+        id === 'sister1'
+          ? {
+              runWhere: { brandId: 'sister1' },
+              registration: { tan: 'MUMS12345A', pan: 'PQRSX5678L' },
+              company: 'Sister One',
+              brandId: 'sister1',
+            }
+          : {
+              runWhere: id === 'MAIN' ? { brandId: null } : {},
+              registration: null,
+              company: null,
+              brandId: id === 'MAIN' ? null : undefined,
+            },
+    };
+    return b;
+  };
+
+  it('records a challan against the chosen company, the main company when none is chosen', async () => {
+    const { service, challans } = withBrands();
+    await service.createChallan(
+      dto({ companyId: 'sister1' }),
+      actor,
+      'org',
+    );
+    await service.createChallan(
+      dto({ challanSerialNo: '00124' }),
+      actor,
+      'org',
+    );
+    expect(challans.map((c) => c.brandId)).toEqual(['sister1', null]);
+  });
+
+  it("a filed statement of one company does not lock another company's challans", async () => {
+    const { service } = withBrands({
+      statements: [
+        {
+          financialYear: '2026-27',
+          quarter: 3,
+          receiptNumber: 'ACK-1',
+          organizationId: 'org',
+          brandId: null,
+        },
+      ],
+    });
+    // The main company filed Q3; the sister company still may add its own challan.
+    await expect(
+      service.createChallan(dto({ companyId: 'sister1' }), actor, 'org'),
+    ).resolves.toBeDefined();
+    await expect(
+      service.createChallan(
+        dto({ challanSerialNo: '00125', companyId: 'MAIN' }),
+        actor,
+        'org',
+      ),
+    ).rejects.toThrow(/already filed/);
   });
 });

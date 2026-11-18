@@ -434,6 +434,8 @@ export class OrganizationSettingsService {
     const org = await this.findOrThrow(organizationId);
     const signed = this.withSignedUrls(org);
     const loginPolicy = readLoginPolicy(org.policies);
+    // Income tax off => no TDS and no Form 130; the apps hide every Form 130 surface. Missing row reads as on (the default).
+    const payrollFlags = await this.prisma.payrollSettings.findFirst({ where: { organizationId }, select: { incomeTaxEnabled: true } });
     const policies = (org.policies ?? {}) as {
       currencySymbol?: string;
       defaultNoticeDays?: number;
@@ -452,6 +454,7 @@ export class OrganizationSettingsService {
       // How people sign in, and whether someone may have no email (Policies > Sign-in); the Add Employee form follows them.
       loginMethod: loginPolicy.method,
       allowNoEmail: loginPolicy.allowNoEmail,
+      incomeTaxEnabled: payrollFlags?.incomeTaxEnabled !== false,
       companyName: org.companyName,
       tagline: org.tagline,
       companyLogoUrl: signed.companyLogoUrl,

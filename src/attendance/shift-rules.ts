@@ -16,6 +16,8 @@ export interface ShiftRuleLite {
   endTime: string;
   breakMinutes: number | null;
   departmentIds: string[];
+  // Set for a rule made inside a work schedule: it follows that schedule's departments and does nothing while it has none.
+  workScheduleId?: string | null;
   isActive: boolean;
 }
 
@@ -30,7 +32,16 @@ export function pickShiftRule<T extends ShiftRuleLite>(
   person: ShiftPerson,
 ): T | null {
   if (!rules?.length) return null;
-  const live = rules.filter((r) => r.isActive);
+  // A schedule's own rule with no department yet must not fall through to "every department".
+  const live = rules.filter(
+    (r) =>
+      r.isActive &&
+      !(
+        r.workScheduleId &&
+        !(r.employeeIds ?? []).length &&
+        r.departmentIds.length === 0
+      ),
+  );
   // A rule that names people applies to them alone, whatever their gender or department.
   const named = live.find(
     (r) => !!person.id && (r.employeeIds ?? []).includes(person.id),
@@ -63,8 +74,9 @@ export function shiftDepartmentFor<D extends DepartmentShiftFields>(
     departmentId:
       (department as { id?: string } | null)?.id ?? person.departmentId,
   });
-  // Without a department there is nothing to lay a rule over (the company default shift applies).
-  if (!rule || !department) return department;
+  // Without a department there is nothing to lay a rule over (the company default shift applies); a flexible shift has no times
+  // to replace.
+  if (!rule || !department || department.isFlexibleShift) return department;
   return {
     ...department,
     shiftStartTime: rule.startTime,

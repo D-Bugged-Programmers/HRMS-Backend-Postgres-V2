@@ -448,13 +448,13 @@ export class ReimbursementsService {
           return {
             name: b.legalName || b.companyName,
             address: b.brandId ? b.address ?? '' : b.address ? [b.address, [place, org?.pincode].filter(Boolean).join(' - ')].filter(Boolean).join('\n') : orgAddress,
-            contactLine: [b.contactEmail ? `Email: ${b.contactEmail}` : '', org?.gstin ? `GST: ${org.gstin}` : ''].filter(Boolean).join('                       '),
+            contactLine: [b.contactEmail ? `Email: ${b.contactEmail}` : '', (b.brandId ? b.registration.gstin : org?.gstin) ? `GST: ${b.brandId ? b.registration.gstin : org?.gstin}` : ''].filter(Boolean).join('                       '),
             city: org?.city ?? '',
             logo,
             phone: b.phone ?? '',
             email: b.contactEmail ?? '',
             website: b.website ?? '',
-            gstin: org?.gstin ?? '',
+            gstin: (b.brandId ? b.registration.gstin : org?.gstin) ?? '',
           };
         })();
         companyCache.set(key, found);

@@ -26,6 +26,50 @@ export const ACCOUNT_LABELS: Record<string, string> = {
   'module.account_activity': 'Account Activity',
 };
 
+// Company Admin > Organization menu entries: switched on/off per company in the Control Center. Menu and page only - the data
+// stays readable for the other screens that use it (an Employee form still lists designations), so these have no API segments below.
+export const ORG_ITEM_LABELS: Record<string, string> = {
+  'module.org_locations': 'Organization: Locations & Branches',
+  'module.org_departments': 'Organization: Departments',
+  'module.org_designations': 'Organization: Designations',
+  'module.org_grades': 'Organization: Grades / Levels',
+  'module.org_reporting_structure': 'Organization: Reporting Structure',
+  'module.org_employee_categories': 'Organization: Employee Categories',
+  'module.org_employment_types': 'Organization: Employment Types',
+  'module.org_holidays': 'Organization: Holiday Calendar',
+  'module.org_required_documents': 'Organization: Required Documents',
+  'module.org_reasons_for_leaving': 'Organization: Reasons for Leaving',
+  'module.org_email_templates': 'Organization: Email Templates',
+  'module.org_data_privacy': 'Organization: Data Privacy & Protection',
+  'module.org_audit_logs': 'Organization: Audit Logs',
+};
+
+// More menu pages, whole features inside screens, report sections and the mobile app: switched on/off per company in the Control
+// Center. Like ORG_ITEM_LABELS they hide things in the apps only and have no API segments.
+export const SCREEN_SWITCH_LABELS: Record<string, string> = {
+  // Menu pages
+  'module.menu_onboarding': 'Menu: Onboarding (New Joiners, Pending Onboarding, Probation Tracker)',
+  'module.menu_employee_history': 'Menu: Employee History',
+  'module.menu_tds_compliance': 'Menu: TDS Compliance',
+  'module.menu_approvals': 'Menu: Approvals',
+  'module.menu_my_requests': 'Menu: My Requests',
+  'module.menu_performance_reviews': 'Menu: Performance Reviews',
+  // Features inside screens
+  'module.feature_overtime': 'Feature: Overtime',
+  'module.feature_flexible_shift': 'Feature: Flexible shifts in work schedules',
+  'module.feature_geofence': 'Feature: Geo-fencing on locations',
+  'module.feature_bulk_employee_upload': 'Feature: Bulk Excel upload of employees',
+  'module.feature_certificate_email': 'Feature: Emailing Form 130 / Form 16 to employees',
+  'module.feature_payslip_download': 'Feature: Payslip download and print',
+  // Report sections
+  'module.report_payroll_compliance': 'Reports: Payroll & Compliance section',
+  'module.report_operations': 'Reports: Operations section',
+  'module.report_scheduled': 'Reports: Scheduled reports section',
+  'module.report_builder': 'Reports: Custom report builder',
+  // Mobile
+  'module.mobile_app': 'Mobile app',
+};
+
 const SEGMENTS: Record<string, string[]> = {
   'module.attendance': ['attendance', 'work-schedules', 'overtime', 'field-tracking', 'field-visits'],
   'module.leave': ['leaves', 'leave-balances', 'leave-encashments', 'leave-grants', 'leave-tracker', 'leave-types', 'leave-year', 'comp-offs'],

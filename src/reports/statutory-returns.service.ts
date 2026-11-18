@@ -4,6 +4,7 @@
 //   decrypts the ESIC number through a top-level user read, resolves each employee's work-location state for PT, and
 //   hands the rows to the pure builders (esic-return.ts / pt-return.ts).
 // Important: the wages and contributions are the ones payroll stored on each run; nothing is recomputed here.
+import { BrandingLookupService } from '../company-brands/branding-lookup.service';
 import { EXPORTABLE_RUNS } from '../payroll/exportable-runs';
 import { Inject, Injectable } from '@nestjs/common';
 import ExcelJS from 'exceljs';
@@ -58,14 +59,31 @@ const pad = (n: number) => String(n).padStart(2, '0');
 export class StatutoryReturnsService {
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
+    private readonly brandingLookup: BrandingLookupService,
   ) {}
 
   // ── ESIC ────────────────────────────────────────────────────────────────
 
-  async esic(month: number, year: number, organizationId: string) {
+  async esic(
+    month: number,
+    year: number,
+    organizationId: string,
+    companyId?: string,
+  ) {
+    // One company's return: only its people, and its own ESIC employer code.
+    const scope = await this.brandingLookup.companyScope(
+      organizationId,
+      companyId,
+    );
     const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
     const runs = await this.scopedPrisma.payrollRun.findMany({
-      where: { organizationId, month, year, ...EXPORTABLE_RUNS },
+      where: {
+        organizationId,
+        month,
+        year,
+        ...EXPORTABLE_RUNS,
+        ...scope.runWhere,
+      },
       orderBy: [{ isFinalSettlement: 'asc' }, { createdAt: 'asc' }],
     });
     const esiRuns = runs.filter(
@@ -174,14 +192,20 @@ export class StatutoryReturnsService {
       where: { id: organizationId },
       select: { esicEmployerCode: true },
     });
-    const code = (org?.esicEmployerCode ?? '').replace(/[^A-Za-z0-9]/g, '');
+    const employerCodeRaw =
+      (scope.registration
+        ? scope.registration.esicEmployerCode
+        : org?.esicEmployerCode) ?? '';
+    const code = employerCodeRaw.replace(/[^A-Za-z0-9]/g, '');
     const due =
       month === 12 ? `${year + 1}-01-15` : `${year}-${pad(month + 1)}-15`;
     return {
       month,
       year,
       monthLabel: `${MONTH_NAMES[month]} ${year}`,
-      employerCode: org?.esicEmployerCode ?? '',
+      employerCode: employerCodeRaw,
+      company: scope.company,
+      employerCodeMissing: !!scope.company && !employerCodeRaw,
       fileBase: `ESIC_MC_${code || 'EMPLOYER'}_${pad(month)}${year}`,
       dueDate: due,
       members: members.length,
@@ -194,7 +218,11 @@ export class StatutoryReturnsService {
       // The employer's share (3.25% of ESI wages), so the challan total can be shown: both shares are paid together.
       employerContribution: esiRuns.reduce(
         (s, r) =>
-          s + amountOf(r.employerContributions, SALARY_COMPONENT_CODES.ESI_EMPLOYER),
+          s +
+          amountOf(
+            r.employerContributions,
+            SALARY_COMPONENT_CODES.ESI_EMPLOYER,
+          ),
         0,
       ),
     };
@@ -236,9 +264,24 @@ export class StatutoryReturnsService {
 
   // ── Professional Tax ────────────────────────────────────────────────────
 
-  async pt(month: number, year: number, organizationId: string) {
+  async pt(
+    month: number,
+    year: number,
+    organizationId: string,
+    companyId?: string,
+  ) {
+    const scope = await this.brandingLookup.companyScope(
+      organizationId,
+      companyId,
+    );
     const runs = await this.scopedPrisma.payrollRun.findMany({
-      where: { organizationId, month, year, ...EXPORTABLE_RUNS },
+      where: {
+        organizationId,
+        month,
+        year,
+        ...EXPORTABLE_RUNS,
+        ...scope.runWhere,
+      },
     });
     const ptRuns = runs.filter((r) =>
       hasLine(r.deductions, SALARY_COMPONENT_CODES.PT),
@@ -303,7 +346,15 @@ export class StatutoryReturnsService {
   // The annual statutory bonus for every employee with signed-off payroll in a financial year, on the bonus module's
   // configuration in force at the year's end: rate, eligibility ceiling and the calculation base (higher of ₹7,000 and
   // the applicable minimum wage). This is the amount to pay; paying it is a separate supplementary run.
-  async statutoryBonus(financialYear: string, organizationId: string) {
+  async statutoryBonus(
+    financialYear: string,
+    organizationId: string,
+    companyId?: string,
+  ) {
+    const scope = await this.brandingLookup.companyScope(
+      organizationId,
+      companyId,
+    );
     const startYear = Number(financialYear.slice(0, 4));
     const yearEnd = `${startYear + 1}-03-31`;
     const version = await this.scopedPrisma.statutoryConfigVersion.findFirst({
@@ -333,6 +384,7 @@ export class StatutoryReturnsService {
         financialYear,
         runSequence: 0,
         ...EXPORTABLE_RUNS,
+        ...scope.runWhere,
       },
       select: {
         employeeId: true,
@@ -399,9 +451,24 @@ export class StatutoryReturnsService {
 
   // Members with an LWF contribution this month, grouped by work-location state. LWF is deducted only in the
   // months a state's schedule says (e.g. June and December), so most months are empty.
-  async lwf(month: number, year: number, organizationId: string) {
+  async lwf(
+    month: number,
+    year: number,
+    organizationId: string,
+    companyId?: string,
+  ) {
+    const scope = await this.brandingLookup.companyScope(
+      organizationId,
+      companyId,
+    );
     const runs = await this.scopedPrisma.payrollRun.findMany({
-      where: { organizationId, month, year, ...EXPORTABLE_RUNS },
+      where: {
+        organizationId,
+        month,
+        year,
+        ...EXPORTABLE_RUNS,
+        ...scope.runWhere,
+      },
     });
     const lwfRuns = runs.filter(
       (r) =>
@@ -490,8 +557,9 @@ export class StatutoryReturnsService {
     month: number,
     year: number,
     organizationId: string,
+    companyId?: string,
   ): Promise<ReportPayload> {
-    const r = await this.lwf(month, year, organizationId);
+    const r = await this.lwf(month, year, organizationId, companyId);
     return {
       title: `Labour Welfare Fund — Employee-wise (${r.monthLabel})`,
       subtitle:
@@ -518,8 +586,9 @@ export class StatutoryReturnsService {
     month: number,
     year: number,
     organizationId: string,
+    companyId?: string,
   ): Promise<ReportPayload> {
-    const r = await this.pt(month, year, organizationId);
+    const r = await this.pt(month, year, organizationId, companyId);
     return {
       title: `Professional Tax — Employee-wise (${r.monthLabel})`,
       subtitle:
@@ -546,8 +615,9 @@ export class StatutoryReturnsService {
     month: number,
     year: number,
     organizationId: string,
+    companyId?: string,
   ): Promise<ReportPayload> {
-    const r = await this.pt(month, year, organizationId);
+    const r = await this.pt(month, year, organizationId, companyId);
     return {
       title: `Professional Tax Return Summary (${r.monthLabel})`,
       subtitle:

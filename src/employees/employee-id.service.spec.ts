@@ -10,7 +10,7 @@ function tx(o: { brand?: Row | null; taken?: string[]; org?: Row }) {
       return [{ documentNumbering: { employeeId: { label: 'Employee ID', format: 'DP-{00000}', resetRule: 'never', counter: 7, lastPeriodKey: null } } }];
     },
     user: { findFirst: async (a: Row) => ((o.taken ?? []).includes(a.where.employeeId) ? { id: 'x' } : null) },
-    companyBrand: { update: async (a: Row) => { updates.push(a); } },
+    companyBrand: { updateMany: async (a: Row) => { updates.push(a); } },
     organization: { update: async () => undefined },
   };
   return { t, updates };

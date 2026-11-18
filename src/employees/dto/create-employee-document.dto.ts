@@ -33,5 +33,4 @@ export class CreateEmployeeDocumentDto {
   @IsOptional()
   @IsEnum(EmployeeDocumentCategory)
   category?: EmployeeDocumentCategory;
-
 }

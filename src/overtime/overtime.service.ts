@@ -16,7 +16,13 @@ import {
   markPayrollInputsChanged,
 } from '../payroll/payroll-period-guard';
 import { EMPLOYEE_RELATION_ORDER_BY } from '../common/employee-order';
-import { OVERTIME_PAY_OFF_MESSAGE, isOvertimePayEnabled } from './overtime-pay';
+import {
+  OVERTIME_PAY_CODE,
+  OVERTIME_PAY_OFF_MESSAGE,
+  isOvertimePayEnabled,
+  isOvertimeSwitchOn,
+} from './overtime-pay';
+import { estimateOvertimeAmount, loadMonthlyBasics } from './overtime-basics';
 import {
   BadRequestException,
   ConflictException,
@@ -30,6 +36,7 @@ import {
   CompOffStatus,
   NotificationCategory,
   OvertimeStatus,
+  PayrollRunStatus,
   OvertimeType,
   Prisma,
   Role,
@@ -76,7 +83,12 @@ import { EmailTemplatesService } from '../email-templates/email-templates.servic
 import { ApprovalDelegationService } from '../approval-delegation/approval-delegation.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
-import { applyRuleSetPolicy, applyRuleSetRates, pickRuleSet, type RuleSetPerson } from './overtime-rule-sets';
+import {
+  applyRuleSetPolicy,
+  applyRuleSetRates,
+  pickRuleSet,
+  type RuleSetPerson,
+} from './overtime-rule-sets';
 import {
   formatDateDisplay,
   resolveOrgDateTimeFormat,
@@ -131,20 +143,31 @@ export async function getOvertimeRates(
 // (Organization Settings > Overtime rule sets) laid over them. Exported so the punch-out auto-suggestion in
 // AttendanceService uses exactly the same rules.
 export async function getEffectiveOvertime(
-  db: Pick<Prisma.TransactionClient, 'organization' | 'payrollSettings' | 'overtimeRuleSet'>,
+  db: Pick<
+    Prisma.TransactionClient,
+    'organization' | 'payrollSettings' | 'overtimeRuleSet' | 'user'
+  >,
   organizationId: string,
   person: RuleSetPerson,
   date: string,
 ) {
-  const [companyPolicy, companyRates, sets] = await Promise.all([
+  const [companyPolicy, companyRates, sets, own] = await Promise.all([
     getOvertimePolicy(db, organizationId),
     getOvertimeRates(db, organizationId),
     db.overtimeRuleSet.findMany({ where: { organizationId, isActive: true } }),
+    db.user.findFirst({
+      where: { id: person.id, organizationId },
+      select: { overtimeEligibility: true },
+    }),
   ]);
   const set = pickRuleSet(sets, person, date);
+  const policy = applyRuleSetPolicy(companyPolicy, set);
+  // The employee's own setting (Employee Directory) beats the rule set and the company policy.
+  if (own?.overtimeEligibility)
+    policy.eligible = own.overtimeEligibility === 'ELIGIBLE';
   return {
     ruleSet: set ? { id: set.id, name: set.name } : null,
-    policy: applyRuleSetPolicy(companyPolicy, set),
+    policy,
     rates: applyRuleSetRates(companyRates, set, MIN_OVERTIME_MULTIPLIER),
   };
 }
@@ -359,9 +382,24 @@ export class OvertimeService {
     });
     // Companies that turned on automatic approval: regular/night overtime within the monthly cap is approved right away
     // through the normal review path (weekend/holiday work needs a compensation choice, so it always waits for a person).
-    const autoApproved = await this.tryAutoApprove(record.id, type, hours, usedThisMonth, actor, organizationId, policy);
+    const autoApproved = await this.tryAutoApprove(
+      record.id,
+      type,
+      hours,
+      usedThisMonth,
+      actor,
+      organizationId,
+      policy,
+    );
     if (autoApproved) return autoApproved;
-    await this.warnNearingCaps(policy, hours, usedThisMonth, usedThisQuarter, actor, organizationId);
+    await this.warnNearingCaps(
+      policy,
+      hours,
+      usedThisMonth,
+      usedThisQuarter,
+      actor,
+      organizationId,
+    );
     await this.notificationsService.notifyReviewers({
       organizationId,
       requester: actor,
@@ -386,19 +424,37 @@ export class OvertimeService {
     policy: OvertimePolicy,
   ) {
     try {
-      if (type !== OvertimeType.REGULAR && type !== OvertimeType.NIGHT) return null;
+      if (type !== OvertimeType.REGULAR && type !== OvertimeType.NIGHT)
+        return null;
       // A rule set can switch automatic approval off for its people, or on with its own monthly limit; otherwise the
       // company's rule decides.
       if (policy.autoApprove === 'OFF') return null;
       const company = await loadAutoApproval(this.scopedPrisma, organizationId);
       const overtimeRule =
         policy.autoApprove === 'ON'
-          ? { on: true, monthlyCapHours: policy.autoApproveMonthlyCapHours ?? company.overtime.monthlyCapHours }
+          ? {
+              on: true,
+              monthlyCapHours:
+                policy.autoApproveMonthlyCapHours ??
+                company.overtime.monthlyCapHours,
+            }
           : company.overtime;
       if (!overtimeQualifies(overtimeRule, hours, usedThisMonth)) return null;
-      const approver = await findAutoApprover(this.scopedPrisma, organizationId, requester.id);
+      const approver = await findAutoApprover(
+        this.scopedPrisma,
+        organizationId,
+        requester.id,
+      );
       if (!approver) return null;
-      return await this.review(id, { status: OvertimeStatus.APPROVED, comments: AUTO_APPROVAL_NOTE } as never, approver as never, organizationId);
+      return await this.review(
+        id,
+        {
+          status: OvertimeStatus.APPROVED,
+          comments: AUTO_APPROVAL_NOTE,
+        } as never,
+        approver as never,
+        organizationId,
+      );
     } catch {
       return null;
     }
@@ -601,7 +657,12 @@ export class OvertimeService {
     if (!employeeId) return this.compensationOptions(organizationId);
     const person = await this.scopedPrisma.user.findFirst({
       where: { id: employeeId, organizationId },
-      select: { id: true, departmentId: true, employeeType: true, designation: true },
+      select: {
+        id: true,
+        departmentId: true,
+        employeeType: true,
+        designation: true,
+      },
     });
     const { policy } = await getEffectiveOvertime(
       this.scopedPrisma,
@@ -610,7 +671,10 @@ export class OvertimeService {
       date ?? new Date().toISOString().slice(0, 10),
     );
     return {
-      ...(await this.compensationOptions(organizationId, policy.compensationMode)),
+      ...(await this.compensationOptions(
+        organizationId,
+        policy.compensationMode,
+      )),
       mode: policy.compensationMode,
     };
   }
@@ -633,7 +697,10 @@ export class OvertimeService {
       // Only when this request is the one that crosses 80%, so it is said once.
       if (used >= limit * 0.8 || used + hours < limit * 0.8) continue;
       const message = `${person.name} has used ${Math.round((used + hours) * 100) / 100} of ${limit} overtime hours allowed this ${label}.`;
-      const targets = [person.id, (person as { reportingManagerId?: string | null }).reportingManagerId].filter(Boolean) as string[];
+      const targets = [
+        person.id,
+        (person as { reportingManagerId?: string | null }).reportingManagerId,
+      ].filter(Boolean) as string[];
       for (const userId of targets) {
         try {
           const forManager = userId !== person.id;
@@ -659,7 +726,14 @@ export class OvertimeService {
   async getRates(organizationId: string, person?: Actor) {
     if (!person) return getOvertimeRates(this.scopedPrisma, organizationId);
     const today = new Date().toISOString().slice(0, 10);
-    return (await getEffectiveOvertime(this.scopedPrisma, organizationId, person, today)).rates;
+    return (
+      await getEffectiveOvertime(
+        this.scopedPrisma,
+        organizationId,
+        person,
+        today,
+      )
+    ).rates;
   }
 
   // Whether overtime is currently paid (the Overtime Pay salary component is active). The web and mobile apps use it
@@ -667,15 +741,22 @@ export class OvertimeService {
   async status(organizationId: string) {
     return {
       payEnabled: await isOvertimePayEnabled(this.scopedPrisma, organizationId),
+      switchOn: await isOvertimeSwitchOn(this.scopedPrisma, organizationId),
     };
   }
 
   async findAll(query: QueryOvertimeDto, actor: Actor, organizationId: string) {
+    // Overtime switched off: nothing to list.
+    if (!(await isOvertimePayEnabled(this.scopedPrisma, organizationId))) {
+      return { data: [], total: 0, page: query.page, limit: query.limit };
+    }
     const where: Prisma.OvertimeRecordWhereInput = { organizationId };
 
     if (actor.role === Role.EMPLOYEE) {
       where.employeeId = actor.id;
-    } else if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
+    } else if (
+      await isScopedReviewer(this.scopedPrisma, actor, organizationId)
+    ) {
       const deptIds = await deptScopedEmployeeIds(
         this.scopedPrisma,
         actor,
@@ -705,7 +786,7 @@ export class OvertimeService {
       where.date = { gte: from, lte: to };
     }
 
-    return paginate(
+    const page = await paginate(
       () =>
         this.scopedPrisma.overtimeRecord.findMany({
           where,
@@ -722,6 +803,103 @@ export class OvertimeService {
       query.page,
       query.limit,
     );
+    // Estimated pay per record: only for Admin / HR and for the person's own records (a manager sees hours, not pay).
+    const canSeePay = (empId: string) =>
+      actor.role === Role.ADMIN || actor.role === Role.HR || actor.id === empId;
+    const payIds = [
+      ...new Set(
+        page.data
+          .filter(
+            (r) =>
+              r.status !== OvertimeStatus.REJECTED && canSeePay(r.employeeId),
+          )
+          .map((r) => r.employeeId),
+      ),
+    ];
+    const asOf = page.data[0]?.date ?? new Date().toISOString().slice(0, 10);
+    const basics = await loadMonthlyBasics(
+      this.scopedPrisma,
+      payIds,
+      asOf,
+      organizationId,
+    );
+    return {
+      ...page,
+      data: page.data.map((r) => {
+        const basic = basics.get(r.employeeId);
+        return {
+          ...r,
+          estimatedAmount:
+            r.status !== OvertimeStatus.REJECTED &&
+            canSeePay(r.employeeId) &&
+            basic !== undefined
+              ? estimateOvertimeAmount(r, basic)
+              : null,
+        };
+      }),
+    };
+  }
+
+  // One month's overtime pay per person (Admin / HR): what the approved records come to, and what is actually on the
+  // payslip once payroll has run for the month. Both are shown so a difference (rounding, a Basic change) is visible.
+  async paySummary(month: number, year: number, organizationId: string) {
+    const { from, to } = monthRange(month, year);
+    const records = await this.scopedPrisma.overtimeRecord.findMany({
+      where: {
+        organizationId,
+        date: { gte: from, lte: to },
+        status: OvertimeStatus.APPROVED,
+      },
+      include: {
+        employee: { select: { id: true, name: true, employeeId: true } },
+      },
+    });
+    const ids = [...new Set(records.map((r) => r.employeeId))];
+    const [basics, runs] = await Promise.all([
+      loadMonthlyBasics(this.scopedPrisma, ids, to, organizationId),
+      this.scopedPrisma.payrollRun.findMany({
+        where: {
+          organizationId,
+          month,
+          year,
+          employeeId: { in: ids },
+          isFinalSettlement: false,
+          status: { not: PayrollRunStatus.DRAFT },
+        },
+        select: { employeeId: true, earnings: true, runSequence: true },
+        orderBy: { runSequence: 'desc' },
+      }),
+    ]);
+    const onPayslip = new Map<string, number>();
+    for (const run of runs) {
+      if (onPayslip.has(run.employeeId)) continue;
+      const line = (
+        (run.earnings ?? []) as unknown as { code: string; amount: number }[]
+      ).find((e) => e.code === OVERTIME_PAY_CODE);
+      onPayslip.set(run.employeeId, Number(line?.amount) || 0);
+    }
+    const rows = ids.map((id) => {
+      const mine = records.filter((r) => r.employeeId === id);
+      const basic = basics.get(id);
+      return {
+        employee: mine[0].employee,
+        approvedHours:
+          Math.round(mine.reduce((a, r) => a + r.hours, 0) * 100) / 100,
+        estimatedAmount:
+          basic === undefined
+            ? null
+            : Math.round(
+                mine.reduce((a, r) => a + estimateOvertimeAmount(r, basic), 0) *
+                  100,
+              ) / 100,
+        onPayslip: onPayslip.has(id) ? (onPayslip.get(id) as number) : null,
+      };
+    });
+    return {
+      month,
+      year,
+      rows: rows.sort((a, b) => a.employee.name.localeCompare(b.employee.name)),
+    };
   }
 
   async review(
@@ -730,7 +908,8 @@ export class OvertimeService {
     actor: Actor,
     organizationId: string,
   ) {
-    if (dto.status === 'REJECTED') requireReason(dto.comments, 'rejecting an overtime request');
+    if (dto.status === 'REJECTED')
+      requireReason(dto.comments, 'rejecting an overtime request');
     const record = await this.scopedPrisma.overtimeRecord.findFirst({
       where: { id, organizationId },
     });
@@ -738,7 +917,12 @@ export class OvertimeService {
     // The person's rule set decides who may review (HR only) and how off-day work may be compensated.
     const owner = await this.scopedPrisma.user.findFirst({
       where: { id: record.employeeId, organizationId },
-      select: { id: true, departmentId: true, employeeType: true, designation: true },
+      select: {
+        id: true,
+        departmentId: true,
+        employeeType: true,
+        designation: true,
+      },
     });
     const { policy: ownerPolicy } = await getEffectiveOvertime(
       this.scopedPrisma,

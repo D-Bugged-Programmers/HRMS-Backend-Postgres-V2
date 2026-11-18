@@ -1,5 +1,6 @@
 process.env.JWT_ACCESS_SECRET ??= 'test-secret-for-file-tokens';
 import {
+  aadhaarRequiredFor,
   assertContactNumbersDistinct,
   areMandatoryDocumentsUploaded,
   assertValidAddress,
@@ -45,13 +46,13 @@ describe('isProfileComplete', () => {
   });
 
   it('is false when one required field is missing', () => {
-    const { fatherName, ...rest } = COMPLETE_FIELDS;
-    void fatherName;
+    const { dateOfBirth, ...rest } = COMPLETE_FIELDS;
+    void dateOfBirth;
     expect(isProfileComplete(rest)).toBe(false);
   });
 
   it('is false when a required field is an empty/whitespace string', () => {
-    expect(isProfileComplete({ ...COMPLETE_FIELDS, fatherName: '  ' })).toBe(
+    expect(isProfileComplete({ ...COMPLETE_FIELDS, dateOfBirth: '  ' })).toBe(
       false,
     );
   });
@@ -60,16 +61,47 @@ describe('isProfileComplete', () => {
     expect(isProfileComplete(COMPLETE_FIELDS)).toBe(true);
   });
 
-  it('is false when a family, experience or bank-holder field is missing', () => {
+  it('stays complete without the optional fields: blood group, parents, a second emergency contact, experience, bank details and the cancelled cheque', () => {
     for (const key of [
       'bloodGroup',
+      'fatherName',
+      'fatherContact',
+      'motherName',
       'motherContact',
       'emergencyContact2Name',
+      'emergencyContact2Number',
       'totalExperience',
+      'currentOrganization',
+      'relevantExperience',
       'bankAccountHolderName',
+      'bankName',
+      'bankAccountNo',
+      'bankIFSC',
+      'cancelledChequeUrl',
     ]) {
-      expect(isProfileComplete({ ...COMPLETE_FIELDS, [key]: '' })).toBe(false);
+      expect(isProfileComplete({ ...COMPLETE_FIELDS, [key]: '' })).toBe(true);
     }
+  });
+
+  it('is false when a required family field (first emergency contact) is missing', () => {
+    expect(
+      isProfileComplete({ ...COMPLETE_FIELDS, emergencyContact1Name: '' }),
+    ).toBe(false);
+  });
+
+  it('asks for the Aadhaar number only where PF or ESI applies', () => {
+    const { aadharNumber, ...rest } = COMPLETE_FIELDS;
+    void aadharNumber;
+    expect(isProfileComplete(rest)).toBe(true);
+    expect(isProfileComplete(rest, { aadhaarRequired: true })).toBe(false);
+    expect(isProfileComplete(COMPLETE_FIELDS, { aadhaarRequired: true })).toBe(true);
+  });
+
+  it('aadhaarRequiredFor: on when PF or ESI is on for a covered type, off otherwise', () => {
+    expect(aadhaarRequiredFor({ pfEnabled: true, esiEnabled: false, employeeType: 'permanent' })).toBe(true);
+    expect(aadhaarRequiredFor({ pfEnabled: false, esiEnabled: true, employeeType: 'permanent' })).toBe(true);
+    expect(aadhaarRequiredFor({ pfEnabled: false, esiEnabled: false, employeeType: 'permanent' })).toBe(false);
+    expect(aadhaarRequiredFor({ pfEnabled: true, esiEnabled: true, employeeType: 'intern' })).toBe(false);
   });
 
   it('ignores fields outside the required set', () => {
@@ -153,7 +185,7 @@ describe('mergePersonalData', () => {
 
   it('clears profileCompletedAt if a later merge removes a required field', () => {
     const first = mergePersonalData({}, COMPLETE_FIELDS, true);
-    const second = mergePersonalData(first, { fatherName: '' }, true);
+    const second = mergePersonalData(first, { dateOfBirth: '' }, true);
     expect(second.profileCompleted).toBe(false);
     expect(second.profileCompletedAt).toBeNull();
   });
@@ -329,7 +361,7 @@ describe('assertValidIdentifiers: PF number', () => {
 describe('signPersonalDataFileUrls refreshes a stale completed flag', () => {
   it('reports not complete when the stored flag is true but a required field is empty', () => {
     const out = signPersonalDataFileUrls(
-      { ...COMPLETE_FIELDS, bloodGroup: '', profileCompleted: true },
+      { ...COMPLETE_FIELDS, dateOfBirth: '', profileCompleted: true },
       'org-1',
     );
     expect(out.profileCompleted).toBe(false);
