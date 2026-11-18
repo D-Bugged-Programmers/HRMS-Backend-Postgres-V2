@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsEnum, IsOptional } from 'class-validator';
+import { IsEnum, IsOptional, IsString, MaxLength } from 'class-validator';
 import { WorkArrangement } from '@prisma/client';
 import { IsValidCalendarDateString } from '../../common/is-valid-calendar-date.validator';
 
@@ -20,4 +20,13 @@ export class SetWorkArrangementDto {
   @IsOptional()
   @IsValidCalendarDateString()
   endDate?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Why Work From Home is needed (up to 500 characters). Kept with the request for the approver; ignored for any other arrangement.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  reason?: string;
 }

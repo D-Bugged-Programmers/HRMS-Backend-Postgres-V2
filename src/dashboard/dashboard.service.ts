@@ -955,6 +955,8 @@ export class DashboardService {
         date: g.rows[0].date,
         endDate: g.rows.length > 1 ? g.rows[g.rows.length - 1].date : null,
         requestedAt: g.rows[0].updatedAt,
+        // Why the employee asked, for the approver.
+        reason: g.rows[0].workArrangementReason ?? undefined,
       })),
       ...overtime.map((o) => ({
         type: 'OVERTIME' as const,

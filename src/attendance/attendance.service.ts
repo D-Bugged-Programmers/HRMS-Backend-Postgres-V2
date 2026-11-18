@@ -1813,6 +1813,7 @@ export class AttendanceService {
       workArrangementReviewedById: null,
       workArrangementReviewedAt: null,
       workArrangementReviewComments: null,
+      workArrangementReason: isWfh ? dto.reason?.trim() || null : null,
       // A single day stands alone; a group id left from an earlier multi-day request must not stick to it.
       wfhRequestId: null,
     };
@@ -2078,6 +2079,7 @@ export class AttendanceService {
       workArrangementReviewedById: null,
       workArrangementReviewedAt: null,
       workArrangementReviewComments: null,
+      workArrangementReason: dto.reason?.trim() || null,
       wfhRequestId: requestId,
     };
     for (const day of days) {

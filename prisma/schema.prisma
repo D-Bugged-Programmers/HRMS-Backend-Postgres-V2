@@ -1983,6 +1983,8 @@ model Attendance {
   workArrangementReviewedById   String?
   workArrangementReviewedAt     DateTime?
   workArrangementReviewComments String?
+  // Why the employee asked for Work From Home (set on a WFH request, cleared when the day goes back to the office).
+  workArrangementReason         String?
   // Rows requested together as one multi-day Work From Home request share this id (see wfh-request-days.ts).
   wfhRequestId                  String?
   isLate                        Boolean           @default(false)
