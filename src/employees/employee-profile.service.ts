@@ -55,6 +55,16 @@ import { assertNotSelfApproval } from '../common/dept-scope';
 
 type Actor = Omit<User, 'password'>;
 
+export type OrgChartNode = {
+  id: string;
+  employeeId: string;
+  name: string;
+  designation: string;
+  department: string;
+  children: OrgChartNode[];
+  teamSize: number;
+};
+
 const HR_ROLES: Role[] = [Role.ADMIN, Role.HR];
 
 // Reduces a bank field to a change-detection/audit-safe form — the last 4
@@ -164,6 +174,140 @@ export class EmployeeProfileService {
   // state any of the employee's documents of that type reached: APPROVED > PENDING (awaiting review) > REJECTED
   // (needs a new upload) > missing. Counts only - no file names or links. An HR/Admin employee's row is left out
   // for anyone but an Admin (or themselves), the same rule as their Documents tab (assertMayAccessDocumentsFor).
+  // The org chart: current employees as a reporting tree (name / designation / department only). Someone whose manager is
+  // missing, inactive or themselves sits at the top level; a reporting loop is cut so the tree always terminates.
+  async orgChart(organizationId: string): Promise<OrgChartNode[]> {
+    const people = await this.scopedPrisma.user.findMany({
+      where: {
+        organizationId,
+        isActive: true,
+        employmentStatus: {
+          notIn: ['RELEASED', 'TERMINATED', 'ABSCONDED', 'ON_HOLD'],
+        },
+      },
+      select: {
+        id: true,
+        employeeId: true,
+        name: true,
+        designation: true,
+        reportingManagerId: true,
+        department: { select: { name: true } },
+      },
+      orderBy: { name: 'asc' },
+    });
+    const nodes = new Map<string, OrgChartNode>(
+      people.map((e) => [
+        e.id,
+        {
+          id: e.id,
+          employeeId: e.employeeId,
+          name: e.name,
+          designation: e.designation,
+          department: e.department?.name ?? '',
+          children: [],
+          teamSize: 0,
+        },
+      ]),
+    );
+    const managerOf = new Map(people.map((x) => [x.id, x.reportingManagerId]));
+    const roots: OrgChartNode[] = [];
+    for (const e of people) {
+      const node = nodes.get(e.id)!;
+      // Walk up the managers: a loop back to this person means the link is cut.
+      let cursor = e.reportingManagerId
+        ? nodes.get(e.reportingManagerId)
+        : undefined;
+      let hops = 0;
+      let loops = false;
+      let up: string | null | undefined = e.reportingManagerId;
+      while (up && hops++ < 100) {
+        if (up === e.id) {
+          loops = true;
+          break;
+        }
+        up = managerOf.get(up);
+      }
+      if (cursor && !loops && cursor.id !== e.id) cursor.children.push(node);
+      else roots.push(node);
+    }
+    const size = (n: OrgChartNode): number => {
+      n.teamSize = n.children.reduce((sum, c) => sum + 1 + size(c), 0);
+      return n.teamSize;
+    };
+    roots.forEach(size);
+    return roots;
+  }
+
+  // Who is on probation and when it ends, overdue / due-soon first, for the Probation Tracker. A manager sees their own
+  // department and direct reports; HR and Admin see everyone (an HR/Admin row stays hidden from others, as elsewhere).
+  async probationTracker(actor: Actor, organizationId: string) {
+    const scope: Prisma.UserWhereInput[] =
+      actor.role === Role.MANAGER
+        ? [
+            { reportingManagerId: actor.id },
+            ...(actor.departmentId
+              ? [{ departmentId: actor.departmentId }]
+              : []),
+          ]
+        : [];
+    const people = await this.scopedPrisma.user.findMany({
+      where: {
+        organizationId,
+        isActive: true,
+        employmentStatus: { in: ['PROBATION', 'EXTENDED_PROBATION'] },
+        ...(scope.length ? { OR: scope } : {}),
+      },
+      select: {
+        id: true,
+        employeeId: true,
+        name: true,
+        role: true,
+        designation: true,
+        probationEndDate: true,
+        employmentStatus: true,
+        department: { select: { name: true } },
+        reportingManager: { select: { name: true } },
+      },
+    });
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const rows = people
+      .filter(
+        (e) =>
+          actor.id === e.id ||
+          actor.role === Role.ADMIN ||
+          !(e.role === Role.ADMIN || e.role === Role.HR),
+      )
+      .map((e) => {
+        const end = e.probationEndDate ? new Date(e.probationEndDate) : null;
+        const valid = end && !Number.isNaN(end.getTime());
+        const daysLeft = valid
+          ? Math.round((end.getTime() - today.getTime()) / 86400000)
+          : null;
+        const bucket =
+          daysLeft === null
+            ? 'NO_DATE'
+            : daysLeft < 0
+              ? 'OVERDUE'
+              : daysLeft <= 30
+                ? 'DUE_SOON'
+                : 'UPCOMING';
+        return {
+          id: e.id,
+          employeeId: e.employeeId,
+          name: e.name,
+          designation: e.designation,
+          department: e.department?.name ?? '',
+          probationEndDate: e.probationEndDate,
+          extended: e.employmentStatus === 'EXTENDED_PROBATION',
+          reportingManager: e.reportingManager?.name ?? null,
+          daysLeft,
+          bucket,
+        };
+      });
+    return rows.sort((a, b) => (a.daysLeft ?? 99999) - (b.daysLeft ?? 99999));
+  }
+
   async onboardingDocumentProgress(actor: Actor, organizationId: string) {
     const [requirements, employees] = await Promise.all([
       this.scopedPrisma.documentRequirement.findMany({

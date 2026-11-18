@@ -81,6 +81,25 @@ export class EmployeesController {
     return this.employeesService.findAll(query, caller, caller.organizationId);
   }
 
+  // Everyone can see who reports to whom (name, designation, department only). Before the :id routes.
+  @Get('org-chart')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER, Role.EMPLOYEE)
+  @UseGuards(RolesGuard)
+  orgChart(@CurrentUser() caller: Caller) {
+    return this.employeeProfileService.orgChart(caller.organizationId);
+  }
+
+  // Declared before the :id routes so "probation-tracker" is not read as an id.
+  @Get('probation-tracker')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
+  probationTracker(@CurrentUser() caller: Caller) {
+    return this.employeeProfileService.probationTracker(
+      caller,
+      caller.organizationId,
+    );
+  }
+
   // Mandatory-document progress for everyone still onboarding - feeds the Pending Onboarding list. Declared before
   // the :id routes so "onboarding-documents" is not read as an id.
   @Get('onboarding-documents')
