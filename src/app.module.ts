@@ -39,6 +39,7 @@ import { TaxDeclarationsModule } from './tax-declarations/tax-declarations.modul
 import { AttendanceModule } from './attendance/attendance.module';
 import { OvertimeModule } from './overtime/overtime.module';
 import { PerformanceRatingsModule } from './performance-ratings/performance-ratings.module';
+import { SelfReviewsModule } from './self-reviews/self-reviews.module';
 import { CompanyPerformanceModule } from './company-performance/company-performance.module';
 import { TdsComplianceModule } from './tds-compliance/tds-compliance.module';
 import { LeaveEncashmentsModule } from './leave-encashments/leave-encashments.module';
@@ -133,6 +134,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     AttendanceModule,
     OvertimeModule,
     PerformanceRatingsModule,
+    SelfReviewsModule,
     CompanyPerformanceModule,
     TdsComplianceModule,
     LeaveEncashmentsModule,
