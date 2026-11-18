@@ -2,10 +2,13 @@ import { Inject, Injectable, NotFoundException } from '@nestjs/common';
 import * as path from 'path';
 import PDFDocument from 'pdfkit';
 import * as QRCode from 'qrcode';
+import { backendPublicUrl } from '../common/backend-url';
+import { signPayslipToken } from './payslip-verify-token';
 import { PayrollRunStatus, PayrollTemplate } from '@prisma/client';
 import type { TaxDetails } from './tax-engine';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
+import { BrandingLookupService } from '../company-brands/branding-lookup.service';
 import { PayrollSettingsService } from '../payroll-settings/payroll-settings.service';
 import {
   DEFAULT_TIMEZONE,
@@ -170,6 +173,8 @@ interface YtdTotals {
 // (Prisma-fetched) PayrollRun+employee and the dummy preview run below.
 interface PayslipRun {
   id: string;
+  // Present on real runs (a full row); the dummy preview has none, and its QR simply will not verify.
+  organizationId?: string;
   payslipNumber: string | null;
   month: number;
   year: number;
@@ -284,7 +289,29 @@ export class PayslipPdfService {
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly payrollSettingsService: PayrollSettingsService,
+    private readonly brandingLookup: BrandingLookupService,
   ) {}
+
+  // A sister company's payslip: its name, logo and address replace the template's header values. A run with no brand keeps the
+  // template exactly as it is, so a company with no sister companies gets the payslip it always did.
+  private async withBrand<T extends { companyName: string; companyAddress: string | null; companyEmail: string | null; companyWebsite: string | null; companyContactNumber: string | null; companyLogoUrl: string | null }>(
+    template: T,
+    brandId: string | null | undefined,
+    organizationId: string,
+  ): Promise<T> {
+    if (!brandId) return template;
+    const b = await this.brandingLookup.forBrand(organizationId, brandId);
+    if (!b.brandId) return template;
+    return {
+      ...template,
+      companyName: b.companyName,
+      companyAddress: b.address ?? template.companyAddress,
+      companyEmail: b.contactEmail ?? template.companyEmail,
+      companyWebsite: b.website ?? template.companyWebsite,
+      companyContactNumber: b.phone ?? template.companyContactNumber,
+      companyLogoUrl: b.logoUrl ?? template.companyLogoUrl,
+    };
+  }
 
   async buildPayslipPdfBuffer(
     runId: string,
@@ -323,7 +350,7 @@ export class PayslipPdfService {
       this.getOrgPrintInfo(organizationId),
     ]);
 
-    return this.renderPayslipPdf(run, template, settings, ytd, printInfo);
+    return this.renderPayslipPdf(run, await this.withBrand(template, run.brandId, organizationId), settings, ytd, printInfo);
   }
 
   // The payslip as it was when this revision of the run was finalised (the run itself now holds the corrected figures).
@@ -373,7 +400,7 @@ export class PayslipPdfService {
     ]);
     const rendered = await this.renderPayslipPdf(
       asFinalised,
-      template,
+      await this.withBrand(template, run.brandId, organizationId),
       settings,
       ytd,
       printInfo,
@@ -514,16 +541,20 @@ export class PayslipPdfService {
     const tableRowH = rowCount > 10 ? 11 : rowCount > 6 ? 13 : 15;
     const tableFontSize = rowCount > 10 ? 6.5 : 7.5;
 
-    const qrBuffer = template.showQRCode
-      ? await QRCode.toBuffer(
-          `PAYSLIP|${run.id}|${run.employee.employeeId}|${run.month}-${run.year}|NET:${run.netPay}`,
-          {
-            type: 'png',
-            margin: 0,
-            width: 200,
-            color: { dark: secondary, light: '#FFFFFFFF' },
-          },
-        ).catch(() => null)
+    // The QR opens the public verification page (GET /verify/payslip/:token): a signed link, not the figures themselves.
+    let qrLink: string | null = null;
+    try {
+      qrLink = `${backendPublicUrl()}/verify/payslip/${signPayslipToken(run.organizationId ?? '', run.id)}`;
+    } catch {
+      /* no signing secret configured: the payslip is still produced, just without the QR */
+    }
+    const qrBuffer = template.showQRCode && qrLink
+      ? await QRCode.toBuffer(qrLink, {
+          type: 'png',
+          margin: 0,
+          width: 200,
+          color: { dark: secondary, light: '#FFFFFFFF' },
+        }).catch(() => null)
       : null;
 
     const buffer = await new Promise<Buffer>((resolve, reject) => {
@@ -798,11 +829,8 @@ export class PayslipPdfService {
       >;
       // Weekly Offs and Holidays are the days actually paid as such (attendance rows plus the calendar's weekly offs and
       // holidays, see payroll/off-days.ts). Older runs saved before those counts existed show the figures they have.
-      // A half day is worth half a day's pay: the other half shows as "Half-day deduction" instead of being folded into
-      // LOP, so LOP is only the full days lost (absent, unmarked, unpaid leave not counted here).
-      const halfDayDeduction = (a.halfDays ?? 0) * 0.5;
-      const lopFullDays =
-        a.lopDays != null ? Math.max(0, a.lopDays - halfDayDeduction) : null;
+      // A half-day attendance row is paid as a full day, so LOP is only the days lost to Absent / unmarked days.
+      const lopFullDays = a.lopDays ?? null;
       const attFields: [string, string | number][] = [
         ['Working Days', a.workingDays ?? '-'],
         ['Present Days', a.presentDays ?? '-'],
@@ -812,9 +840,6 @@ export class PayslipPdfService {
         ['Paid Leave', a.paidLeaveDays ?? '-'],
         ['Unpaid Leave', a.unpaidLeaveDays ?? '-'],
         ['LOP Days', lopFullDays ?? '-'],
-        ...(halfDayDeduction > 0
-          ? ([['Half-day deduction', halfDayDeduction]] as [string, number][])
-          : []),
         ['OT Hours', a.overtimeHours ?? '-'],
         [
           'Payable Days',
@@ -907,7 +932,21 @@ export class PayslipPdfService {
         fonts,
         money,
       });
-      y = Math.max(earnEndY, dedEndY) + 18;
+      // The days not paid are already taken out of the earnings; say where the reduction came from, below the deductions
+      // (not part of Total Deductions).
+      const cut = (run.attendanceSummary ?? {}) as Record<string, number | undefined>;
+      let noteEndY = dedEndY;
+      const cutLines: string[] = [];
+      if ((cut.lwpPayCut ?? 0) > 0) cutLines.push(`Leave without pay (LWP) - ${cut.unpaidLeaveDays ?? 0} day(s): - ${money(cut.lwpPayCut as number)}`);
+      if ((cut.lopPayCut ?? 0) > 0) cutLines.push(`Absent / unmarked (LOP) - ${cut.lopDays ?? 0} day(s): - ${money(cut.lopPayCut as number)}`);
+      if (cutLines.length > 0) {
+        doc.font(fonts.bold).fontSize(6.8).fillColor('#6b7280');
+        text('Pay already reduced in the earnings:', rightX, noteEndY + 6, { width: colW });
+        doc.font(fonts.regular).fontSize(6.8).fillColor('#6b7280');
+        cutLines.forEach((line, i) => text(line, rightX, noteEndY + 16 + i * 9, { width: colW }));
+        noteEndY += 16 + cutLines.length * 9;
+      }
+      y = Math.max(earnEndY, noteEndY) + 18;
 
       // ── Net Payable highlighted band ──────────────────────────────────
       const bandH = 42;

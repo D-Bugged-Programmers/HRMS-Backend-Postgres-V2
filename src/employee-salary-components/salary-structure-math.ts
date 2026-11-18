@@ -230,7 +230,7 @@ export interface StructureBreakdown {
   effectiveFrom: string | null;
 }
 
-const OCCURRENCES_PER_YEAR: Record<string, number> = {
+export const OCCURRENCES_PER_YEAR: Record<string, number> = {
   YEARLY: 1,
   HALF_YEARLY: 2,
   QUARTERLY: 4,
@@ -267,10 +267,11 @@ export function breakdownStructure(
         r.valueType === 'FIXED' ||
         (r.valueType === 'MANUAL' && r.amountBasis !== 'ANNUAL')
       ) {
-        monthlyByCode[code] = num(r.fixedAmount);
+        // Rounded to the rupee, as payroll pays each line (1,538.33 is paid as 1,538, and 50% of a Basic of 6,281 as 3,141).
+        monthlyByCode[code] = Math.round(num(r.fixedAmount));
       } else if (r.valueType === 'PERCENTAGE') {
         const base = monthlyByCode[r.percentageOf ?? ''] ?? 0;
-        monthlyByCode[code] = (base * num(r.percentageValue)) / 100;
+        monthlyByCode[code] = Math.round((base * num(r.percentageValue)) / 100);
       } else if (monthlyByCode[code] === undefined) {
         monthlyByCode[code] = 0;
       }

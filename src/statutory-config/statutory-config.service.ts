@@ -8,6 +8,7 @@
 // module per employee inside a full payroll batch — O(9xN) lookups of data that rarely changes. remove()
 // only allows deleting a future-dated version — past/current versions are permanent history — and refuses
 // to delete the last remaining version for a module.
+import { summariseModules } from './statutory-summary';
 import {
   BadRequestException,
   ConflictException,
@@ -42,6 +43,7 @@ import {
   suggestedAnswers,
 } from './statutory-setup';
 
+import { dmyText } from '../payroll/format-date';
 // The deduction/contribution modules - "statutory not set up" means none of these is on.
 const SETUP_MODULES: StatutoryModule[] = [
   StatutoryModule.PF,
@@ -165,7 +167,7 @@ export class StatutoryConfigService {
     });
     if (finalized) {
       throw new BadRequestException(
-        `Cannot add a ${module} version effective ${effectiveFrom}: payroll for ${finalized.month}/${finalized.year} is already locked or paid. Choose an effective date after the last finalized payroll month, or unlock those payroll runs first.`,
+        `Cannot add a ${module} version effective ${dmyText(effectiveFrom)}: payroll for ${finalized.month}/${finalized.year} is already locked or paid. Choose an effective date after the last finalized payroll month, or unlock those payroll runs first.`,
       );
     }
   }
@@ -187,7 +189,7 @@ export class StatutoryConfigService {
     });
     if (duplicate) {
       throw new ConflictException(
-        `A version for ${module} already starts on ${dto.effectiveFrom} — edit or delete it instead.`,
+        `A version for ${module} already starts on ${dmyText(dto.effectiveFrom)} — edit or delete it instead.`,
       );
     }
 
@@ -204,7 +206,7 @@ export class StatutoryConfigService {
     });
     if (latest && dto.effectiveFrom < latest.effectiveFrom) {
       throw new BadRequestException(
-        `New version must start after the most recent version's effective date (${latest.effectiveFrom}). Versions must be created in chronological order — backdating before the latest version is not supported.`,
+        `New version must start after the most recent version's effective date (${dmyText(latest.effectiveFrom)}). Versions must be created in chronological order — backdating before the latest version is not supported.`,
       );
     }
 
@@ -307,6 +309,16 @@ export class StatutoryConfigService {
       SETUP_MODULES.map((m) => this.getEffective(m, date, organizationId)),
     );
     return !results.some((r) => r.version?.isEnabled);
+  }
+
+  // One line per module for the Statutory Compliance Center's tab bar: in force today, and any change already scheduled.
+  async getSummary(organizationId: string) {
+    const today = localDateStr(await this.getOrgTimezone(organizationId));
+    const versions = await this.scopedPrisma.statutoryConfigVersion.findMany({
+      where: { organizationId },
+      select: { module: true, effectiveFrom: true, effectiveTo: true, isEnabled: true },
+    });
+    return summariseModules(Object.values(StatutoryModule), versions, today);
   }
 
   // What the guide needs: whether setup is still due, the headcount, and which of PF/ESI/PT to pre-select.

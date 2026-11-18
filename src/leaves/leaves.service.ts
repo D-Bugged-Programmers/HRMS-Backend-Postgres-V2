@@ -7,6 +7,8 @@
 // Important: review() implements a two-level workflow where a MANAGER's approval on a 2-level leave type
 // only records level-1 sign-off (status stays PENDING); only ADMIN/HR can give final approval. releaseHold()
 // is the single place that reverses whatever a leave's current status implied, shared by update() and cancel().
+import { managerIdsOf } from '../common/managers';
+import { keepModuleEnabled } from '../module-access/module-gate';
 import { EMPLOYEE_RELATION_ORDER_BY } from '../common/employee-order';
 import {
   BadRequestException,
@@ -20,6 +22,7 @@ import {
 import { Cron } from '@nestjs/schedule';
 import {
   AllocationType,
+  HalfDaySession,
   Leave,
   LeaveStatus,
   LeaveType,
@@ -40,6 +43,9 @@ import { CompOffService } from '../comp-offs/comp-off.service';
 import { AttendanceService } from '../attendance/attendance.service';
 import { PreviewLeaveDaysQueryDto } from './dto/preview-leave-days-query.dto';
 import { ApplyLeaveDto } from './dto/apply-leave.dto';
+import { ManualLeaveDto } from './dto/manual-leave.dto';
+import { ImportLeavesDto } from './dto/import-leaves.dto';
+import { isValidCalendarDateString } from '../common/is-valid-calendar-date.validator';
 import { UpdateLeaveDto } from './dto/update-leave.dto';
 import { ReviewLeaveDto } from './dto/review-leave.dto';
 import { ListLeavesQueryDto } from './dto/list-leaves-query.dto';
@@ -47,11 +53,22 @@ import { TeamCalendarQueryDto } from './dto/team-calendar-query.dto';
 import {
   checkLeaveRules,
   applicationDocumentRule,
+  chargedDatesInclusive,
+  chargedKindsOf,
+  countChargedDaysInclusive,
   effectiveLeaveRules,
   rangesOverlap,
   splitDaysByYear,
   LeaveRules,
 } from './leave-rules';
+import {
+  negativeBalanceRuleFor,
+  splitForLossOfPay,
+} from './negative-leave-balance';
+import {
+  getOrgLeaveSwitches,
+  readOrgLeaveSwitches,
+} from '../organizations/org-leave-switches';
 import { getLeaveYearConfig } from '../leave-balances/leave-year-config';
 import {
   currentLeaveYear,
@@ -70,6 +87,7 @@ import {
   assertManagerDeptScope,
   assertManagerScopeOrDelegate,
   deptScopedEmployeeIds,
+  isScopedReviewer,
 } from '../common/dept-scope';
 import { ApprovalDelegationService } from '../approval-delegation/approval-delegation.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -79,8 +97,20 @@ import { AuditLogService } from '../audit-log/audit-log.service';
 import {
   formatDateDisplay,
   resolveOrgDateTimeFormat,
+  dmyText,
 } from '../payroll/format-date';
 import { todayInOrgTz } from '../common/org-date';
+import {
+  leaveCancelWindowDaysOf,
+  ownerCancelOptions,
+  adminCanCancelOthers,
+  leaveTaken,
+  ownerCanCancel,
+} from './leave-cancel-rules';
+import {
+  DecideLeaveCancelDto,
+  RequestLeaveCancelDto,
+} from './dto/leave-cancel-request.dto';
 import {
   assertPayrollMonthsUnlocked,
   monthsBetween,
@@ -152,6 +182,61 @@ function monthsInRange(
   return months;
 }
 
+export interface ImportLeaveRowResult {
+  row: number;
+  employeeId: string;
+  employeeName?: string;
+  leaveType: string;
+  startDate: string;
+  endDate: string;
+  status: 'OK' | 'IMPORTED' | 'ERROR';
+  totalDays?: number;
+  message?: string;
+}
+
+export interface ImportLeavesResult {
+  dryRun: boolean;
+  total: number;
+  ok: number;
+  imported: number;
+  failed: number;
+  rows: ImportLeaveRowResult[];
+}
+
+// Options for recording past leave on an employee's behalf (the leave import).
+interface ImportOptions {
+  importing: true;
+  dryRun?: boolean;
+  extraRanges?: {
+    start: string;
+    end: string;
+    isHalfDay: boolean;
+    halfDaySession: HalfDaySession | null;
+  }[];
+  virtualDays?: Map<string, number>;
+}
+
+// The leave type's own rules about HOW and WHEN to apply (notice, backdating, duration limits, gaps, holiday
+// restrictions) govern an employee's application, not migrated history. What stays is what decides how many days a
+// leave costs (the type's sandwich rule and weekly offs / holidays) and the always-on checks (dates in order, no overlap,
+// a half day is a single day).
+function relaxedForImport(rules: LeaveRules): LeaveRules {
+  return {
+    ...rules,
+    minDurationDays: 0,
+    maxDurationDays: null,
+    noticePeriodDays: 0,
+    allowBackdated: true,
+    maxBackdateDays: 36500,
+    allowFutureDated: true,
+    maxAdvanceDays: null,
+    allowHalfDay: true,
+    restrictPrefixSuffixHoliday: false,
+    maxConsecutiveDays: null,
+    minGapBetweenRequestsDays: 0,
+  };
+}
+
 const NO_GRANT_MESSAGE =
   'No leave has been granted for this leave type, or the granted days are used up. HR grants it for a qualifying event.';
 
@@ -203,7 +288,177 @@ export class LeavesService {
         'leave',
       );
     }
-    return this.createLeaveInternal(dto, actor, organizationId);
+    const lossOfPay = await this.planLossOfPaySplit(dto, actor, organizationId);
+    if (!lossOfPay) return this.createLeaveInternal(dto, actor, organizationId);
+    return this.applyWithLossOfPay(dto, actor, organizationId, lossOfPay);
+  }
+
+  // Company switch Allow Negative Leave Balance, mode "Mark as Loss of Pay": when the request needs more days than the
+  // balance has, the part the balance covers stays on the leave type and the days beyond it become a Loss of Pay leave
+  // (pay deducted by payroll like any other Leave Without Pay). Returns null when none of that applies - the switch is
+  // off or in another mode, the type has no balance, the request fits, spans two leave years, or the organization has no
+  // active Leave Without Pay type - and the request then goes through the normal path (and the normal balance message).
+  private async planLossOfPaySplit(
+    dto: ApplyLeaveDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    if (!dto.startDate || !dto.endDate || dto.endDate < dto.startDate) {
+      return null;
+    }
+    const switches = await getOrgLeaveSwitches(
+      this.scopedPrisma,
+      organizationId,
+    );
+    if (
+      !switches.allowNegativeLeaveBalance ||
+      switches.negativeLeaveBalanceMode !== 'MARK_AS_LOP'
+    ) {
+      return null;
+    }
+    const leaveType = await this.scopedPrisma.leaveType.findFirst({
+      where: { id: dto.leaveType, organizationId, isActive: true },
+    });
+    if (
+      !leaveType ||
+      isCompOffType(leaveType) ||
+      isUnbalancedType(leaveType) ||
+      leaveType.allocationType === AllocationType.EVENT_BASED
+    ) {
+      return null;
+    }
+    const lwpType = await this.scopedPrisma.leaveType.findFirst({
+      where: {
+        organizationId,
+        code: 'LWP',
+        isActive: true,
+        id: { not: leaveType.id },
+      },
+    });
+    if (!lwpType) return null;
+    const [holidays, org, dept] = await Promise.all([
+      this.holidaysFor(actor, organizationId),
+      this.scopedPrisma.organization.findFirst({
+        where: { id: organizationId },
+      }),
+      actor.departmentId
+        ? this.scopedPrisma.department.findFirst({
+            where: { id: actor.departmentId, organizationId },
+          })
+        : Promise.resolve(null),
+    ]);
+    const leaveYearCfg: LeaveYearConfig = {
+      startMonth: org?.leaveYearStartMonth ?? 1,
+      anchorYear: org?.leaveYearAnchorYear ?? null,
+    };
+    const year = leaveYearOf(dto.startDate, leaveYearCfg);
+    if (leaveYearOf(dto.endDate, leaveYearCfg) !== year) return null;
+    const { weeklyOffs } = resolveShiftConfig(
+      dept,
+      org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
+    );
+    const rules = effectiveLeaveRules(
+      leaveType.rules as unknown as LeaveRules,
+      leaveType,
+    );
+    const holidayDates = new Set(holidays.map((h) => h.date));
+    const kinds = chargedKindsOf(rules);
+    const isHalfDay = dto.isHalfDay ?? false;
+    const totalDays = isHalfDay
+      ? 0.5
+      : countChargedDaysInclusive(
+          dto.startDate,
+          dto.endDate,
+          holidayDates,
+          weeklyOffs,
+          kinds,
+        );
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const available = await this.scopedPrisma.$transaction(async (tx) => {
+      const row = await this.leaveBalanceService.ensureBalanceRow(
+        tx,
+        actor.id,
+        leaveType.id,
+        year,
+        organizationId,
+      );
+      const forfeited = (
+        await this.leaveBalanceService.forfeitedCarryIn(
+          tx,
+          [row],
+          organizationId,
+          today,
+        )
+      ).get(row.id);
+      return checkAffordability(
+        row,
+        { allowed: false, maxNegativeDays: 0 },
+        0,
+        today,
+        forfeited ?? 0,
+      ).available;
+    });
+    const split = splitForLossOfPay({
+      startDate: dto.startDate,
+      endDate: dto.endDate,
+      isHalfDay,
+      totalDays,
+      available,
+      kinds,
+      holidayDates,
+      weeklyOffs,
+    });
+    if (split.lopDays <= 0 || !split.lopStart) return null;
+    return { leaveType, lwpType, split };
+  }
+
+  private async applyWithLossOfPay(
+    dto: ApplyLeaveDto,
+    actor: Actor,
+    organizationId: string,
+    plan: NonNullable<Awaited<ReturnType<LeavesService['planLossOfPaySplit']>>>,
+  ) {
+    const { leaveType, lwpType, split } = plan;
+    const days = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
+    const note = `Loss of Pay: ${days(split.lopDays)} over the ${leaveType.name} balance, applied together with the same request.`;
+    // The part the balance covers is created first, as an ordinary application.
+    const covered = split.coveredEnd
+      ? await this.createLeaveInternal(
+          { ...dto, endDate: split.coveredEnd },
+          actor,
+          organizationId,
+        )
+      : null;
+    let lossOfPay: Leave;
+    try {
+      lossOfPay = await this.createLeaveInternal(
+        {
+          ...dto,
+          leaveType: lwpType.id,
+          startDate: split.lopStart as string,
+          remarks: dto.remarks ? `${note} ${dto.remarks}` : note,
+        },
+        actor,
+        organizationId,
+      );
+    } catch (err) {
+      // Never leave half a request behind.
+      if (covered) {
+        await this.cancel(covered.id, actor, organizationId).catch(
+          () => undefined,
+        );
+      }
+      throw err;
+    }
+    return {
+      ...(covered ?? lossOfPay),
+      lossOfPayLeave: covered ? lossOfPay : null,
+      convertedToLossOfPay: !covered,
+      lossOfPayDays: split.lopDays,
+      lossOfPayNotice: covered
+        ? `${days(split.coveredDays)} applied as ${leaveType.name}; the other ${days(split.lopDays)} as Loss of Pay (pay is deducted for those).`
+        : `You have no ${leaveType.name} balance left, so ${days(split.lopDays)} applied as Loss of Pay (pay is deducted for those).`,
+    };
   }
 
   // History of periodic accrual/carry-forward runs, visible to whoever can
@@ -236,7 +491,7 @@ export class LeavesService {
     const where: Prisma.LeaveWhereInput = { organizationId };
     if (actor.role === Role.EMPLOYEE) {
       where.employeeId = actor.id;
-    } else if (actor.role === Role.MANAGER) {
+    } else if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       const deptIds = await deptScopedEmployeeIds(
         this.scopedPrisma,
         actor,
@@ -260,10 +515,27 @@ export class LeavesService {
       where.employeeId = query.employeeId;
     }
     if (query.status) where.status = query.status;
+    // Approved leaves an employee has asked to have cancelled (the approver's "Cancellation requests" list).
+    if (query.cancelRequested) {
+      where.status = LeaveStatus.APPROVED;
+      where.cancelRequestedAt = { not: null };
+    }
+
+    // What the caller may do with each of their own leaves today (see leave-cancel-rules.ts).
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: { timezone: true, policies: true },
+    });
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const windowDays = leaveCancelWindowDaysOf(
+      (org?.policies as { leaveCancelWindowDays?: unknown } | null)
+        ?.leaveCancelWindowDays,
+    );
 
     return paginate(
-      () =>
-        this.scopedPrisma.leave.findMany({
+      async () =>
+        (
+          await this.scopedPrisma.leave.findMany({
           where,
           include: {
             employee: { select: { id: true, name: true, employeeId: true } },
@@ -279,7 +551,17 @@ export class LeavesService {
           orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { createdAt: 'desc' }],
           skip: skip(query.page, query.limit),
           take: query.limit,
-        }),
+        })
+        ).map((l) => ({
+          ...l,
+          ...(l.employeeId === actor.id
+            ? ownerCancelOptions(l, today, windowDays, CANCEL_OVERRIDE_ROLES.includes(actor.role))
+            : {
+                // An Admin / HR can cancel a colleague's leave that has not started yet, even when it is approved.
+                canCancel: CANCEL_OVERRIDE_ROLES.includes(actor.role) && adminCanCancelOthers(l, today),
+                canRequestCancel: false,
+              }),
+        })),
       () => this.scopedPrisma.leave.count({ where }),
       query.page,
       query.limit,
@@ -462,7 +744,7 @@ export class LeavesService {
       startDate: { lte: query.to },
       endDate: { gte: query.from },
     };
-    if (actor.role === Role.MANAGER) {
+    if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       where.employeeId = {
         in: await deptScopedEmployeeIds(
           this.scopedPrisma,
@@ -482,10 +764,10 @@ export class LeavesService {
     });
   }
 
-  // Who is away in a window - open to every employee, so people can see who is out before planning a meeting. Only what
-  // that needs: the person, the dates and whether it is a half-day. Never the leave type, the remarks or any document
-  // (a sick or maternity leave is nobody else's business), and only approved leave. HR and Admin see the whole
-  // organisation; everyone else sees their own department (an employee with no department sees only themself).
+  // Who is away in a window - for Admin, HR and Managers (the controller rejects plain employees), so they can see who is
+  // out before planning. Only what that needs: the person, the dates and whether it is a half-day. Never the leave type,
+  // the remarks or any document (a sick or maternity leave is nobody else's business), and only approved leave. HR and
+  // Admin see the whole organisation; a manager sees their own department.
   async getWhosOut(
     query: TeamCalendarQueryDto,
     actor: Actor,
@@ -775,6 +1057,8 @@ export class LeavesService {
     comments: string,
     reviewedById: string | null,
     organizationId: string,
+    // The leave import records the decision without telling anyone.
+    quiet = false,
   ) {
     // Approving a leave rewrites attendance and balances for its dates: refuse when one of those months is already
     // locked/paid, and send a signed-off run back for recalculation (see payroll-period-guard.ts).
@@ -788,6 +1072,12 @@ export class LeavesService {
         'leave',
       );
     }
+    // The days this leave stamps as On Leave: the ones it is charged for, so a holiday or weekly off inside it that its type's
+    // sandwich rule leaves out stays a holiday / weekly off in the attendance grid and in payroll.
+    const stampDates =
+      decision === 'APPROVED'
+        ? await this.datesToStamp(leave, leaveType, organizationId)
+        : undefined;
     await this.scopedPrisma.$transaction(async (tx) => {
       // status: PENDING re-asserted here (not just in whatever check the
       // caller already ran) so a second concurrent call — double-click, a
@@ -814,6 +1104,7 @@ export class LeavesService {
           tx,
           leave,
           organizationId,
+          stampDates,
         );
         await markPayrollInputsChanged(
           tx,
@@ -884,11 +1175,13 @@ export class LeavesService {
       }
     });
 
-    await this.notifyLeaveDecision(
-      leave,
-      { decision, comments },
-      organizationId,
-    );
+    if (!quiet) {
+      await this.notifyLeaveDecision(
+        leave,
+        { decision, comments },
+        organizationId,
+      );
+    }
     return this.findByIdOrThrow(leave.id, organizationId);
   }
 
@@ -901,10 +1194,12 @@ export class LeavesService {
   // a double-decision either way.
   @Cron('*/15 * * * *')
   async autoApprovePendingLeaves() {
-    const organizations = await this.scopedPrisma.organization.findMany({
+    const allOrganizations = await this.scopedPrisma.organization.findMany({
       where: { isActive: true },
       select: { id: true },
     });
+    // Skip companies whose Super Admin switched this module off.
+    const organizations = await keepModuleEnabled(allOrganizations, 'module.leave');
     for (const org of organizations) {
       try {
         await this.autoApprovePendingLeavesForOrg(org.id);
@@ -1003,16 +1298,14 @@ export class LeavesService {
   ): Promise<boolean> {
     const applicant = await this.scopedPrisma.user.findFirst({
       where: { id: leave.employeeId, organizationId },
-      select: { role: true, reportingManagerId: true, departmentId: true },
+      select: { role: true, reportingManagerId: true, additionalReportingManagerIds: true, departmentId: true },
     });
     if (!applicant) return false;
     if (applicant.role === Role.ADMIN || applicant.role === Role.HR) {
       return false;
     }
     const scope: Prisma.UserWhereInput[] = [];
-    if (applicant.reportingManagerId) {
-      scope.push({ id: applicant.reportingManagerId });
-    }
+    for (const managerId of managerIdsOf(applicant)) scope.push({ id: managerId });
     if (applicant.departmentId) {
       scope.push({ departmentId: applicant.departmentId });
     }
@@ -1030,17 +1323,19 @@ export class LeavesService {
   }
 
   private async notifyLevel1Approved(leave: Leave, organizationId: string) {
+    // Final approval is HR's: the HR assigned to the employee (see NotificationsService.reviewersFor).
     const [hrUsers, { dateFormat, timeZone }] = await Promise.all([
-      this.scopedPrisma.user.findMany({
-        where: { organizationId, role: { in: [Role.HR, Role.ADMIN] } },
-        select: { id: true },
-      }),
+      this.notificationsService.reviewersFor(
+        organizationId,
+        { id: leave.employeeId, reportingManagerId: null },
+        false,
+      ),
       resolveOrgDateTimeFormat(this.scopedPrisma, organizationId),
     ]);
     await this.notificationsService.createMany(
-      hrUsers.map((u) => ({
+      hrUsers.map((userId) => ({
         organizationId,
-        userId: u.id,
+        userId,
         title: 'Leave Application Pending Final Approval',
         message: `A leave request (${formatDateDisplay(leave.startDate, '', dateFormat, timeZone)} to ${formatDateDisplay(leave.endDate, '', dateFormat, timeZone)}) has been level-1 approved and needs your final decision.`,
         category: NotificationCategory.LEAVE,
@@ -1115,6 +1410,93 @@ export class LeavesService {
       );
     }
 
+    // The owner cancels an approved leave directly only until it starts (plus the company's grace days); after that
+    // they send a cancellation request instead. HR/Admin can cancel at any time.
+    if (isSelf && !isOverride && leave.status === LeaveStatus.APPROVED) {
+      const org = await this.scopedPrisma.organization.findFirst({
+        where: { id: organizationId },
+        select: { timezone: true, policies: true },
+      });
+      const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+      const windowDays = leaveCancelWindowDaysOf(
+        (org?.policies as { leaveCancelWindowDays?: unknown } | null)
+          ?.leaveCancelWindowDays,
+      );
+      if (!ownerCanCancel(leave, today, windowDays)) {
+        throw new BadRequestException(
+          'This leave has already started, so it can no longer be cancelled directly. Send a cancellation request to your manager or HR instead.',
+        );
+      }
+    }
+    const result = await this.performCancel(id, leave, actor, organizationId, !isSelf);
+    // Someone else cancelled it: the employee is told, with the dates, so a booked leave does not just vanish.
+    if (!isSelf) {
+      await this.notifyLeaveCancelledForEmployee(leave, actor, organizationId).catch(() => undefined);
+    }
+    // Cancelling an approved leave undoes something an approver signed off, so they are told (a pending leave was never
+    // approved, and a request an approver decides themselves needs no extra alert).
+    if (isSelf && leave.status === LeaveStatus.APPROVED) {
+      await this.notifyApprovedLeaveCancelled(leave, actor, organizationId).catch(
+        () => undefined,
+      );
+    }
+    return result;
+  }
+
+  // Tells the employee that an Admin / HR cancelled their leave.
+  private async notifyLeaveCancelledForEmployee(leave: Leave, actor: Actor, organizationId: string) {
+    const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(this.scopedPrisma, organizationId);
+    await this.notificationsService.create({
+      organizationId,
+      userId: leave.employeeId,
+      title: 'Leave Cancelled',
+      message: `${actor.name} cancelled your leave from ${formatDateDisplay(leave.startDate, '', dateFormat, timeZone)} to ${formatDateDisplay(leave.endDate, '', dateFormat, timeZone)}. Your leave balance was restored.`,
+      category: NotificationCategory.LEAVE,
+    });
+  }
+
+  // Tells the employee's reporting manager(s) and every HR/Admin that an approved leave was cancelled by its owner.
+  private async notifyApprovedLeaveCancelled(
+    leave: Leave,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(
+      this.scopedPrisma,
+      organizationId,
+    );
+    // The HR assigned to the employee (see NotificationsService.reviewersFor), not every HR user.
+    const hrAdmins = await this.notificationsService.reviewersFor(organizationId, actor, false);
+    const recipients = [
+      ...new Set([...managerIdsOf(actor), ...hrAdmins]),
+    ].filter((id) => id !== actor.id);
+    if (recipients.length === 0) return;
+    const message = `${actor.name} cancelled their approved leave from ${formatDateDisplay(leave.startDate, '', dateFormat, timeZone)} to ${formatDateDisplay(leave.endDate, '', dateFormat, timeZone)}.`;
+    await this.notificationsService.createMany(
+      recipients.map((userId) => ({
+        organizationId,
+        userId,
+        title: 'Approved Leave Cancelled',
+        message,
+        category: NotificationCategory.LEAVE,
+      })),
+    );
+  }
+
+  // The cancellation itself, after whoever asked has been checked: reverses balance/attendance, writes the audit entry.
+  // `onBehalf` is true when someone other than the owner cancels (HR/Admin, or an approver deciding a request).
+  private async performCancel(
+    id: string,
+    leave: Leave,
+    actor: Actor,
+    organizationId: string,
+    onBehalf: boolean,
+  ) {
+    const cancellableStatuses: LeaveStatus[] = [
+      LeaveStatus.PENDING,
+      LeaveStatus.RETURNED,
+      LeaveStatus.APPROVED,
+    ];
     // An APPROVED leave has already been folded into attendance (and
     // possibly a since-locked/paid payroll run's LOP calculation) —
     // cancelling it out from under an already-LOCKED/PAID run would
@@ -1155,6 +1537,8 @@ export class LeavesService {
           status: LeaveStatus.CANCELLED,
           cancelledById: actor.id,
           cancelledAt: new Date(),
+          // Any waiting cancellation request is settled by the cancellation itself.
+          cancelRequestedAt: null,
         },
       });
       if (count === 0) {
@@ -1190,7 +1574,7 @@ export class LeavesService {
         startDate: leave.startDate,
         endDate: leave.endDate,
         totalDays: leave.totalDays,
-        onBehalf: !isSelf,
+        onBehalf,
       },
     });
     return this.findByIdOrThrow(id, organizationId);
@@ -1268,6 +1652,46 @@ export class LeavesService {
     }
   }
 
+  // The dates of an approved leave that are marked On Leave: every date when the type charges them all (or it is a half day),
+  // otherwise only the charged ones. undefined = every date in the range.
+  private async datesToStamp(
+    leave: Leave,
+    leaveType: LeaveType,
+    organizationId: string,
+  ): Promise<string[] | undefined> {
+    if (leave.isHalfDay) return undefined;
+    const kinds = chargedKindsOf(
+      effectiveLeaveRules(leaveType.rules as unknown as LeaveRules, leaveType),
+    );
+    if (kinds.weeklyOffs && kinds.holidays) return undefined;
+    const person = await this.scopedPrisma.user.findFirst({
+      where: { id: leave.employeeId, organizationId },
+      select: { departmentId: true },
+    });
+    const [holidays, org, dept] = await Promise.all([
+      this.holidaysFor({ departmentId: person?.departmentId ?? null }, organizationId),
+      this.scopedPrisma.organization.findFirst({ where: { id: organizationId } }),
+      person?.departmentId
+        ? this.scopedPrisma.department.findFirst({
+            where: { id: person.departmentId, organizationId },
+          })
+        : Promise.resolve(null),
+    ]);
+    const { weeklyOffs } = resolveShiftConfig(
+      dept,
+      org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
+    );
+    const charged = chargedDatesInclusive(
+      leave.startDate,
+      leave.endDate,
+      new Set(holidays.map((h) => h.date)),
+      weeklyOffs,
+      kinds,
+    );
+    // Nothing charged (should not happen for an accepted application): stamp the whole range rather than leave it unmarked.
+    return charged.length > 0 ? charged : undefined;
+  }
+
   // The holidays this employee actually gets: company-wide and their own department's, optional ones excluded (an
   // optional holiday is a day the employee may choose to take, not a day off for everyone) - the same set attendance
   // and payroll use. One lookup shared by applying for leave and by the day-count preview, so they cannot disagree.
@@ -1301,21 +1725,36 @@ export class LeavesService {
       where: { id: query.leaveType, organizationId, isActive: true },
     });
     if (!leaveType) throw new NotFoundException('Leave type not found.');
+    // Admin / HR recording a leave for someone: the days are that person's - their department's weekly offs and holidays - and the
+    // rules are the relaxed ones recording uses, so the number shown is the number that will be charged.
+    const forOther = !!query.employeeId && query.employeeId !== actor.id;
+    if (forOther && actor.role !== Role.ADMIN && actor.role !== Role.HR) {
+      throw new ForbiddenException(
+        'Only Admin or HR can preview days for another employee.',
+      );
+    }
+    const person = forOther
+      ? await this.scopedPrisma.user.findFirst({
+          where: { id: query.employeeId, organizationId },
+          select: { id: true, departmentId: true },
+        })
+      : actor;
+    if (!person) throw new NotFoundException('Employee not found.');
     const [holidays, prior, employeeDept, org] = await Promise.all([
-      this.holidaysFor(actor, organizationId),
+      this.holidaysFor(person, organizationId),
       this.scopedPrisma.leave.findFirst({
         where: {
           organizationId,
-          employeeId: actor.id,
+          employeeId: person.id,
           leaveTypeId: leaveType.id,
           status: { in: [LeaveStatus.PENDING, LeaveStatus.APPROVED] },
           endDate: { lt: query.startDate },
         },
         orderBy: { endDate: 'desc' },
       }),
-      actor.departmentId
+      person.departmentId
         ? this.scopedPrisma.department.findFirst({
-            where: { id: actor.departmentId, organizationId },
+            where: { id: person.departmentId, organizationId },
           })
         : Promise.resolve(null),
       this.scopedPrisma.organization.findFirst({
@@ -1326,10 +1765,11 @@ export class LeavesService {
       employeeDept,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
     );
-    const rules = effectiveLeaveRules(
+    const baseRules = effectiveLeaveRules(
       leaveType.rules as unknown as LeaveRules,
       leaveType,
     );
+    const rules = forOther ? relaxedForImport(baseRules) : baseRules;
     const isHalfDay = query.isHalfDay ?? false;
     const result = checkLeaveRules(
       rules,
@@ -1368,7 +1808,10 @@ export class LeavesService {
       // Days in the range that are not charged (weekly offs / holidays); 0 for a half day or a calendar-day type.
       excludedDays: isHalfDay
         ? 0
-        : Math.max(0, Math.round((calendarDays - result.totalDays) * 100) / 100),
+        : Math.max(
+            0,
+            Math.round((calendarDays - result.totalDays) * 100) / 100,
+          ),
       messages,
     };
   }
@@ -1380,6 +1823,10 @@ export class LeavesService {
     // Set when this request replaces an existing PENDING one (an edit): that leave is left out of the overlap and gap
     // checks, and is cancelled - with its balance hold released - inside the same transaction that creates the new one.
     replacing?: Leave,
+    // Set by the leave import (migration of past leave): the leave is recorded on the employee's behalf, so the
+    // application-time rules (notice, backdating, limits, documents, eligibility, notice period) are not enforced,
+    // nobody is notified, and `dryRun` only checks without writing. See importLeaves().
+    opts?: ImportOptions,
   ) {
     const leaveType = await this.scopedPrisma.leaveType.findFirst({
       where: { id: dto.leaveType, organizationId, isActive: true },
@@ -1392,7 +1839,7 @@ export class LeavesService {
     // ineligible employee (e.g. wrong gender/department, or below
     // minServiceMonths) could apply directly by leaveType id and the
     // request would silently proceed.
-    if (!isEligible(leaveType, actor)) {
+    if (!opts?.importing && !isEligible(leaveType, actor)) {
       throw new ForbiddenException('You are not eligible for this leave type.');
     }
 
@@ -1419,7 +1866,11 @@ export class LeavesService {
         },
       },
     });
-    if (openOffboarding && dto.startDate <= openOffboarding.lastWorkingDay) {
+    if (
+      !opts?.importing &&
+      openOffboarding &&
+      dto.startDate <= openOffboarding.lastWorkingDay
+    ) {
       throw new BadRequestException(
         `You're serving notice with a last working day of ${formatDateDisplay(openOffboarding.lastWorkingDay)} — new leave can't be applied for during the notice period.`,
       );
@@ -1480,7 +1931,9 @@ export class LeavesService {
     const baseRules = leaveType.rules as unknown as LeaveRules;
     // Event-based leave drops the rules that do not apply to it and, in calendar days, charges every date in the range
     // (weekends/holidays included) - see effectiveLeaveRules.
-    const rules = effectiveLeaveRules(baseRules, leaveType);
+    const rules = opts?.importing
+      ? relaxedForImport(effectiveLeaveRules(baseRules, leaveType))
+      : effectiveLeaveRules(baseRules, leaveType);
     // Event-based leave: the document given with the grant request covers the application (see applicationDocumentRule).
     const grantHasDocument =
       leaveType.allocationType === AllocationType.EVENT_BASED &&
@@ -1508,13 +1961,20 @@ export class LeavesService {
         holidayDates: new Set(holidays.map((h) => h.date)),
         weeklyOffs,
         priorLeaveEndDate: priorLeaveOfType?.endDate ?? null,
-        existingRanges: otherLeaves.map((l) => ({
-          start: l.startDate,
-          end: l.endDate,
-          isHalfDay: l.isHalfDay,
-          halfDaySession: l.halfDaySession,
-        })),
-        ...applicationDocumentRule(leaveType, { grantHasDocument }),
+        existingRanges: [
+          ...otherLeaves.map((l) => ({
+            start: l.startDate,
+            end: l.endDate,
+            isHalfDay: l.isHalfDay,
+            halfDaySession: l.halfDaySession,
+          })),
+          // Earlier rows of the same import file (a check run writes nothing, so they are not in the database yet).
+          ...(opts?.extraRanges ?? []),
+        ],
+        // A document is not asked for when past leave is migrated.
+        ...(opts?.importing
+          ? { documentsRequired: false, documentRequiredAfterDays: null }
+          : applicationDocumentRule(leaveType, { grantHasDocument })),
       },
     );
     if (!ruleResult.ok) {
@@ -1535,6 +1995,64 @@ export class LeavesService {
       weeklyOffs,
       leaveYearCfg,
     );
+
+    // A check run (import preview): the same balance test as below, counting the days earlier rows of the file would
+    // use, but nothing is written.
+    if (opts?.dryRun) {
+      if (isCompOffType(leaveType)) {
+        throw new BadRequestException(
+          'Comp-off leave cannot be imported - it depends on comp-off the employee has earned.',
+        );
+      }
+      if (!isUnbalancedType(leaveType)) {
+        for (const part of yearParts) {
+          const key = `${actor.id}:${leaveType.id}:${part.year}`;
+          const verdict = await this.scopedPrisma.$transaction(async (tx) => {
+            const row = await this.leaveBalanceService.ensureBalanceRow(
+              tx,
+              actor.id,
+              leaveType.id,
+              part.year,
+              organizationId,
+            );
+            const forfeited = (
+              await this.leaveBalanceService.forfeitedCarryIn(
+                tx,
+                [row],
+                organizationId,
+                today,
+              )
+            ).get(row.id);
+            return checkAffordability(
+              row,
+              { allowed: false, maxNegativeDays: 0 },
+              part.days + (opts.virtualDays?.get(key) ?? 0),
+              today,
+              forfeited ?? 0,
+            );
+          });
+          if (!verdict.ok) {
+            throw new ForbiddenException(
+              leaveType.allocationType === AllocationType.EVENT_BASED
+                ? NO_GRANT_MESSAGE
+                : `Not enough ${leaveType.name} balance for ${part.days} day(s) (${Math.max(0, verdict.available)} available). Adjust the balance first, or import it as Leave Without Pay.`,
+            );
+          }
+        }
+        for (const part of yearParts) {
+          const key = `${actor.id}:${leaveType.id}:${part.year}`;
+          opts.virtualDays?.set(
+            key,
+            (opts.virtualDays.get(key) ?? 0) + part.days,
+          );
+        }
+      }
+      return {
+        dryRun: true,
+        totalDays,
+        leaveTypeName: leaveType.name,
+      } as never;
+    }
 
     const created = await this.scopedPrisma.$transaction(async (tx) => {
       // Row-lock the applicant's own User row so two concurrent apply()
@@ -1631,12 +2149,12 @@ export class LeavesService {
       }
 
       if (!isCompOffType(leaveType) && !isUnbalancedType(leaveType)) {
-        // Leave never goes negative: once the quota is used up the employee applies Leave Without Pay for the extra
-        // days (pay is deducted for those). Any Allow Negative Balance setting on the leave type is ignored.
-        const negativeBalance: NegativeBalanceRule = {
-          allowed: false,
-          maxNegativeDays: 0,
-        };
+        // By default leave never goes negative: once the quota is used up the employee applies Leave Without Pay for
+        // the extra days (pay is deducted for those). The company-wide Allow Negative Leave Balance switch changes
+        // that - see negativeBalanceRuleFor: below zero without limit, or up to what the type still credits this year.
+        // (Under "Mark as Loss of Pay" apply() has already cut the request, so what reaches here always fits.) A
+        // setting on the leave type itself is ignored.
+        const orgSwitches = readOrgLeaveSwitches(org?.policies);
         // A leave spanning New Year takes each year's days from that year's balance.
         for (const part of yearParts) {
           const row = await this.leaveBalanceService.ensureBalanceRow(
@@ -1662,7 +2180,7 @@ export class LeavesService {
           ).get(row.id);
           const preflight = checkAffordability(
             row,
-            negativeBalance,
+            negativeBalanceRuleFor(orgSwitches, leaveType, row),
             part.days,
             today,
             forfeited ?? 0,
@@ -1700,7 +2218,7 @@ export class LeavesService {
           });
           const affordability = checkAffordability(
             rowAfterHold,
-            negativeBalance,
+            negativeBalanceRuleFor(orgSwitches, leaveType, rowAfterHold),
             0,
             today,
             forfeited ?? 0,
@@ -1738,8 +2256,271 @@ export class LeavesService {
       });
     });
 
-    await this.notifyNewLeaveApplication(created, actor, organizationId);
+    if (!opts?.importing) {
+      await this.notifyNewLeaveApplication(created, actor, organizationId);
+    }
     return created;
+  }
+
+  // An Admin / HR records a leave for employees who could not apply themselves (a phone call, a missed application): it is
+  // approved straight away. It goes through the leave-import code for each person, so the balance is deducted, attendance
+  // turns into On Leave / Half Day, payroll inputs are flagged, a locked payroll month is refused and overlapping leave is
+  // caught - minus the application-time rules (notice, backdating limits, documents), which an HR override does not apply.
+  // The reply lists each person's result; a refused one never stops the others. Only an Admin may do it for an HR/Admin.
+  async manualLeave(
+    dto: ManualLeaveDto,
+    actor: Actor,
+    organizationId: string,
+  ): Promise<ImportLeavesResult> {
+    if (dto.endDate < dto.startDate) {
+      throw new BadRequestException('The end date cannot be before the start date.');
+    }
+    const leaveType = await this.scopedPrisma.leaveType.findFirst({
+      where: { id: dto.leaveTypeId, organizationId, isActive: true },
+    });
+    if (!leaveType) throw new NotFoundException('Leave type not found.');
+    const people = await this.scopedPrisma.user.findMany({
+      where: { id: { in: dto.employeeIds }, organizationId },
+      select: { id: true, employeeId: true },
+    });
+    const codeById = new Map(people.map((p) => [p.id, p.employeeId]));
+    const rows = dto.employeeIds.map((id) => ({
+      employeeId: codeById.get(id) ?? '',
+      leaveType: leaveType.code,
+      startDate: dto.startDate,
+      endDate: dto.endDate,
+      halfDay: dto.isHalfDay ? 'yes' : 'no',
+      session: dto.halfDaySession === 'SECOND_HALF' ? 'second' : 'first',
+      reason: dto.remarks ?? '',
+    }));
+    return this.importLeaves({ rows, dryRun: false }, actor, organizationId, true);
+  }
+
+  // Leave import (migration): records leave that already happened - and was approved on the old system - for many
+  // employees at once. Each row goes through the same code as a real application and approval (balance deducted,
+  // attendance days turned into On Leave / Half Day, payroll inputs flagged), minus what only makes sense for a live
+  // request: no application-time rules, no notifications, no balance for comp-off. With dryRun (the default) nothing is
+  // saved and every row says what would happen; rows are checked in order, so two rows of one file for the same person
+  // overlap-check and balance-check against each other.
+  async importLeaves(
+    dto: ImportLeavesDto,
+    importer: Actor,
+    organizationId: string,
+    // True when an Admin/HR records a live leave on an employee's behalf (see manualLeave): the same code runs, but the
+    // leave says who recorded it, the audit entry is its own, and the employee is told.
+    manual = false,
+  ): Promise<ImportLeavesResult> {
+    const dryRun = dto.dryRun !== false;
+    const str = (v: unknown) =>
+      v === undefined || v === null ? '' : String(v).trim();
+    const yes = (v: unknown) => /^(y|yes|true|1)$/i.test(str(v));
+
+    const codes = [
+      ...new Set(dto.rows.map((r) => str(r.employeeId).toLowerCase())),
+    ].filter(Boolean);
+    const employees = codes.length
+      ? await this.scopedPrisma.user.findMany({
+          where: { organizationId },
+          omit: { password: true },
+        })
+      : [];
+    const byCode = new Map(
+      employees.map((e) => [e.employeeId.toLowerCase(), e]),
+    );
+    const leaveTypes = await this.scopedPrisma.leaveType.findMany({
+      where: { organizationId, isActive: true },
+    });
+    const typeByKey = new Map<string, LeaveType>();
+    for (const t of leaveTypes) {
+      typeByKey.set(t.code.toLowerCase(), t);
+      typeByKey.set(t.name.toLowerCase(), t);
+    }
+
+    const results: ImportLeaveRowResult[] = [];
+    const virtualDays = new Map<string, number>();
+    const rangesByEmployee = new Map<
+      string,
+      NonNullable<ImportOptions['extraRanges']>
+    >();
+
+    for (const [i, row] of dto.rows.entries()) {
+      const out: ImportLeaveRowResult = {
+        row: i + 1,
+        employeeId: str(row.employeeId),
+        leaveType: str(row.leaveType),
+        startDate: str(row.startDate),
+        endDate: str(row.endDate),
+        status: 'ERROR',
+      };
+      results.push(out);
+      try {
+        const employee = byCode.get(str(row.employeeId).toLowerCase());
+        if (!employee) throw new BadRequestException('Unknown employee ID.');
+        out.employeeName = employee.name;
+        // Same boundary as editing someone's personal data: only an Admin touches an HR or Admin employee's record.
+        if (
+          importer.role !== Role.ADMIN &&
+          (employee.role === Role.ADMIN || employee.role === Role.HR)
+        ) {
+          throw new ForbiddenException(
+            'Only an Admin can record leave for an HR or Admin employee.',
+          );
+        }
+        const leaveType = typeByKey.get(str(row.leaveType).toLowerCase());
+        if (!leaveType) {
+          throw new BadRequestException(
+            'Unknown leave type (use the leave type code or name).',
+          );
+        }
+        if (
+          !isValidCalendarDateString(out.startDate) ||
+          !isValidCalendarDateString(out.endDate)
+        ) {
+          throw new BadRequestException(
+            'Start and end dates must be real dates (DD-MM-YYYY).',
+          );
+        }
+        const isHalfDay = yes(row.halfDay);
+        let halfDaySession: HalfDaySession | undefined;
+        if (isHalfDay) {
+          if (out.startDate !== out.endDate) {
+            throw new BadRequestException(
+              'A half day must start and end on the same date.',
+            );
+          }
+          const sessionText = str(row.session).toLowerCase();
+          halfDaySession = sessionText.startsWith('s')
+            ? HalfDaySession.SECOND_HALF
+            : HalfDaySession.FIRST_HALF;
+        }
+        // The payroll month must still be open: approved leave rewrites that month's attendance and pay inputs.
+        await assertPayrollMonthsUnlocked(
+          this.scopedPrisma,
+          organizationId,
+          employee.id,
+          monthsBetween(out.startDate, out.endDate),
+          'leave',
+        );
+
+        const leaveDto: ApplyLeaveDto = {
+          leaveType: leaveType.id,
+          startDate: out.startDate,
+          endDate: out.endDate,
+          isHalfDay,
+          halfDaySession,
+          remarks: manual
+            ? `Recorded by ${importer.name} on behalf of the employee${str(row.reason) ? `: ${str(row.reason)}` : ''}`
+            : `Imported leave${str(row.reason) ? `: ${str(row.reason)}` : ''}`,
+        };
+        const extraRanges = rangesByEmployee.get(employee.id) ?? [];
+        if (dryRun) {
+          const checked = (await this.createLeaveInternal(
+            leaveDto,
+            employee,
+            organizationId,
+            undefined,
+            { importing: true, dryRun: true, extraRanges, virtualDays },
+          )) as unknown as { totalDays: number };
+          out.totalDays = checked.totalDays;
+          out.status = 'OK';
+          out.message = `Would record ${checked.totalDays} day(s) of ${leaveType.name}.`;
+          extraRanges.push({
+            start: out.startDate,
+            end: out.endDate,
+            isHalfDay,
+            halfDaySession: halfDaySession ?? null,
+          });
+          rangesByEmployee.set(employee.id, extraRanges);
+        } else {
+          const created = await this.createLeaveInternal(
+            leaveDto,
+            employee,
+            organizationId,
+            undefined,
+            { importing: true },
+          );
+          try {
+            await this.applyDecision(
+              created,
+              leaveType,
+              'APPROVED',
+              manual
+                ? `Recorded and approved by ${importer.name} on behalf of the employee.`
+                : 'Imported from the previous system.',
+              importer.id,
+              organizationId,
+              true,
+            );
+          } catch (err) {
+            // Approval failed after the request was saved: take the request (and its balance hold) back out so a
+            // half-imported row never lingers as a pending leave.
+            await this.scopedPrisma.$transaction(async (tx) => {
+              await tx.leave.updateMany({
+                where: { id: created.id, organizationId },
+                data: { status: LeaveStatus.CANCELLED },
+              });
+              await this.releaseHold(tx, created, organizationId);
+            });
+            throw err;
+          }
+          out.totalDays = created.totalDays;
+          out.status = 'IMPORTED';
+          out.message = `Recorded ${created.totalDays} day(s) of ${leaveType.name}.`;
+          if (manual) {
+            await this.notificationsService
+              .create({
+                organizationId,
+                userId: employee.id,
+                title: 'Leave Recorded for You',
+                message: `${importer.name} recorded and approved ${created.totalDays} day(s) of ${leaveType.name} for you, from ${dmyText(out.startDate)} to ${dmyText(out.endDate)}.`,
+                category: NotificationCategory.LEAVE,
+              })
+              .catch(() => undefined);
+          }
+          await this.auditLogService.log({
+            actorId: importer.id,
+            action: manual ? 'LEAVE_RECORDED_ON_BEHALF' : 'LEAVE_IMPORTED',
+            module: 'LEAVE',
+            organizationId,
+            targetId: created.id,
+            details: {
+              employeeId: employee.id,
+              leaveType: leaveType.code,
+              startDate: out.startDate,
+              endDate: out.endDate,
+              totalDays: created.totalDays,
+            },
+          });
+        }
+      } catch (err) {
+        out.status = 'ERROR';
+        out.message =
+          err instanceof Error
+            ? err.message
+            : 'The row could not be processed.';
+      }
+    }
+
+    const imported = results.filter((r) => r.status === 'IMPORTED').length;
+    const ok = results.filter((r) => r.status === 'OK').length;
+    const failed = results.filter((r) => r.status === 'ERROR').length;
+    if (!dryRun && !manual) {
+      await this.auditLogService.log({
+        actorId: importer.id,
+        action: 'LEAVE_IMPORT_RUN',
+        module: 'LEAVE',
+        organizationId,
+        details: { rows: results.length, imported, failed },
+      });
+    }
+    return {
+      dryRun,
+      total: results.length,
+      ok,
+      imported,
+      failed,
+      rows: results,
+    };
   }
 
   // The original release notifies the employee's department head, or (if there is
@@ -1747,6 +2528,189 @@ export class LeavesService {
   // against reportingManagerId rather than Department.departmentHeadId,
   // since that's the field the review() approval check actually uses in
   // this system.
+  // The employee asks for an approved leave that has already started to be cancelled. Nothing changes until an
+  // approver decides (decideCancelRequest); the leave stays approved and keeps counting until then.
+  async requestCancel(
+    id: string,
+    dto: RequestLeaveCancelDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    const leave = await this.findByIdOrThrow(id, organizationId);
+    if (leave.employeeId !== actor.id) {
+      throw new ForbiddenException(
+        "You cannot ask to cancel another employee's leave.",
+      );
+    }
+    if (leave.status !== LeaveStatus.APPROVED) {
+      throw new BadRequestException(
+        'Only an approved leave needs a cancellation request.',
+      );
+    }
+    if (leave.cancelRequestedAt) {
+      throw new BadRequestException(
+        'A cancellation request for this leave is already waiting for a decision.',
+      );
+    }
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: { timezone: true, policies: true },
+    });
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const windowDays = leaveCancelWindowDaysOf(
+      (org?.policies as { leaveCancelWindowDays?: unknown } | null)
+        ?.leaveCancelWindowDays,
+    );
+    // An Admin / HR cancels their own leave directly: a request would wait for an approver who is not there.
+    if (CANCEL_OVERRIDE_ROLES.includes(actor.role)) {
+      return this.performCancel(id, leave, actor, organizationId, false);
+    }
+    if (ownerCanCancel(leave, today, windowDays)) {
+      throw new BadRequestException(
+        'This leave has not started yet - cancel it directly instead of sending a request.',
+      );
+    }
+    if (leaveTaken(leave, today)) {
+      throw new BadRequestException(
+        'This leave has already been taken, so it can no longer be cancelled. Ask HR if it needs correcting.',
+      );
+    }
+    const reason = dto.reason.trim();
+    if (!reason) {
+      throw new BadRequestException('Tell your approver why this leave should be cancelled.');
+    }
+    const { count } = await this.scopedPrisma.leave.updateMany({
+      where: { id, organizationId, status: LeaveStatus.APPROVED, cancelRequestedAt: null },
+      data: {
+        cancelRequestedAt: new Date(),
+        cancelRequestReason: reason,
+        cancelRequestDeclinedComments: '',
+      },
+    });
+    if (count === 0) {
+      throw new ConflictException('This leave changed - refresh and try again.');
+    }
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'LEAVE_CANCEL_REQUESTED',
+      module: 'LEAVE',
+      organizationId,
+      targetId: id,
+      details: {
+        employeeId: leave.employeeId,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        reason,
+      },
+    });
+    await this.notifyCancelRequested(leave, actor, reason, organizationId);
+    return this.findByIdOrThrow(id, organizationId);
+  }
+
+  // A manager (their department), HR or Admin approves or declines a cancellation request. Approving cancels the leave
+  // exactly as a direct cancellation would (balance returned, attendance reverted, locked payroll months refuse).
+  async decideCancelRequest(
+    id: string,
+    dto: DecideLeaveCancelDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    const leave = await this.findByIdOrThrow(id, organizationId);
+    if (leave.status !== LeaveStatus.APPROVED || !leave.cancelRequestedAt) {
+      throw new BadRequestException(
+        'There is no cancellation request waiting on this leave.',
+      );
+    }
+    const comments = dto.comments?.trim() ?? '';
+    if (dto.decision === 'REJECTED' && !comments) {
+      throw new BadRequestException(
+        'A comment is required when declining a cancellation request.',
+      );
+    }
+    await assertManagerScopeOrDelegate(
+      this.scopedPrisma,
+      this.delegationService,
+      actor,
+      organizationId,
+      leave.employeeId,
+    );
+    if (dto.decision === 'APPROVED') {
+      const cancelled = await this.performCancel(
+        id,
+        leave,
+        actor,
+        organizationId,
+        true,
+      );
+      await this.notifyCancelDecision(leave, 'APPROVED', comments, organizationId);
+      return cancelled;
+    }
+    await this.scopedPrisma.leave.updateMany({
+      where: { id, organizationId, status: LeaveStatus.APPROVED },
+      data: { cancelRequestedAt: null, cancelRequestDeclinedComments: comments },
+    });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'LEAVE_CANCEL_DECLINED',
+      module: 'LEAVE',
+      organizationId,
+      targetId: id,
+      details: {
+        employeeId: leave.employeeId,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        comments,
+      },
+    });
+    await this.notifyCancelDecision(leave, 'REJECTED', comments, organizationId);
+    return this.findByIdOrThrow(id, organizationId);
+  }
+
+  // Tells whoever approves this employee's leave (their reporting manager, else HR/Admin) that a cancellation is asked.
+  private async notifyCancelRequested(
+    leave: Leave,
+    actor: Actor,
+    reason: string,
+    organizationId: string,
+  ) {
+    const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(
+      this.scopedPrisma,
+      organizationId,
+    );
+    const title = 'Leave Cancellation Request';
+    const message = `${actor.name} asked to cancel the approved leave from ${formatDateDisplay(leave.startDate, '', dateFormat, timeZone)} to ${formatDateDisplay(leave.endDate, '', dateFormat, timeZone)}. Reason: ${reason}`;
+    const recipients = await this.notificationsService.reviewersFor(organizationId, actor, true);
+    await this.notificationsService.createMany(
+      recipients.map((userId) => ({
+        organizationId,
+        userId,
+        title,
+        message,
+        category: NotificationCategory.LEAVE,
+        pushKind: 'APPROVAL' as const,
+      })),
+    );
+  }
+
+  private async notifyCancelDecision(
+    leave: Leave,
+    decision: 'APPROVED' | 'REJECTED',
+    comments: string,
+    organizationId: string,
+  ) {
+    const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(
+      this.scopedPrisma,
+      organizationId,
+    );
+    await this.notificationsService.create({
+      organizationId,
+      userId: leave.employeeId,
+      title: `Leave Cancellation ${decision === 'APPROVED' ? 'Approved' : 'Declined'}`,
+      message: `Your request to cancel the leave from ${formatDateDisplay(leave.startDate, '', dateFormat, timeZone)} to ${formatDateDisplay(leave.endDate, '', dateFormat, timeZone)} was ${decision === 'APPROVED' ? 'approved - the leave is cancelled' : 'declined'}.${comments ? ` Comments: ${comments}` : ''}`,
+      category: NotificationCategory.LEAVE,
+    });
+  }
+
   private async notifyNewLeaveApplication(
     leave: Leave,
     actor: Actor,
@@ -1759,30 +2723,17 @@ export class LeavesService {
     const title = 'New Leave Application';
     const message = `${actor.name} applied for leave from ${formatDateDisplay(leave.startDate, '', dateFormat, timeZone)} to ${formatDateDisplay(leave.endDate, '', dateFormat, timeZone)}.`;
 
-    if (actor.reportingManagerId && actor.reportingManagerId !== actor.id) {
-      await this.notificationsService.create({
-        organizationId,
-        userId: actor.reportingManagerId,
-        title,
-        message,
-        category: NotificationCategory.LEAVE,
-        pushKind: 'APPROVAL',
-      });
-      return;
-    }
-
-    const hrUsers = await this.scopedPrisma.user.findMany({
-      where: { organizationId, role: { in: [Role.HR, Role.ADMIN] } },
-      select: { id: true },
-    });
+    // The reporting managers and the department head; with none, the HR assigned to the employee (see
+    // NotificationsService.reviewersFor).
+    const recipients = await this.notificationsService.reviewersFor(organizationId, actor, true);
     await this.notificationsService.createMany(
-      hrUsers.map((u) => ({
+      recipients.map((userId) => ({
         organizationId,
-        userId: u.id,
+        userId,
         title,
         message,
         category: NotificationCategory.LEAVE,
-        pushKind: 'APPROVAL',
+        pushKind: 'APPROVAL' as const,
       })),
     );
   }

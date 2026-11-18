@@ -109,6 +109,20 @@ export class DocumentsController {
     );
   }
 
+  @Get('policies/:id/pending-acknowledgments')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  listPending(@Param('id') id: string, @CurrentUser() caller: Caller) {
+    return this.documentsService.listPendingAcknowledgments(id, caller.organizationId);
+  }
+
+  @Post('policies/:id/remind')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  remind(@Param('id') id: string, @CurrentUser() caller: Caller) {
+    return this.documentsService.remindPending(id, caller.organizationId, caller.id);
+  }
+
   @Get('policies/:id/acknowledgments')
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
@@ -122,7 +136,7 @@ export class DocumentsController {
   // No @Roles() — any authenticated caller can see what's expected of them.
   @Get('requirements')
   findRequirements(@CurrentUser() caller: Caller) {
-    return this.documentsService.findRequirements(caller.organizationId);
+    return this.documentsService.findRequirements(caller.organizationId, caller.role === Role.ADMIN || caller.role === Role.HR);
   }
 
   @Post('requirements')

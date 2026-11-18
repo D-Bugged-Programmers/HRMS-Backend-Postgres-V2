@@ -171,8 +171,13 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
       // Org-wide leave/attendance switches exposed to every role so the apps can hide what is turned off.
       allowCarryForward: true,
       allowLeaveEncashment: true,
-      allowNegativeLeaveBalance: true,
+      // Negative balance is off unless switched on (see org-leave-switches.ts); the mode says what happens when it is.
+      allowNegativeLeaveBalance: false,
+      negativeLeaveBalanceMode: 'MARK_AS_LOP',
       requireSelfieForPunch: true,
+      // What a check-in/out needs by default, and the WFH days allowed per month (unset = no limit).
+      locationMode: 'ENFORCED',
+      wfhDaysPerMonth: null,
       // Needed client-side wherever a user enters a wall-clock time that
       // must be converted to UTC before being sent to an endpoint that
       // stores/interprets timestamps as UTC (e.g. attendance Excel import)
@@ -259,6 +264,22 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
     expect(body.pan).toBe('ABCDE1234F');
   });
 
+  it('General Settings saves the regularization caps; blank clears them to null', async () => {
+    const patch = (body: object) =>
+      request(app.getHttpServer())
+        .patch('/organizations/settings/policies')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send(body);
+    const set = await patch({ regularizationMonthlyLimit: 4, regularizationResubmitLimit: 2 });
+    expect(set.status).toBe(200);
+    expect(set.body.regularizationMonthlyLimit).toBe(4);
+    expect(set.body.regularizationResubmitLimit).toBe(2);
+    const cleared = await patch({ regularizationMonthlyLimit: '', regularizationResubmitLimit: null });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.regularizationMonthlyLimit).toBeNull();
+    expect(cleared.body.regularizationResubmitLimit).toBeNull();
+  });
+
   it('deriving attendancePayrollPrefs: policies section write updates the narrower field AttendanceService actually reads', async () => {
     // The standalone 'attendancePayroll' section was folded into the
     // combined 'policies' section/tab — see SECTION_FIELDS's comment above
@@ -268,7 +289,6 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
       .set('Authorization', `Bearer ${adminToken}`)
       .send({
         orgPayrollAttendancePrefs: {
-          attendanceMethod: ['manual'],
           defaultShiftStartTime: '10:00',
           defaultShiftEndTime: '19:00',
           defaultLateInThresholdMinutes: 20,
@@ -276,7 +296,6 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
           defaultMinHoursForPresent: 7,
           defaultMinHoursForHalfDay: 3.5,
           weekendDays: [0],
-          payrollCycle: 'monthly',
         },
       })
       .expect(200);
@@ -330,7 +349,7 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
       .patch('/organizations/settings/policies')
       .set('Authorization', `Bearer ${adminToken}`)
       .send({
-        orgPayrollAttendancePrefs: { payrollCycle: 'weekly' },
+        orgPayrollAttendancePrefs: { notifySalaryRevision: false },
       })
       .expect(200);
 
@@ -428,11 +447,11 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
       where: { id: organizationId },
     });
     const prefs = org.orgPayrollAttendancePrefs as Record<string, unknown>;
-    expect(prefs.payrollCycle).toBe('weekly');
+    expect(prefs.notifySalaryRevision).toBe(false);
     expect(prefs.defaultShiftStartTime).toBe('10:00');
     expect(prefs.weekendDays).toEqual([0]);
     // Keys never sent in any request survive from the column default.
-    expect(prefs.enableCompOff).toBe(true);
+    expect(prefs.defaultWorkWeek).toBe('monday-friday');
   });
 
   it('a partial policies PATCH preserves sibling keys in the policies JSON', async () => {
@@ -732,7 +751,7 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
       where: { id: organizationId },
     });
     const prefs = org.orgPayrollAttendancePrefs as Record<string, unknown>;
-    expect(prefs.defaultWorkingHoursPerDay).toBe(8);
+    expect(prefs.defaultWorkWeek).toBe('monday-friday');
     expect(prefs.defaultBreakMinutes).toBe(60);
     // The unpaid break cannot be 0: it is taken off the worked time (and off weekend / holiday overtime).
     await send({ defaultBreakMinutes: 0, defaultMinHoursForPresent: 8 }).expect(

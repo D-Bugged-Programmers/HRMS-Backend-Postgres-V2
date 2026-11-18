@@ -9,6 +9,7 @@
 // personalData and removes non-required documents.
 // Important: NEVER deletes the User row or payroll/audit data. Every state change is written to PrivacyAuditLog with
 // field NAMES only, never values.
+import { resolveTrackingSettings } from '../field-tracking/field-tracking-logic';
 import {
   BadRequestException,
   ConflictException,
@@ -432,6 +433,31 @@ export class PrivacyRequestsService {
   }
 
   // -- HR / admin side --
+
+  /** Requests still being handled (submitted, under review, needing action or approved but not yet completed). */
+  countOpen(organizationId: string): Promise<number> {
+    return this.scopedPrisma.dataRequest.count({
+      where: {
+        organizationId,
+        status: {
+          in: ['SUBMITTED', 'UNDER_REVIEW', 'ACTION_REQUIRED', 'APPROVED'],
+        },
+      },
+    });
+  }
+
+  /** Open requests whose due date has passed. */
+  countOverdue(organizationId: string): Promise<number> {
+    return this.scopedPrisma.dataRequest.count({
+      where: {
+        organizationId,
+        status: {
+          in: ['SUBMITTED', 'UNDER_REVIEW', 'ACTION_REQUIRED', 'APPROVED'],
+        },
+        dueDate: { lt: new Date() },
+      },
+    });
+  }
 
   async listAll(query: ListDataRequestsQueryDto, organizationId: string) {
     const page = query.page ?? 1;
@@ -870,6 +896,8 @@ export class PrivacyRequestsService {
       personalDataKeysCleared: 0,
       documentsRemoved: 0,
       profileImageRemoved: false,
+      locationPointsRemoved: 0,
+      askHrQuestionsRemoved: 0,
     };
     const user = await p.user.findFirst({
       where: { id: userId, organizationId },
@@ -899,6 +927,30 @@ export class PrivacyRequestsService {
         outcome.profileImageRemoved = true;
       }
     }
+
+    // Live-tracking data is never a legal-retention record: the saved trail goes, tracking is switched off, and the
+    // coordinates on the person's visit check-ins are blanked (the visit itself - client, day, outcome - is a business record).
+    const pings = await p.locationPing.deleteMany({
+      where: { organizationId, employeeId: userId },
+    });
+    outcome.locationPointsRemoved = pings.count;
+    // The questions typed into Ask HR are not a legal-retention record either.
+    const asked = await p.askHrQuery.deleteMany({ where: { organizationId, userId } });
+    outcome.askHrQuestionsRemoved = asked.count;
+    await p.user.updateMany({
+      where: { id: userId, organizationId },
+      data: { fieldTrackingEnabled: false, fieldTrackingConsentAt: null },
+    });
+    await p.fieldVisit.updateMany({
+      where: { organizationId, employeeId: userId },
+      data: {
+        checkInLatitude: null,
+        checkInLongitude: null,
+        checkInAccuracyMeters: null,
+        checkOutLatitude: null,
+        checkOutLongitude: null,
+      },
+    });
 
     if (rules.removeNonRequiredDocuments !== false) {
       const required = await p.documentRequirement.findMany({
@@ -960,55 +1012,107 @@ export class PrivacyRequestsService {
       });
     }
 
-    const [docs, leaveGroups, attGroups, payslips, consents, requests] =
-      await Promise.all([
-        p.employeeDocument.findMany({
-          where: { organizationId, employeeId: userId },
-          orderBy: { uploadedAt: 'desc' },
-          select: {
-            docType: true,
-            fileName: true,
-            category: true,
-            status: true,
-            uploadedAt: true,
-          },
-        }),
-        p.leave.groupBy({
-          by: ['status'],
-          where: { organizationId, employeeId: userId },
-          _count: { _all: true },
-        }),
-        p.attendance.groupBy({
-          by: ['status'],
-          where: { organizationId, employeeId: userId },
-          _count: { _all: true },
-        }),
-        p.payrollRun.findMany({
-          where: { organizationId, employeeId: userId },
-          orderBy: [{ year: 'desc' }, { month: 'desc' }],
-          select: {
-            month: true,
-            year: true,
-            status: true,
-            payslipNumber: true,
-          },
-        }),
-        p.consentRecord.findMany({
-          where: { organizationId, userId },
-          orderBy: { at: 'asc' },
-          select: { purposeKey: true, status: true, at: true, source: true },
-        }),
-        p.dataRequest.findMany({
-          where: { organizationId, userId },
-          orderBy: { seqNo: 'asc' },
-          select: {
-            requestNo: true,
-            type: true,
-            status: true,
-            createdAt: true,
-          },
-        }),
-      ]);
+    const retentionDays = resolveTrackingSettings(
+      (
+        await p.organization.findFirst({
+          where: { id: organizationId },
+          select: { fieldTrackingSettings: true },
+        })
+      )?.fieldTrackingSettings,
+    ).retentionDays;
+    const [
+      docs,
+      leaveGroups,
+      attGroups,
+      payslips,
+      consents,
+      requests,
+      pings,
+      visits,
+      askHrQuestions,
+    ] = await Promise.all([
+      p.employeeDocument.findMany({
+        where: { organizationId, employeeId: userId },
+        orderBy: { uploadedAt: 'desc' },
+        select: {
+          docType: true,
+          fileName: true,
+          category: true,
+          status: true,
+          uploadedAt: true,
+        },
+      }),
+      p.leave.groupBy({
+        by: ['status'],
+        where: { organizationId, employeeId: userId },
+        _count: { _all: true },
+      }),
+      p.attendance.groupBy({
+        by: ['status'],
+        where: { organizationId, employeeId: userId },
+        _count: { _all: true },
+      }),
+      p.payrollRun.findMany({
+        where: { organizationId, employeeId: userId },
+        orderBy: [{ year: 'desc' }, { month: 'desc' }],
+        select: {
+          month: true,
+          year: true,
+          status: true,
+          payslipNumber: true,
+        },
+      }),
+      p.consentRecord.findMany({
+        where: { organizationId, userId },
+        orderBy: { at: 'asc' },
+        select: { purposeKey: true, status: true, at: true, source: true },
+      }),
+      p.dataRequest.findMany({
+        where: { organizationId, userId },
+        orderBy: { seqNo: 'asc' },
+        select: {
+          requestNo: true,
+          type: true,
+          status: true,
+          createdAt: true,
+        },
+      }),
+      // Live tracking: the saved location trail (kept 60 days) and the person's field visits.
+      p.locationPing.findMany({
+        where: { organizationId, employeeId: userId },
+        orderBy: { recordedAt: 'asc' },
+        take: 50000,
+        select: {
+          recordedAt: true,
+          latitude: true,
+          longitude: true,
+          accuracyMeters: true,
+          kind: true,
+        },
+      }),
+      p.fieldVisit.findMany({
+        where: { organizationId, employeeId: userId },
+        orderBy: { scheduledFor: 'desc' },
+        take: 5000,
+        select: {
+          clientName: true,
+          address: true,
+          scheduledFor: true,
+          status: true,
+          purpose: true,
+          checkInAt: true,
+          checkOutAt: true,
+          outcome: true,
+        },
+      }),
+      // Ask HR: the questions this person typed (kept 90 days) and whether anything was found.
+      p.askHrQuery.findMany({
+        where: { organizationId, userId },
+        orderBy: { createdAt: 'desc' },
+        take: 2000,
+        select: { question: true, answered: true, createdAt: true },
+      }),
+    ]);
 
     return {
       generatedAt: new Date().toISOString(),
@@ -1035,6 +1139,17 @@ export class PrivacyRequestsService {
       payslips,
       consents,
       privacyRequests: requests,
+      liveTracking: {
+        switchedOn: user.fieldTrackingEnabled,
+        agreedAt: user.fieldTrackingConsentAt,
+        note: `Location points are kept for ${retentionDays} days and then deleted.`,
+        locationPoints: pings,
+      },
+      fieldVisits: visits,
+      askHrQuestions: {
+        note: 'Questions you typed into Ask HR are kept for 90 days and then deleted.',
+        items: askHrQuestions,
+      },
     };
   }
 

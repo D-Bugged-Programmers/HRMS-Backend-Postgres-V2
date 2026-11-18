@@ -81,6 +81,7 @@ const SUPPLIED: Record<string, string[]> = {
   ROLE_CHANGED: ['previousRole', 'newRole'],
   SALARY_REVISED: ['effectiveFrom'],
   EXIT_COMPLETED: ['lastWorkingDay'],
+  EXIT_DOCUMENTS_PACK: ['lastWorkingDay', 'payslipCount'],
   APPROVALS_DIGEST: [
     'totalPending',
     'leaveCount',
@@ -129,6 +130,7 @@ const SUPPLIED: Record<string, string[]> = {
   LEAVE_EXPIRY_REMINDER: ['leaveSummary', 'daysLeft', 'reviewUrl'],
   MISSING_DOCUMENTS_REMINDER: ['missingCount', 'missingDocuments', 'reviewUrl'],
   MISSING_DOCUMENTS_SUMMARY: ['employeeCount', 'reviewUrl'],
+  HOLIDAY_CALENDAR_REMINDER: ['nextYear', 'holidayCount', 'reviewUrl'],
   TAX_DECLARATION_REMINDER: ['financialYear', 'deadline', 'reviewUrl'],
   EXIT_HANDOVER_REMINDER: ['lastWorkingDay', 'when', 'tasks', 'reviewUrl'],
   EXIT_CLEARANCE_REMINDER: [
@@ -138,6 +140,16 @@ const SUPPLIED: Record<string, string[]> = {
     'openItems',
     'reviewUrl',
   ],
+  PROBATION_DECISION: ['outcome', 'dateLabel', 'decisionDate', 'note'],
+  RESIGNATION_DECISION: ['decision', 'detail', 'lastWorkingDay', 'note'],
+  ASSET_ALLOCATED: ['assetName', 'assetType', 'assetTag', 'allocatedDate'],
+  ASSET_RETURN_REMINDER: ['assetList', 'assetCount', 'lastWorkingDay'],
+  LOAN_EMI_DUE: ['loanType', 'month', 'emiAmount', 'outstanding'],
+  LOAN_CLOSED: ['loanType', 'amount', 'closedOn'],
+  FORM16_AVAILABLE: ['financialYear', 'downloadUrl'],
+  ONBOARDING_REMINDER: ['pendingItems', 'profileUrl'],
+  RESIGNATION_SUBMITTED: ['subjectName', 'requestedLwd', 'reason', 'reviewUrl'],
+  RESIGNATION_PENDING_REMINDER: ['subjectName', 'requestedLwd', 'daysWaiting', 'reviewUrl'],
 };
 
 describe('email layout', () => {

@@ -34,6 +34,8 @@ import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { sendReportBranded } from '../reports/report-branding';
 import { TdsComplianceService } from './tds-compliance.service';
 import { renderForm130 } from './form130-pdf';
+import { sendOccasionEmail } from '../email-templates/send-occasion-email';
+import { frontendUrl } from '../common/frontend-url';
 import { EmailTemplatesService } from '../email-templates/email-templates.service';
 import { EmailService } from '../notifications/email.service';
 import { escapeHtml } from '../email-templates/email-layout';
@@ -41,7 +43,7 @@ import {
   PERSONAL_EMAIL_REQUIRED_MESSAGE,
   personalEmailOf,
 } from '../common/personal-email';
-import { loadReportLogo } from '../reports/report-branding';
+import { loadReportBranding } from '../reports/report-branding';
 import {
   ChallanListQueryDto,
   CreateChallanDto,
@@ -192,6 +194,18 @@ export class TdsComplianceController {
     return this.service.setStatement(dto, c, c.organizationId);
   }
 
+  // HR's pre-flight for the Form 130 / Form 16 screen: whether the certificate can be issued, and what to look at first.
+  @Get('form130/:id/check')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  form130Check(
+    @Param('id') id: string,
+    @Query() q: Form130QueryDto,
+    @CurrentUser() c: Caller,
+  ) {
+    return this.service.form130Readiness(id, q.financialYear, c.organizationId);
+  }
+
   @Get('form130/:id')
   @SelfOrRoles('id', Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
@@ -209,14 +223,43 @@ export class TdsComplianceController {
       c,
       c.organizationId,
     );
-    const logo = await loadReportLogo(this.scopedPrisma, c.organizationId);
-    const pdf = await renderForm130(data, logo);
+    const { logo, watermarkEnabled } = await loadReportBranding(
+      this.scopedPrisma,
+      c.organizationId,
+    );
+    const pdf = await renderForm130(data, logo, watermarkEnabled);
     res.set({
       'Content-Type': 'application/pdf',
       'Content-Disposition': `attachment; filename="${data.formName.replace(' ', '')}_${data.employee.code}_${q.financialYear}.pdf"`,
       'Content-Length': String(pdf.length),
     });
     res.end(pdf);
+  }
+
+  // Tells every employee with finalized pay in the year that their Form 16 can be downloaded (template FORM16_AVAILABLE). No
+  // attachment: the certificate itself is still downloaded from Tax Declaration or issued per person below.
+  @Post('form130/notify')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  async notifyForm130Ready(@Body() q: Form130QueryDto, @CurrentUser() c: Caller) {
+    const ids = await this.service.form130Recipients(q.financialYear, c.organizationId);
+    const users = await this.scopedPrisma.user.findMany({
+      where: { organizationId: c.organizationId, id: { in: ids }, isActive: true },
+      select: { name: true, email: true, notificationPreferences: true },
+    });
+    let sent = 0;
+    for (const u of users) {
+      const ok = await sendOccasionEmail(this.emailService, this.emailTemplatesService, {
+        organizationId: c.organizationId,
+        to: u.email,
+        occasionKey: 'FORM16_AVAILABLE',
+        notificationPreferences: u.notificationPreferences,
+        variables: { employeeName: u.name, financialYear: q.financialYear, downloadUrl: `${frontendUrl()}/tax-declaration` },
+      });
+      if (ok) sent++;
+    }
+    return { financialYear: q.financialYear, eligible: ids.length, sent };
   }
 
   // Issues the employee's Form 130 / Form 16 by e-mail: the PDF goes to their personal address (the company mailbox
@@ -252,15 +295,22 @@ export class TdsComplianceController {
       throw new BadRequestException(PERSONAL_EMAIL_REQUIRED_MESSAGE);
     }
     const to = personal ?? employee.email;
-    const logo = await loadReportLogo(this.scopedPrisma, c.organizationId);
-    const pdf = await renderForm130(data, logo);
+    const { logo, watermarkEnabled } = await loadReportBranding(
+      this.scopedPrisma,
+      c.organizationId,
+    );
+    const pdf = await renderForm130(data, logo, watermarkEnabled);
     const filename = `${data.formName.replace(' ', '')}_${data.employee.code}_${q.financialYear}.pdf`;
     const subject = `Your ${data.formName} for ${q.financialYear}`;
     // Through the shared email shell (organization header, footer, styled body) - it used to go out as bare paragraphs.
     const rendered = await this.emailTemplatesService.renderOccasion(
       c.organizationId,
       'TAX_CERTIFICATE_SENT',
-      { employeeName: employee.name, formName: data.formName, financialYear: q.financialYear },
+      {
+        employeeName: employee.name,
+        formName: data.formName,
+        financialYear: q.financialYear,
+      },
       {
         subject,
         html: `<p>Hi ${escapeHtml(employee.name)},</p><p>Your ${escapeHtml(data.formName)} (tax certificate) for ${escapeHtml(q.financialYear)} is attached. Please keep it for your income-tax filing.</p>`,

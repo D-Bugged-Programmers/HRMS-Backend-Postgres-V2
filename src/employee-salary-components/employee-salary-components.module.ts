@@ -1,3 +1,4 @@
+import { LettersModule } from '../letters/letters.module';
 import { Module } from '@nestjs/common';
 import { EmployeeSalaryComponentsController } from './employee-salary-components.controller';
 import { EmployeeSalaryComponentsService } from './employee-salary-components.service';
@@ -9,14 +10,18 @@ import { SalaryStructurePdfService } from './salary-structure-pdf.service';
 import { PrivacyModule } from '../privacy/privacy.module';
 import { PayrollModule } from '../payroll/payroll.module';
 
+import { CompanyBrandsModule } from '../company-brands/company-brands.module';
+
 @Module({
   imports: [
+    LettersModule,
     AuditLogModule,
     EmployeeTimelineModule,
     NotificationsModule,
     EmailTemplatesModule,
     PrivacyModule,
     PayrollModule,
+    CompanyBrandsModule,
   ],
   controllers: [EmployeeSalaryComponentsController],
   providers: [EmployeeSalaryComponentsService, SalaryStructurePdfService],

@@ -1,68 +1,21 @@
-import { Role } from '@prisma/client';
-import {
-  canManagerAccessEmployee,
-  resolveDepartmentFilter,
-} from './employee-query-scope';
+import { Role as RoleForDirectory } from '@prisma/client';
+import { employeeDirectoryScope, slimForEmployeeViewer } from './employee-query-scope';
 
-describe('resolveDepartmentFilter', () => {
-  it('MANAGER: forces their own department, ignoring the requested one entirely', () => {
-    const actor = { role: Role.MANAGER, departmentId: 'dept-mine' };
-    expect(resolveDepartmentFilter(actor, 'dept-someone-elses')).toBe(
-      'dept-mine',
-    );
+describe('employee directory for an EMPLOYEE viewer', () => {
+  it('shows only people who still work here, plus the caller own record', () => {
+    expect(employeeDirectoryScope({ id: 'me', role: RoleForDirectory.EMPLOYEE, departmentId: null })).toEqual({
+      OR: [{ isActive: true }, { id: 'me' }],
+    });
+    expect(employeeDirectoryScope({ id: 'm', role: RoleForDirectory.MANAGER, departmentId: null })).toBeUndefined();
+    expect(employeeDirectoryScope({ id: 'a', role: RoleForDirectory.ADMIN, departmentId: null })).toBeUndefined();
   });
 
-  it('MANAGER with no department assigned: resolves to undefined (no results, not "all results")', () => {
-    const actor = { role: Role.MANAGER, departmentId: null };
-    expect(resolveDepartmentFilter(actor, 'dept-x')).toBeUndefined();
-  });
-
-  it.each([Role.ADMIN, Role.HR, Role.EMPLOYEE])(
-    '%s: passes the requested department through unchanged',
-    (role) => {
-      const actor = { role, departmentId: 'dept-mine' };
-      expect(resolveDepartmentFilter(actor, 'dept-requested')).toBe(
-        'dept-requested',
-      );
-    },
-  );
-
-  it.each([Role.ADMIN, Role.HR, Role.EMPLOYEE])(
-    '%s: no filter requested -> undefined (no department scoping)',
-    (role) => {
-      const actor = { role, departmentId: 'dept-mine' };
-      expect(resolveDepartmentFilter(actor, undefined)).toBeUndefined();
-    },
-  );
-});
-
-describe('canManagerAccessEmployee', () => {
-  it.each([Role.ADMIN, Role.HR, Role.EMPLOYEE])(
-    "%s: always true — this function only restricts MANAGER, other roles are the guard's concern",
-    (role) => {
-      expect(
-        canManagerAccessEmployee({ role, departmentId: 'dept-1' }, 'dept-2'),
-      ).toBe(true);
-    },
-  );
-
-  it('MANAGER: true when the target is in their own department', () => {
-    const actor = { role: Role.MANAGER, departmentId: 'dept-1' };
-    expect(canManagerAccessEmployee(actor, 'dept-1')).toBe(true);
-  });
-
-  it('MANAGER: false when the target is in a different department', () => {
-    const actor = { role: Role.MANAGER, departmentId: 'dept-1' };
-    expect(canManagerAccessEmployee(actor, 'dept-2')).toBe(false);
-  });
-
-  it('MANAGER: false when the target has no department at all', () => {
-    const actor = { role: Role.MANAGER, departmentId: 'dept-1' };
-    expect(canManagerAccessEmployee(actor, null)).toBe(false);
-  });
-
-  it('MANAGER with no department themselves: false even if the target also has none (null !== null is avoided explicitly)', () => {
-    const actor = { role: Role.MANAGER, departmentId: null };
-    expect(canManagerAccessEmployee(actor, null)).toBe(false);
+  it('keeps who and where in the reporting line, drops email, phone and the rest', () => {
+    const slim = slimForEmployeeViewer({
+      id: '1', name: 'A', employeeId: 'E1', role: 'EMPLOYEE', departmentId: 'd', reportingManagerId: 'm', isActive: true,
+      email: 'a@x.test', contactNumber: '999', gender: 'MALE', probationEndDate: '2026-01-01', personalData: { pan: 'X' },
+    });
+    expect(slim).toEqual({ id: '1', name: 'A', employeeId: 'E1', role: 'EMPLOYEE', departmentId: 'd', reportingManagerId: 'm', isActive: true });
+    expect(slim).not.toHaveProperty('email');
   });
 });

@@ -4,8 +4,10 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
+  Patch,
   Post,
   Query,
   Res,
@@ -21,6 +23,7 @@ import { PrivacyAuditService } from '../privacy/privacy-audit.service';
 import { auditSensitive } from '../common/sensitive-audit';
 import { SetComponentValueDto } from './dto/set-component-value.dto';
 import { BulkSetStructureDto } from './dto/bulk-set-structure.dto';
+import { EditRevisionDto } from './dto/edit-revision.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { SelfOrRoles } from '../common/decorators/self-or-roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -159,6 +162,42 @@ export class EmployeeSalaryComponentsController {
     return this.employeeSalaryComponentsService.bulkSetStructure(
       id,
       dto,
+      caller.id,
+      caller.organizationId,
+    );
+  }
+
+  // Only HR and Admin; an HR user cannot edit their own revision (an Admin does), an Admin can.
+  @Patch(':id/revisions')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  editRevision(
+    @Param('id') id: string,
+    @Body() dto: EditRevisionDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    assertMayChangeSalaryOf(caller, id);
+    return this.employeeSalaryComponentsService.editRevision(
+      id,
+      dto,
+      caller.id,
+      caller.organizationId,
+    );
+  }
+
+  // Same rule as editing: Admin/HR only, HR cannot delete a revision of their own salary.
+  @Delete(':id/revisions')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  deleteRevision(
+    @Param('id') id: string,
+    @Query('effectiveFrom') effectiveFrom: string,
+    @CurrentUser() caller: Caller,
+  ) {
+    assertMayChangeSalaryOf(caller, id);
+    return this.employeeSalaryComponentsService.deleteRevision(
+      id,
+      effectiveFrom,
       caller.id,
       caller.organizationId,
     );

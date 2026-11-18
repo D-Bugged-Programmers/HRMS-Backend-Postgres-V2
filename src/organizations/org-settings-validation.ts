@@ -9,6 +9,8 @@ import { isValidIndianMobile } from '../common/indian-mobile';
 import { BadRequestException } from '@nestjs/common';
 import { isIanaTimeZone } from '../common/is-iana-timezone.validator';
 import { SUPPORTED_STATES, isSupportedState } from '../common/indian-states';
+import { NEGATIVE_BALANCE_MODES } from './org-leave-switches';
+import { sanitizeRuleSetPolicy } from '../overtime/overtime-rule-sets';
 
 // Number of Setup Wizard steps (frontend/src/components/organization/
 // steps.js ORG_STEPS) — setupStep is 1-based and the wizard clamps it to
@@ -57,6 +59,8 @@ export const FIELD_KINDS: Record<string, FieldKind> = {
   secondaryColor: 'requiredString',
   faviconUrl: 'fileUrl',
   reportLogoUrl: 'fileUrl',
+  letterHeaderUrl: 'fileUrl',
+  letterFooterUrl: 'fileUrl',
   emailLogoUrl: 'fileUrl',
   watermarkLogo: 'boolean',
   signatories: 'array',
@@ -71,6 +75,8 @@ export const FIELD_KINDS: Record<string, FieldKind> = {
   regularizationAutoApproveIfNoAction: 'boolean',
   regularizationAutoApproveHours: 'number',
   regularizationWindowDays: 'number',
+  regularizationMonthlyLimit: 'number',
+  regularizationResubmitLimit: 'number',
 };
 
 export function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -127,7 +133,11 @@ function checkNumber(
   const raw = obj[key];
   if (raw === undefined) return;
   if (raw === null || raw === '') {
-    if (rule.allowEmpty) return;
+    // A blank optional number is stored as NULL ("not set"), never as an empty string.
+    if (rule.allowEmpty) {
+      obj[key] = null;
+      return;
+    }
     bad(`${path} is required and must be a number.`);
   }
   const n =
@@ -191,6 +201,27 @@ function validatePolicies(p: Record<string, unknown>) {
     max: 365,
     integer: true,
   });
+  // Default probation length in months (joining date + this = the probation end date). Blank = 6.
+  checkNumber(p, 'defaultProbationMonths', 'policies.defaultProbationMonths', {
+    min: 1,
+    max: 24,
+    integer: true,
+    allowEmpty: true,
+  });
+  // Work From Home days an employee may have per month - shown on the profile as "used / allowed". Blank = no limit.
+  checkNumber(p, 'wfhDaysPerMonth', 'policies.wfhDaysPerMonth', {
+    min: 0,
+    max: 31,
+    integer: true,
+    allowEmpty: true,
+  });
+  // Days after a leave starts that the employee can still cancel it themselves (0 = only before it starts).
+  checkNumber(p, 'leaveCancelWindowDays', 'policies.leaveCancelWindowDays', {
+    min: 0,
+    max: 90,
+    integer: true,
+    allowEmpty: true,
+  });
   const ALLOWED_DATE_FORMATS = ['DD-MM-YYYY', 'MM-DD-YYYY', 'YYYY-MM-DD'];
   if (
     typeof p.dateFormat === 'string' &&
@@ -232,15 +263,93 @@ function validatePolicies(p: Record<string, unknown>) {
       bad(`policies.${key} must be a string.`);
     }
   }
+  // The company account salaries are paid from (goes into the bank file as the debit account; same-bank payments become
+  // IFT). Both optional.
+  const debitAccount = p.salaryDebitAccountNumber;
+  if (
+    debitAccount !== undefined &&
+    debitAccount !== null &&
+    debitAccount !== '' &&
+    !(
+      typeof debitAccount === 'string' && /^\d{9,18}$/.test(debitAccount.trim())
+    )
+  ) {
+    bad('policies.salaryDebitAccountNumber must be 9 to 18 digits.');
+  }
+  const debitIfsc = p.salaryDebitAccountIfsc;
+  if (
+    debitIfsc !== undefined &&
+    debitIfsc !== null &&
+    debitIfsc !== '' &&
+    !(
+      typeof debitIfsc === 'string' &&
+      /^[A-Za-z]{4}0[A-Za-z0-9]{6}$/.test(debitIfsc.trim())
+    )
+  ) {
+    bad('policies.salaryDebitAccountIfsc must look like HDFC0001234.');
+  }
   for (const key of [
     'autoCarryForwardEnabled',
     'allowCarryForward',
     'allowLeaveEncashment',
     'allowNegativeLeaveBalance',
+    'autoPrepareFnf',
+    'autoCompleteExit',
+    'autoConfirmProbation',
+    'autoApproveOvertime',
+    'autoApproveCompOff',
+    'autoApproveReimbursement',
   ]) {
     if (p[key] !== undefined && typeof p[key] !== 'boolean') {
       bad(`policies.${key} must be true or false.`);
     }
+  }
+  for (const key of [
+    'autoApproveOvertimeMonthlyCapHours',
+    'autoApproveCompOffMaxDays',
+    'autoApproveReimbursementMaxAmount',
+  ]) {
+    if (p[key] !== undefined && p[key] !== null && (typeof p[key] !== 'number' || !Number.isFinite(p[key]) || (p[key] as number) < 0)) {
+      bad(`policies.${key} must be a number of 0 or more.`);
+    }
+  }
+  if (p.loginMethod !== undefined && !['EMAIL', 'EMAIL_OR_ID', 'ID_ONLY'].includes(p.loginMethod as string)) {
+    bad('policies.loginMethod must be EMAIL, EMAIL_OR_ID or ID_ONLY.');
+  }
+  if (p.allowNoEmail !== undefined && typeof p.allowNoEmail !== 'boolean') bad('policies.allowNoEmail must be true or false.');
+  if (p.allowNoEmail === true && p.loginMethod === 'EMAIL') {
+    bad('People without an email cannot sign in with an email. Choose "Email or employee ID" or "Employee ID only", or switch "People may have no email" off.');
+  }
+  if (p.eventLetters !== undefined) {
+    const e = p.eventLetters;
+    if (!e || typeof e !== 'object' || Array.isArray(e)) bad('policies.eventLetters must be an object.');
+    else {
+      for (const [k, v] of Object.entries(e as Record<string, unknown>)) {
+        if (!['promotionLetter', 'incrementLetter', 'transferLetter'].includes(k)) bad(`policies.eventLetters.${k} is not a letter that follows an event.`);
+        else if (!['off', 'review', 'send'].includes(v as string)) bad(`policies.eventLetters.${k} must be off, review or send.`);
+      }
+    }
+  }
+  if (p.escalationDays !== undefined) {
+    const kinds = ['LEAVE', 'REGULARIZATION', 'WFH', 'OVERTIME', 'COMP_OFF', 'REIMBURSEMENT', 'LOAN', 'ENCASHMENT', 'RESIGNATION'];
+    const e = p.escalationDays;
+    if (!e || typeof e !== 'object' || Array.isArray(e)) bad('policies.escalationDays must be an object.');
+    else {
+      for (const [k, v] of Object.entries(e as Record<string, unknown>)) {
+        if (!kinds.includes(k)) bad(`policies.escalationDays.${k} is not a request type.`);
+        else if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 60) bad(`policies.escalationDays.${k} must be a whole number of days from 0 (never) to 60.`);
+      }
+    }
+  }
+  if (
+    p.negativeLeaveBalanceMode !== undefined &&
+    !(NEGATIVE_BALANCE_MODES as readonly unknown[]).includes(
+      p.negativeLeaveBalanceMode,
+    )
+  ) {
+    bad(
+      `policies.negativeLeaveBalanceMode must be one of ${NEGATIVE_BALANCE_MODES.join(', ')}.`,
+    );
   }
 }
 
@@ -308,6 +417,103 @@ function validateAttendancePrefs(p: Record<string, unknown>) {
       bad(`${path('alternateWeeklyOffs')} lists the same day more than once.`);
     }
   }
+  if (p.stillCheckedInReminder !== undefined) {
+    const c = p.stillCheckedInReminder;
+    if (!isPlainObject(c)) {
+      bad(`${path('stillCheckedInReminder')} must be an object.`);
+    } else {
+      if (c.enabled !== undefined && typeof c.enabled !== 'boolean') {
+        bad(`${path('stillCheckedInReminder')}.enabled must be true or false.`);
+      }
+      checkNumber(
+        c,
+        'minutesAfter',
+        `${path('stillCheckedInReminder')}.minutesAfter`,
+        { min: 5, max: 240, integer: true },
+      );
+    }
+  }
+  if (p.absenceSandwich !== undefined) {
+    const c = p.absenceSandwich;
+    if (!isPlainObject(c)) {
+      bad(`${path('absenceSandwich')} must be an object.`);
+    } else {
+      for (const k of ['weeklyOffs', 'holidays'] as const) {
+        if (c[k] !== undefined && typeof c[k] !== 'boolean') {
+          bad(`${path('absenceSandwich')}.${k} must be true or false.`);
+        }
+      }
+    }
+  }
+  for (const key of ['checkInReminder', 'checkOutReminder'] as const) {
+    if (p[key] === undefined) continue;
+    const c = p[key];
+    if (!isPlainObject(c)) {
+      bad(`${path(key)} must be an object.`);
+    } else {
+      if (c.enabled !== undefined && typeof c.enabled !== 'boolean') {
+        bad(`${path(key)}.enabled must be true or false.`);
+      }
+      checkNumber(c, 'minutesBefore', `${path(key)}.minutesBefore`, {
+        min: 5,
+        max: 120,
+        integer: true,
+      });
+    }
+  }
+  if (p.overtimePolicy !== undefined) {
+    const o = p.overtimePolicy;
+    if (!isPlainObject(o)) {
+      bad(`${path('overtimePolicy')} must be an object.`);
+    } else {
+      const op = (k: string) => `${path('overtimePolicy')}.${k}`;
+      checkNumber(o, 'minMinutes', op('minMinutes'), {
+        min: 0,
+        max: 240,
+        integer: true,
+      });
+      checkNumber(o, 'minWorkedHours', op('minWorkedHours'), {
+        min: 0.5,
+        max: 24,
+        allowEmpty: true,
+      });
+      checkNumber(o, 'maxHoursPerDay', op('maxHoursPerDay'), {
+        min: 0.25,
+        max: 24,
+        allowEmpty: true,
+      });
+      checkNumber(o, 'maxHoursPerMonth', op('maxHoursPerMonth'), {
+        min: 0.25,
+        max: 744,
+        allowEmpty: true,
+      });
+      checkNumber(o, 'claimWithinDays', op('claimWithinDays'), {
+        min: 1,
+        max: 90,
+        integer: true,
+        allowEmpty: true,
+      });
+      if (
+        o.roundingMinutes !== undefined &&
+        ![0, 15, 30, 60].includes(o.roundingMinutes as number)
+      ) {
+        bad(`${op('roundingMinutes')} must be 0, 15, 30 or 60.`);
+      }
+      const oneOf = (k: string, allowed: string[]) => {
+        if (o[k] !== undefined && !allowed.includes(o[k] as string)) {
+          bad(`${op(k)} must be one of ${allowed.join(', ')}.`);
+        }
+      };
+      oneOf('roundingMode', ['DOWN', 'NEAREST', 'UP']);
+      oneOf('capMode', ['BLOCK', 'WARN']);
+      oneOf('creationMode', ['BOTH', 'SELF', 'AUTO']);
+      try {
+        sanitizeRuleSetPolicy(o);
+      } catch (e) {
+        bad(`${path('overtimePolicy')}: ${(e as Error).message}`);
+      }
+    }
+  }
   if (
     p.requireSelfieForPunch !== undefined &&
     typeof p.requireSelfieForPunch !== 'boolean'
@@ -316,11 +522,11 @@ function validateAttendancePrefs(p: Record<string, unknown>) {
   }
   if (
     p.locationMode !== undefined &&
-    !['ENFORCED', 'RECORD_ONLY', 'NOT_NEEDED'].includes(p.locationMode as string)
+    !['ENFORCED', 'RECORD_ONLY', 'NOT_NEEDED'].includes(
+      p.locationMode as string,
+    )
   ) {
-    bad(
-      `${path('locationMode')} must be ENFORCED, RECORD_ONLY or NOT_NEEDED.`,
-    );
+    bad(`${path('locationMode')} must be ENFORCED, RECORD_ONLY or NOT_NEEDED.`);
   }
   if (
     p.notifySalaryRevision !== undefined &&
@@ -524,6 +730,29 @@ export function validateSectionData(data: Record<string, unknown>) {
     max: 31,
     integer: true,
   });
+  // Blank = no limit. Requests per month per employee, and re-sends of a rejected date.
+  checkNumber(
+    data,
+    'regularizationMonthlyLimit',
+    'regularizationMonthlyLimit',
+    {
+      min: 1,
+      max: 31,
+      integer: true,
+      allowEmpty: true,
+    },
+  );
+  checkNumber(
+    data,
+    'regularizationResubmitLimit',
+    'regularizationResubmitLimit',
+    {
+      min: 1,
+      max: 20,
+      integer: true,
+      allowEmpty: true,
+    },
+  );
 
   for (const field of ['primaryColor', 'secondaryColor']) {
     const v = data[field];

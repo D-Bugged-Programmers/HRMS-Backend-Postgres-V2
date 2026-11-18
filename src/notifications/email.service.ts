@@ -4,6 +4,7 @@
 // Important: send() never throws — any provider failure (or missing credentials) degrades to a console
 // dry-run log rather than propagating, so a bad SMTP/Resend config can never fail the caller's business
 // action. Only an explicit EMAIL_DRIVER=resend switches off the default SMTP path.
+import { isPlaceholderEmail } from '../common/no-email';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import * as nodemailer from 'nodemailer';
 import { Resend } from 'resend';
@@ -20,7 +21,14 @@ export interface SendEmailInput {
   subject: string;
   html: string;
   cc?: string[];
+  // Blind copies: delivered, but no recipient sees the other addresses (used for company-wide announcements, so
+  // everyone's address is not shown to everyone).
+  bcc?: string[];
   attachments?: EmailAttachment[];
+  // By default mail never goes to an inactive employee (an exited or deactivated account): automated mail has no business
+  // reaching them. Set this for the few messages that are meant for a leaver (a letter HR chose to send them, their final
+  // payslip and settlement), which are addressed on purpose.
+  allowInactive?: boolean;
   // Optional — when the caller has one in scope, pass it so a verified
   // custom sending domain (Organization Settings > Email Sending) is used
   // instead of the shared platform address. Omitted callers (or an org
@@ -132,18 +140,53 @@ export class EmailService {
     return !!process.env.SMTP_USER && !!process.env.SMTP_PASS;
   }
 
-  async send({
-    to,
-    subject,
-    html,
-    cc,
-    attachments,
-    organizationId,
-  }: SendEmailInput): Promise<{ dryRun: boolean }> {
+  // Which of these addresses belong to an inactive employee of the organisation (case-insensitive). A lookup that fails
+  // reports nobody inactive: a database hiccup must not stop mail.
+  private async inactiveAddresses(organizationId: string, addresses: string[]): Promise<Set<string>> {
+    const wanted = [...new Set(addresses.map((a) => a.trim().toLowerCase()).filter(Boolean))];
+    if (wanted.length === 0) return new Set();
+    try {
+      const rows = await this.prisma.user.findMany({
+        where: {
+          organizationId,
+          isActive: false,
+          OR: wanted.map((email) => ({ email: { equals: email, mode: 'insensitive' as const } })),
+        },
+        select: { email: true },
+      });
+      return new Set(rows.map((r) => r.email.trim().toLowerCase()));
+    } catch {
+      return new Set();
+    }
+  }
+
+  async send(input: SendEmailInput): Promise<{ dryRun: boolean }> {
+    const { subject, html, attachments, organizationId } = input;
+    let { to, cc, bcc } = input;
+    // A person with no email has a placeholder login address that can never receive mail: nothing is sent to it.
+    if (isPlaceholderEmail(to)) {
+      this.logger.log(`[Email - SKIPPED, recipient has no email] Subject: ${subject}`);
+      return { dryRun: true };
+    }
+    cc = cc?.filter((a) => !isPlaceholderEmail(a));
+    bcc = bcc?.filter((a) => !isPlaceholderEmail(a));
+    if (organizationId && !input.allowInactive) {
+      const inactive = await this.inactiveAddresses(organizationId, [to, ...(cc ?? []), ...(bcc ?? [])]);
+      if (inactive.size > 0) {
+        if (inactive.has(to.trim().toLowerCase())) {
+          this.logger.log(`[Email - SKIPPED, recipient is an inactive employee] To: ${to} | Subject: ${subject}`);
+          return { dryRun: true };
+        }
+        cc = cc?.filter((a) => !inactive.has(a.trim().toLowerCase()));
+        bcc = bcc?.filter((a) => !inactive.has(a.trim().toLowerCase()));
+      }
+    }
     const attachmentNote = attachments?.length
       ? ` | Attachments: ${attachments.map((a) => a.filename).join(', ')}`
       : '';
-    const ccNote = cc?.length ? ` | Cc: ${cc.join(', ')}` : '';
+    const ccNote =
+      (cc?.length ? ` | Cc: ${cc.join(', ')}` : '') +
+      (bcc?.length ? ` | Bcc: ${bcc.length} recipient(s)` : '');
     const from = await this.resolveFrom(organizationId);
 
     // An address that cannot exist: never handed to a provider.
@@ -168,6 +211,7 @@ export class EmailService {
           subject,
           html,
           ...(cc?.length && { cc }),
+          ...(bcc?.length && { bcc }),
           attachments: attachments?.map((a) => ({
             filename: a.filename,
             content: a.content,
@@ -205,6 +249,7 @@ export class EmailService {
         subject,
         html,
         ...(cc?.length && { cc }),
+        ...(bcc?.length && { bcc }),
         attachments,
       });
       return { dryRun: false };

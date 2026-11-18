@@ -14,6 +14,7 @@ import {
 } from '@nestjs/common';
 import {
   AttendanceStatus,
+  FieldVisitStatus,
   LeaveStatus,
   PayrollRunStatus,
   Role,
@@ -26,6 +27,7 @@ import { resolveOrgTimeContext } from '../payroll/format-date';
 import { CustomReportQueryDto } from './dto/custom-report-query.dto';
 import { ReportColumn } from './report-export';
 import { assertValidDateRange } from './report-limits';
+import { featureEnabledFor } from '../module-access/module-gate';
 
 type Actor = Omit<User, 'password'>;
 
@@ -38,9 +40,16 @@ const MANAGER_BLOCKED_SOURCES = new Set(['payroll']);
 // and fail as a 500, and for Employees any value other than 'active' silently meant inactive).
 const STATUS_VALUES: Record<string, readonly string[]> = {
   employees: ['active', 'inactive'],
-  attendance: Object.values(AttendanceStatus),
+  attendance: [
+    'LATE',
+    'EARLY_OUT',
+    'LATE_OR_EARLY',
+    ...Object.values(AttendanceStatus),
+  ],
   leaves: Object.values(LeaveStatus),
   payroll: Object.values(PayrollRunStatus),
+  probation: ['overdue', 'due_30', 'extended'],
+  fieldVisits: Object.values(FieldVisitStatus),
 };
 
 @Injectable()
@@ -49,10 +58,20 @@ export class CustomReportService {
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
   ) {}
 
-  listSources() {
-    return Object.entries(CUSTOM_REPORT_SOURCES).map(([key, s]) => ({
+  // Sources that need a company feature are listed only for companies that have it.
+  async listSources(organizationId: string) {
+    const entries: [string, (typeof CUSTOM_REPORT_SOURCES)[string]][] = [];
+    for (const e of Object.entries(CUSTOM_REPORT_SOURCES)) {
+      if (
+        !e[1].feature ||
+        (await featureEnabledFor(organizationId, e[1].feature))
+      )
+        entries.push(e);
+    }
+    return entries.map(([key, s]) => ({
       key,
       label: s.label,
+      statuses: s.statuses ?? [],
       columns: Object.entries(s.columns).map(([ckey, c]) => ({
         key: ckey,
         label: c.header,
@@ -65,6 +84,14 @@ export class CustomReportService {
     if (!src) {
       throw new BadRequestException(
         `source must be one of: ${Object.keys(CUSTOM_REPORT_SOURCES).join(', ')}.`,
+      );
+    }
+    if (
+      src.feature &&
+      !(await featureEnabledFor(organizationId, src.feature))
+    ) {
+      throw new ForbiddenException(
+        'This report source is not switched on for your company.',
       );
     }
     assertValidDateRange(query.from, query.to);

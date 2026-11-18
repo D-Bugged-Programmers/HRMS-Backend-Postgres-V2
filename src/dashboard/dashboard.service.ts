@@ -6,6 +6,20 @@
 // Important: departmentHeadDashboard() intentionally ports a quirk from the original release — a manager with no
 // department matches every other no-department user via departmentId: null, not zero rows.
 // computeHeadcountTrend() is shared with the Reports module so headcount numbers stay consistent everywhere.
+import { reviewerScope } from '../common/dept-scope';
+import { employedOnWhere } from '../common/managers';
+import { REQUEST_TYPE_MODULE, disabledModulesOf, gate } from '../module-access/module-gate';
+import {
+  pageRequest,
+  slicePage,
+  wanted,
+  type PageRequest,
+} from './pending-page';
+import {
+  formatTimeInZone,
+  resolveOrgTimeContext,
+} from '../payroll/format-date';
+import { holidayInEffect } from '../holidays/holiday-in-effect';
 import { getLeaveYearConfig } from '../leave-balances/leave-year-config';
 import { currentLeaveYear } from '../leave-balances/leave-year';
 import { Inject, Injectable } from '@nestjs/common';
@@ -24,8 +38,10 @@ import {
   ResignationStatus,
   WithdrawalRequestStatus,
   Role,
+  StatutoryModule,
   User,
   WfhApprovalStatus,
+  WorkArrangement,
 } from '@prisma/client';
 import { leaveDaysInRange } from '../leaves/leave-days-in-range';
 import { EXPORTABLE_RUN_STATUSES } from '../payroll/exportable-runs';
@@ -33,17 +49,22 @@ import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { PayrollSettingsService } from '../payroll-settings/payroll-settings.service';
 import { CompOffService } from '../comp-offs/comp-off.service';
+import { StatutoryConfigService } from '../statutory-config/statutory-config.service';
+import {
+  applyStatutoryOverrides,
+  type EffectiveConfigsByModule,
+} from '../payroll/statutory-overlay';
+import { lastDayOfMonth } from '../payroll/payroll-date-math';
 import { SALARY_COMPONENT_CODES } from '../common/reserved-codes';
 import { getFinancialYear } from '../payroll-settings/financial-year';
 import {
   DashboardRange,
   MONTH_LABELS,
   daysUntilNextOccurrence,
+  leaversByMonth,
   monthsForRange,
 } from './dashboard-date-math';
 import {
-  dateStrInOrgTz,
-  startOfDayInOrgTzUtc,
   todayInOrgTz,
 } from '../common/org-date';
 import {
@@ -71,7 +92,42 @@ export class DashboardService {
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly payrollSettingsService: PayrollSettingsService,
     private readonly compOffService: CompOffService,
+    private readonly statutoryConfigService: StatutoryConfigService,
   ) {}
+
+  // Which statutory deductions apply in a month, resolved the way payroll resolves them: the dated version in force on
+  // the month's last day (Statutory Configuration) wins over the plain on/off flag in Payroll Settings. Reading only
+  // the flag left the dashboard blank for PF/ESI/PT/LWF when a company had enabled them through Statutory
+  // Configuration while payroll was already deducting them.
+  private async statutoryEnabledIn(
+    settings: Parameters<typeof applyStatutoryOverrides>[0],
+    organizationId: string,
+    month: number,
+    year: number,
+  ) {
+    const periodDate = lastDayOfMonth(month, year);
+    const effectiveConfigs: EffectiveConfigsByModule = {};
+    for (const statutoryModule of Object.values(StatutoryModule)) {
+      const { version } = await this.statutoryConfigService.getEffective(
+        statutoryModule,
+        periodDate,
+        organizationId,
+      );
+      if (version) {
+        effectiveConfigs[statutoryModule] = {
+          config: version.config,
+          isEnabled: version.isEnabled,
+        };
+      }
+    }
+    const resolved = applyStatutoryOverrides(settings, effectiveConfigs);
+    return {
+      pf: resolved.pfEnabled,
+      esi: resolved.esiEnabled,
+      pt: resolved.ptEnabled,
+      lwf: resolved.lwfEnabled,
+    };
+  }
 
   // The leave year now in progress (the key leave balance rows are filed under) - the calendar year unless the
   // organisation's leave year starts in another month.
@@ -172,6 +228,10 @@ export class DashboardService {
     const currentYear = now.getFullYear();
     const monthPrefix = `${currentYear}-${String(currentMonth).padStart(2, '0')}`;
 
+    const off = await disabledModulesOf(organizationId);
+    // On the books today - joined, and not past the last working day (the account stays open until the exit is
+    // completed).
+    const onBooksToday = { isActive: true, ...employedOnWhere(today) };
     const [
       totalEmployees,
       presentToday,
@@ -179,6 +239,8 @@ export class DashboardService {
       absentToday,
       incompleteToday,
       onLeaveToday,
+      offToday,
+      notPunchedInToday,
       pendingLeaves,
       pendingRegularizationCount,
       payrollThisMonth,
@@ -189,63 +251,88 @@ export class DashboardService {
       reimbApproved,
       reimbRejected,
       reimbAmountPendingAgg,
+      reimbAmountApprovedAgg,
       upcomingHolidays,
       leaveBalanceRows,
       deptLeaveSummaryRaw,
     ] = await Promise.all([
       this.scopedPrisma.user.count({
-        where: { organizationId, isActive: true },
+        where: { organizationId, ...onBooksToday },
       }),
       // Present = a finished punch pair (or a regularized day). Someone who has only punched in so far is counted
-      // separately as Checked in until their punch-out arrives.
-      this.scopedPrisma.attendance.count({
+      // separately as Checked in until their punch-out arrives. Every count below is limited to the people in the
+      // headcount, so the cards add up to Total Employees.
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
         where: {
           organizationId,
           date: today,
-          status: AttendanceStatus.PRESENT,
+          employee: onBooksToday,
+          // A half day was punched in and out too; it is not left out of every card.
+          status: { in: [AttendanceStatus.PRESENT, AttendanceStatus.HALF_DAY] },
           // Everything Present except a bare punch-in (a regularized or manually entered day with no punch pair still
           // counts as Present).
           NOT: { inTime: { not: null }, outTime: null },
         },
-      }),
-      this.scopedPrisma.attendance.count({
+      }), 0),
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
         where: {
           organizationId,
           date: today,
+          employee: onBooksToday,
           status: AttendanceStatus.PRESENT,
           inTime: { not: null },
           outTime: null,
         },
-      }),
-      this.scopedPrisma.attendance.count({
-        where: { organizationId, date: today, status: AttendanceStatus.ABSENT },
-      }),
+      }), 0),
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
+        where: { organizationId, date: today, employee: onBooksToday, status: AttendanceStatus.ABSENT },
+      }), 0),
       // Punched in, no punch-out, shift already ended — distinct from a
       // plain no-show so HR can see who still needs to regularize today.
-      this.scopedPrisma.attendance.count({
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
         where: {
           organizationId,
           date: today,
+          employee: onBooksToday,
           status: AttendanceStatus.INCOMPLETE,
         },
-      }),
-      this.scopedPrisma.attendance.count({
+      }), 0),
+      gate(off, 'module.leave', async () => this.scopedPrisma.attendance.count({
         where: {
           organizationId,
           date: today,
+          employee: onBooksToday,
           status: AttendanceStatus.ON_LEAVE,
         },
-      }),
-      this.scopedPrisma.leave.count({
+      }), 0),
+      // A weekly off or holiday today: nobody is expected in.
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
+        where: {
+          organizationId,
+          date: today,
+          employee: onBooksToday,
+          status: { in: [AttendanceStatus.WEEKLY_OFF, AttendanceStatus.HOLIDAY] },
+        },
+      }), 0),
+      // Nothing recorded yet today: no punch, no leave. The nightly job marks them Absent after the day ends, so until
+      // then they are shown on their own instead of falling out of every card.
+      gate(off, 'module.attendance', async () => this.scopedPrisma.user.count({
+        where: {
+          ...onBooksToday,
+          organizationId,
+          attendances: { none: { organizationId, date: today } },
+        },
+      }), 0),
+      gate(off, 'module.leave', async () => this.scopedPrisma.leave.count({
         where: { organizationId, status: LeaveStatus.PENDING },
-      }),
-      this.scopedPrisma.attendance.count({
+      }), 0),
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
         where: {
           organizationId,
           regularization: { path: ['status'], equals: 'pending' },
         },
-      }),
-      this.scopedPrisma.payrollRun.count({
+      }), 0),
+      gate(off, 'module.payroll', async () => this.scopedPrisma.payrollRun.count({
         where: {
           organizationId,
           month: currentMonth,
@@ -262,8 +349,8 @@ export class DashboardService {
             ],
           },
         },
-      }),
-      this.scopedPrisma.payrollRun.findMany({
+      }), 0),
+      gate(off, 'module.payroll', async () => this.scopedPrisma.payrollRun.findMany({
         where: {
           organizationId,
           month: currentMonth,
@@ -273,8 +360,8 @@ export class DashboardService {
           isFinalSettlement: false,
           runSequence: 0,
         },
-      }),
-      this.scopedPrisma.payrollRun.findMany({
+      }), []),
+      gate(off, 'module.payroll', async () => this.scopedPrisma.payrollRun.findMany({
         where: {
           organizationId,
           status: PayrollRunStatus.DRAFT,
@@ -282,21 +369,26 @@ export class DashboardService {
           runSequence: 0,
         },
         orderBy: [{ year: 'asc' }, { month: 'asc' }],
-      }),
-      this.payrollSettingsService.getOrCreate(organizationId),
-      this.scopedPrisma.reimbursement.count({
+      }), []),
+      gate(off, 'module.payroll', async () => this.payrollSettingsService.getOrCreate(organizationId), null as never),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.count({
         where: { organizationId, status: ReimbursementStatus.PENDING },
-      }),
-      this.scopedPrisma.reimbursement.count({
+      }), 0),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.count({
         where: { organizationId, status: ReimbursementStatus.APPROVED },
-      }),
-      this.scopedPrisma.reimbursement.count({
+      }), 0),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.count({
         where: { organizationId, status: ReimbursementStatus.REJECTED },
-      }),
-      this.scopedPrisma.reimbursement.aggregate({
+      }), 0),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.aggregate({
         where: { organizationId, status: ReimbursementStatus.PENDING },
         _sum: { amount: true },
-      }),
+      }), { _sum: { amount: 0 } } as never),
+      // Approved but not yet paid: money still owed to employees (a claim leaves APPROVED only when it is marked PAID).
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.aggregate({
+        where: { organizationId, status: ReimbursementStatus.APPROVED },
+        _sum: { amount: true },
+      }), { _sum: { amount: 0 } } as never),
       this.scopedPrisma.holiday.findMany({
         where: { organizationId, isActive: true, date: { gte: today } },
         orderBy: { date: 'asc' },
@@ -307,7 +399,7 @@ export class DashboardService {
       // how much leave the employee actually has left overall. Grouped into
       // one total per employee below, same convention the mobile Dashboard
       // already uses for its own "Leave Balance" stat.
-      this.scopedPrisma.leaveBalance.findMany({
+      gate(off, 'module.leave', async () => this.scopedPrisma.leaveBalance.findMany({
         where: {
           organizationId,
           year: await this.currentLeaveYearKey(organizationId),
@@ -317,13 +409,13 @@ export class DashboardService {
             countInTotalBalance: true,
             allocationType: { not: AllocationType.EVENT_BASED },
           },
-          employee: { isActive: true },
+          employee: { isActive: true, ...employedOnWhere(today) },
         },
         include: {
           employee: { select: { id: true, name: true, employeeId: true } },
         },
-      }),
-      this.scopedPrisma.leave.findMany({
+      }), []),
+      gate(off, 'module.leave', async () => this.scopedPrisma.leave.findMany({
         where: {
           organizationId,
           status: LeaveStatus.APPROVED,
@@ -331,7 +423,7 @@ export class DashboardService {
           endDate: { gte: `${monthPrefix}-01` },
         },
         include: { employee: { select: { departmentId: true } } },
-      }),
+      }), []),
     ]);
 
     // Total remaining leave per employee across every leave type they have a
@@ -405,21 +497,30 @@ export class DashboardService {
         0,
       );
 
+    // With Payroll switched off there are no payroll settings or runs to read: nothing is shown as enabled.
+    const statutoryOn = off.has('module.payroll')
+      ? { pf: false, esi: false, pt: false, lwf: false }
+      : await this.statutoryEnabledIn(
+          settings,
+          organizationId,
+          currentMonth,
+          currentYear,
+        );
     const taxCompliance = {
       totalTDS: sumDeductionCode(
         currentMonthRuns,
         SALARY_COMPONENT_CODES.INCOME_TAX,
       ),
-      totalPF: settings.pfEnabled
+      totalPF: statutoryOn.pf
         ? sumDeductionCode(currentMonthRuns, SALARY_COMPONENT_CODES.PF)
         : null,
-      totalESI: settings.esiEnabled
+      totalESI: statutoryOn.esi
         ? sumDeductionCode(currentMonthRuns, SALARY_COMPONENT_CODES.ESI)
         : null,
-      totalPT: settings.ptEnabled
+      totalPT: statutoryOn.pt
         ? sumDeductionCode(currentMonthRuns, SALARY_COMPONENT_CODES.PT)
         : null,
-      totalLWF: settings.lwfEnabled
+      totalLWF: statutoryOn.lwf
         ? sumDeductionCode(currentMonthRuns, SALARY_COMPONENT_CODES.LWF)
         : null,
     };
@@ -457,8 +558,16 @@ export class DashboardService {
         absentToday,
         incompleteToday,
         onLeaveToday,
+        offToday,
+        notPunchedInToday,
       },
-      pendingItems: await this.pendingItems(organizationId, null, true, viewer),
+      // An HR user who heads departments sees only their people's requests here (see reviewerScope).
+      pendingItems: await this.pendingItems(
+        organizationId,
+        viewer ? await reviewerScope(this.scopedPrisma, viewer, organizationId) : null,
+        true,
+        viewer,
+      ),
       pendingApprovals: {
         leaves: pendingLeaves,
         regularizations: pendingRegularizationCount,
@@ -469,7 +578,11 @@ export class DashboardService {
         pendingClaims: reimbPending,
         approvedClaims: reimbApproved,
         rejectedClaims: reimbRejected,
-        amountPending: reimbAmountPendingAgg._sum.amount ?? 0,
+        // Money in claims still waiting for a decision, and money in approved claims still waiting to be paid.
+        amountAwaitingApproval: reimbAmountPendingAgg._sum.amount ?? 0,
+        amountAwaitingPayment: reimbAmountApprovedAgg._sum.amount ?? 0,
+        // Kept for older clients: everything not yet paid or rejected.
+        amountPending: (reimbAmountPendingAgg._sum.amount ?? 0) + (reimbAmountApprovedAgg._sum.amount ?? 0),
       },
       upcomingPayrun,
       upcomingHolidays,
@@ -487,22 +600,22 @@ export class DashboardService {
   // elsewhere), but worth knowing before wiring a frontend "my team" widget
   // to this endpoint for a non-manager caller.
   async departmentHeadDashboard(actor: Actor, organizationId: string) {
-    // A department-less MANAGER has no team: scope to nobody rather than to every unassigned user.
-    // (Other roles keep the documented null-department behaviour above.)
-    const deptEmployees =
-      actor.departmentId === null && actor.role === Role.MANAGER
-        ? []
-        : await this.scopedPrisma.user.findMany({
+    // The team is the departments they head and their reporting line (see reviewerScope); someone unscoped keeps the
+    // documented own-department behaviour above.
+    const scope = await reviewerScope(this.scopedPrisma, actor, organizationId);
+    const deptEmployees = await this.scopedPrisma.user.findMany({
             // Active people only: a deactivated colleague is not part of the team any more (the manager still counts).
             where: {
               organizationId,
-              departmentId: actor.departmentId,
+              ...(scope ? { id: { in: scope } } : { departmentId: actor.departmentId }),
               isActive: true,
+              ...employedOnWhere(todayInOrgTz(await this.getOrgTimezone(organizationId))),
             },
             select: { id: true },
           });
     const ids = deptEmployees.map((e) => e.id);
 
+    const off = await disabledModulesOf(organizationId);
     const [
       pendingLeaves,
       pendingRegularizations,
@@ -510,30 +623,30 @@ export class DashboardService {
       leaveTypesForTrends,
       teamLeaveBalancesRaw,
     ] = await Promise.all([
-      this.scopedPrisma.leave.count({
+      gate(off, 'module.leave', async () => this.scopedPrisma.leave.count({
         where: {
           organizationId,
           employeeId: { in: ids },
           status: LeaveStatus.PENDING,
         },
-      }),
-      this.scopedPrisma.attendance.count({
+      }), 0),
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
         where: {
           organizationId,
           employeeId: { in: ids },
           regularization: { path: ['status'], equals: 'pending' },
         },
-      }),
-      this.scopedPrisma.leave.groupBy({
+      }), 0),
+      gate(off, 'module.leave', async () => this.scopedPrisma.leave.groupBy({
         by: ['leaveTypeId'],
         where: { organizationId, employeeId: { in: ids } },
         _count: { _all: true },
-      }),
-      this.scopedPrisma.leaveType.findMany({
+      }), []),
+      gate(off, 'module.leave', async () => this.scopedPrisma.leaveType.findMany({
         where: { organizationId },
         select: { id: true, name: true, code: true },
-      }),
-      this.scopedPrisma.leaveBalance.findMany({
+      }), []),
+      gate(off, 'module.leave', async () => this.scopedPrisma.leaveBalance.findMany({
         where: {
           organizationId,
           employeeId: { in: ids },
@@ -546,7 +659,7 @@ export class DashboardService {
           leaveType: { select: { name: true, code: true, displayOrder: true } },
         },
         orderBy: { closing: 'asc' },
-      }),
+      }), []),
     ]);
 
     const leaveTypeByIdForTrends = new Map(
@@ -630,10 +743,9 @@ export class DashboardService {
   // The ONE definition of "waiting for a decision" for each request type. The Approvals list (pendingItems) and the
   // sidebar badge counts (pendingCounts) both use it, so a badge can never disagree with the list behind it.
   //
-  // A request is not waiting for a person's decision when they are not allowed to decide it: nobody, Admin included,
-  // may review their own leave, comp-off or encashment (assertNotOwnRequest), and only an Admin may review their own
-  // other requests (assertNotSelfApproval). Those are left out of the count and the list when the viewer is known, so
-  // the badge never promises an action the person cannot take.
+  // A request is not waiting for a person's decision when they are not allowed to decide it: only an Admin may decide
+  // their own requests (assertNotSelfApproval), so HR's and a manager's own are left out of their count and list when
+  // the viewer is known - the badge never promises an action the person cannot take. An Admin's own stay in.
   private pendingWhere(
     scope: {
       organizationId: string;
@@ -641,37 +753,48 @@ export class DashboardService {
     },
     viewer?: { id: string; role: Role },
   ) {
-    const withoutOwn = (strict: boolean) => {
-      if (!viewer || (!strict && viewer.role === Role.ADMIN)) return scope;
+    const withoutOwn = () => {
+      if (!viewer || viewer.role === Role.ADMIN) return scope;
       return {
         ...scope,
         employeeId: { ...(scope.employeeId ?? {}), not: viewer.id },
       };
     };
     return {
-      leaves: { ...withoutOwn(true), status: LeaveStatus.PENDING },
+      // Pending leave requests, plus approved leaves the employee has asked to have cancelled (the approver decides
+      // those too, from the same list).
+      leaves: {
+        ...withoutOwn(),
+        OR: [
+          { status: LeaveStatus.PENDING },
+          {
+            status: LeaveStatus.APPROVED,
+            cancelRequestedAt: { not: null },
+          },
+        ],
+      },
       regularizations: {
-        ...withoutOwn(false),
+        ...withoutOwn(),
         regularization: { path: ['status'], equals: 'pending' },
       },
       wfh: {
-        ...withoutOwn(false),
+        ...withoutOwn(),
         workArrangementStatus: WfhApprovalStatus.PENDING,
       },
-      overtime: { ...withoutOwn(false), status: OvertimeStatus.PENDING },
-      compOffs: { ...withoutOwn(true), status: CompOffStatus.PENDING },
+      overtime: { ...withoutOwn(), status: OvertimeStatus.PENDING },
+      compOffs: { ...withoutOwn(), status: CompOffStatus.PENDING },
       reimbursements: {
-        ...withoutOwn(false),
+        ...withoutOwn(),
         status: ReimbursementStatus.PENDING,
       },
-      loans: { ...withoutOwn(false), status: LoanStatus.PENDING },
+      loans: { ...withoutOwn(), status: LoanStatus.PENDING },
       encashments: {
-        ...withoutOwn(true),
+        ...withoutOwn(),
         status: LeaveEncashmentStatus.PENDING,
       },
       // Pending resignations, plus approved ones whose employee asked to withdraw (HR/Admin answer those too).
       resignations: {
-        ...withoutOwn(false),
+        ...withoutOwn(),
         OR: [
           { status: ResignationStatus.PENDING },
           {
@@ -718,44 +841,40 @@ export class DashboardService {
     const isHr = actor.role === Role.ADMIN || actor.role === Role.HR;
     if (!isHr && actor.role !== Role.MANAGER) return empty;
 
+    // Same team the department-head dashboard uses: a MANAGER, or an HR user who heads departments, counts only the
+    // people they look after (see reviewerScope); Admin and an HR user heading no department count everyone.
     let employeeIds: string[] | null = null;
-    if (!isHr) {
-      // Same team the manager's dashboard uses: active people in their department (none when they have no department).
-      const team =
-        actor.departmentId === null
-          ? []
-          : await this.scopedPrisma.user.findMany({
-              where: {
-                organizationId,
-                departmentId: actor.departmentId,
-                isActive: true,
-              },
-              select: { id: true },
-            });
+    const scope = await reviewerScope(this.scopedPrisma, actor, organizationId);
+    if (scope) {
+      const team = await this.scopedPrisma.user.findMany({
+        where: { organizationId, id: { in: scope }, isActive: true },
+        select: { id: true },
+      });
       employeeIds = team.map((e) => e.id);
     }
     const where = this.pendingWhere(
       this.pendingScope(organizationId, employeeIds),
       { id: actor.id, role: actor.role },
     );
+    const off = await disabledModulesOf(organizationId);
     const [leaves, regularizations, wfh, overtime, compOffs] =
       await Promise.all([
-        this.scopedPrisma.leave.count({ where: where.leaves }),
-        this.scopedPrisma.attendance.count({ where: where.regularizations }),
-        this.countPendingWfhRequests(where.wfh),
-        this.scopedPrisma.overtimeRecord.count({ where: where.overtime }),
-        this.scopedPrisma.compOff.count({ where: where.compOffs }),
+        gate(off, 'module.leave', async () => this.scopedPrisma.leave.count({ where: where.leaves }), 0),
+        gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({ where: where.regularizations }), 0),
+        gate(off, 'module.attendance', async () => this.countPendingWfhRequests(where.wfh), 0),
+        gate(off, 'module.attendance', async () => this.scopedPrisma.overtimeRecord.count({ where: where.overtime }), 0),
+        gate(off, 'module.leave', async () => this.scopedPrisma.compOff.count({ where: where.compOffs }), 0),
       ]);
     const [reimbursements, loans, encashments, resignations] = isHr
       ? await Promise.all([
-          this.scopedPrisma.reimbursement.count({
-            where: where.reimbursements,
-          }),
-          this.scopedPrisma.loan.count({ where: where.loans }),
-          this.scopedPrisma.leaveEncashment.count({ where: where.encashments }),
-          this.scopedPrisma.resignation.count({ where: where.resignations }),
+          gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.count({ where: where.reimbursements }), 0),
+          gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.loan.count({ where: where.loans }), 0),
+          gate(off, 'module.leave', async () => this.scopedPrisma.leaveEncashment.count({ where: where.encashments }), 0),
+          gate(off, 'module.offboarding', async () => this.scopedPrisma.resignation.count({ where: where.resignations }), 0),
         ])
       : [0, 0, 0, 0];
+    // A switched-off module has nothing to approve: its queries above were skipped, so its counts read 0 (and the
+    // sidebar badges hide too).
     const counts = {
       leaves,
       regularizations,
@@ -778,85 +897,164 @@ export class DashboardService {
   // review. Each row carries what the dashboard needs to show it and link to the page where it is actioned.
   // employeeIds = null means the whole organisation (HR/Admin); includeHrQueues adds the request types only HR/Admin
   // review (reimbursement, loan/advance, leave encashment, resignation).
+  // The waiting requests of ONE type for the caller (a manager: their department; HR/Admin: everyone), newest first, up to
+  // 50 - the mobile Approvals screen's per-type tabs, where the 10-newest mixed list would hide older ones.
+  //
+  // Without `paging` the answer is the plain list of the newest 50 (what every existing client reads). With it, the answer
+  // is { items, hasMore, offset, limit }: one page of that newest-first list and whether more follow, so a backlog longer
+  // than 50 can be read to the end ("Load more") instead of being cut off.
+  async pendingItemsByType(
+    actor: Actor,
+    organizationId: string,
+    type: string,
+    paging?: { offset?: number; limit?: number },
+  ) {
+    const viewer = { id: actor.id, role: actor.role };
+    const page = pageRequest(paging?.offset, paging?.limit);
+    const options = { type, limit: 50, page: paging ? page : undefined };
+    // Same team as the department-head dashboard (see reviewerScope).
+    const scope = await reviewerScope(this.scopedPrisma, actor, organizationId);
+    const team = scope
+      ? (
+          await this.scopedPrisma.user.findMany({
+            where: { organizationId, id: { in: scope }, isActive: true },
+            select: { id: true },
+          })
+        ).map((e) => e.id)
+      : null;
+    // HR keeps its own queues (reimbursements, loans, ...) for the people it looks after; a manager only the ones a
+    // manager reviews.
+    return this.pendingItems(organizationId, team, actor.role !== Role.MANAGER, viewer, options);
+  }
+
+  // The Work From Home rows of the waiting requests, newest request first: single days one row each, and a multi-day
+  // request all of its rows together (so it is never cut in the middle). Reads `want` requests of each kind.
+  private async wfhRowsForPending(
+    where: Prisma.AttendanceWhereInput,
+    include: { employee: { select: { name: true; employeeId: true } } },
+    want: number,
+  ) {
+    const [singles, groups] = await Promise.all([
+      this.scopedPrisma.attendance.findMany({
+        where: { ...where, wfhRequestId: null },
+        include,
+        orderBy: { updatedAt: 'desc' },
+        take: want,
+      }),
+      this.scopedPrisma.attendance.groupBy({
+        by: ['wfhRequestId'],
+        where: { ...where, wfhRequestId: { not: null } },
+        _max: { updatedAt: true },
+        orderBy: { _max: { updatedAt: 'desc' } },
+        take: want,
+      }),
+    ]);
+    const ids = groups.map((g) => g.wfhRequestId as string);
+    const grouped = ids.length
+      ? await this.scopedPrisma.attendance.findMany({
+          where: { ...where, wfhRequestId: { in: ids } },
+          include,
+          orderBy: { updatedAt: 'desc' },
+        })
+      : [];
+    return [...singles, ...grouped];
+  }
+
   private async pendingItems(
     organizationId: string,
     employeeIds: string[] | null,
     includeHrQueues: boolean,
     viewer?: { id: string; role: Role },
+    // `type`: only that kind of request, up to `limit` of them (default: all kinds mixed, the 10 newest). `page`: one
+    // page of that list with a "more follow" flag instead of just the first `limit`.
+    options?: { type?: string; limit?: number; page?: PageRequest },
   ) {
-    const LIMIT = 10;
+    const LIMIT = options?.limit ?? 10;
+    // Rows read from each source: enough for the first LIMIT, or for the requested page plus one to know if more follow.
+    const WANT = options?.page ? wanted(options.page) : LIMIT;
     const scope = this.pendingScope(organizationId, employeeIds);
     const where = this.pendingWhere(scope, viewer);
-    const employeeSelect = { select: { name: true, employeeId: true } };
+    const employeeSelect = { select: { name: true, employeeId: true } } as const;
+    const off = await disabledModulesOf(organizationId);
     const [leaves, regularizations, wfh, overtime, compOffs] =
       await Promise.all([
-        this.scopedPrisma.leave.findMany({
+        gate(off, 'module.leave', async () => this.scopedPrisma.leave.findMany({
           where: where.leaves,
           include: {
             employee: employeeSelect,
             leaveType: { select: { name: true } },
           },
           orderBy: { createdAt: 'desc' },
-          take: LIMIT,
-        }),
-        this.scopedPrisma.attendance.findMany({
+          take: WANT,
+        }), [] as never),
+        gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.findMany({
           where: where.regularizations,
           include: { employee: employeeSelect },
           orderBy: { updatedAt: 'desc' },
-          take: LIMIT,
-        }),
-        this.scopedPrisma.attendance.findMany({
-          where: where.wfh,
-          include: { employee: employeeSelect },
-          orderBy: { updatedAt: 'desc' },
-          // More than LIMIT rows: a multi-day request is several rows that are shown as ONE item below, so the cap
-          // is applied to requests, not to days.
-          take: 200,
-        }),
-        this.scopedPrisma.overtimeRecord.findMany({
+          take: WANT,
+        }), [] as never),
+        // A multi-day request is several rows shown as ONE item below, so the cap counts requests, not days.
+        gate(off, 'module.attendance', async () => this.wfhRowsForPending(where.wfh, { employee: employeeSelect }, WANT), [] as never),
+        gate(off, 'module.attendance', async () => this.scopedPrisma.overtimeRecord.findMany({
           where: where.overtime,
           include: { employee: employeeSelect },
           orderBy: { createdAt: 'desc' },
-          take: LIMIT,
-        }),
-        this.scopedPrisma.compOff.findMany({
+          take: WANT,
+        }), [] as never),
+        gate(off, 'module.leave', async () => this.scopedPrisma.compOff.findMany({
           where: where.compOffs,
           include: { employee: employeeSelect },
           orderBy: { createdAt: 'desc' },
-          take: LIMIT,
-        }),
+          take: WANT,
+        }), [] as never),
       ]);
     const days = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
-    const reimbursements = includeHrQueues
+    const timeCtx = await resolveOrgTimeContext(
+      this.scopedPrisma,
+      organizationId,
+    );
+    const reimbursements = includeHrQueues && !off.has('module.loans_reimbursements')
       ? await this.scopedPrisma.reimbursement.findMany({
           where: where.reimbursements,
           include: { employee: employeeSelect },
           orderBy: { createdAt: 'desc' },
-          take: LIMIT,
+          take: WANT,
         })
       : [];
-    const loans = includeHrQueues
+    const loans = includeHrQueues && !off.has('module.loans_reimbursements')
       ? await this.scopedPrisma.loan.findMany({
           where: where.loans,
           include: { employee: employeeSelect },
           orderBy: { createdAt: 'desc' },
-          take: LIMIT,
+          take: WANT,
         })
       : [];
-    const encashments = includeHrQueues
+    const encashments = includeHrQueues && !off.has('module.leave')
       ? await this.scopedPrisma.leaveEncashment.findMany({
           where: where.encashments,
           include: { employee: employeeSelect },
           orderBy: { createdAt: 'desc' },
-          take: LIMIT,
+          take: WANT,
         })
       : [];
-    const resignations = includeHrQueues
+    const resignations = includeHrQueues && !off.has('module.offboarding')
       ? await this.scopedPrisma.resignation.findMany({
-          where: where.resignations,
+          // For one kind only, so the page is not filled by the other kind: a pending resignation, or an approved one
+          // whose employee asked to withdraw it.
+          where:
+            options?.type === 'RESIGNATION'
+              ? { ...where.resignations, OR: undefined, status: ResignationStatus.PENDING }
+              : options?.type === 'RESIGNATION_WITHDRAWAL'
+                ? {
+                    ...where.resignations,
+                    OR: undefined,
+                    status: ResignationStatus.APPROVED,
+                    withdrawalStatus: WithdrawalRequestStatus.REQUESTED,
+                  }
+                : where.resignations,
           include: { employee: employeeSelect },
           orderBy: { createdAt: 'desc' },
-          take: LIMIT,
+          take: WANT,
         })
       : [];
     const hrItems = [
@@ -923,24 +1121,52 @@ export class DashboardService {
         id: l.id,
         employee: l.employee.name,
         employeeId: l.employee.employeeId,
-        summary: `${l.leaveType.name} (${days(l.totalDays)})`,
+        // An approved leave in this list is a cancellation request: it is decided on its own endpoint.
+        cancellation: l.status === LeaveStatus.APPROVED,
+        cancelReason:
+          l.status === LeaveStatus.APPROVED ? l.cancelRequestReason : null,
+        summary: `${l.status === LeaveStatus.APPROVED ? 'Cancel request: ' : ''}${l.leaveType.name} (${days(l.totalDays)})`,
         date: l.startDate,
         endDate: l.endDate === l.startDate ? null : l.endDate,
-        requestedAt: l.createdAt,
+        requestedAt:
+          l.status === LeaveStatus.APPROVED
+            ? (l.cancelRequestedAt ?? l.createdAt)
+            : l.createdAt,
         // Set once the reporting manager has signed off level 1 of a two-level leave type; the request then waits
         // for HR/Admin's final decision, so the list can say so instead of offering the manager Approve again.
         levelOneApprovedAt: l.level1ApprovedAt,
       })),
-      ...regularizations.map((a) => ({
-        type: 'REGULARIZATION' as const,
-        id: a.id,
-        employee: a.employee.name,
-        employeeId: a.employee.employeeId,
-        summary: 'Attendance regularization',
-        date: a.date,
-        endDate: null,
-        requestedAt: a.updatedAt,
-      })),
+      ...regularizations.map((a) => {
+        // What was actually punched and what is being asked for, in the organization's own clock, so the reviewer sees
+        // both without opening the request (the Approvals dialog and the mobile card both show this line).
+        const reg = a.regularization as unknown as {
+          requestedInTime?: string | null;
+          requestedOutTime?: string | null;
+        } | null;
+        const clock = (v: Date | string | null | undefined, none: string) =>
+          v
+            ? formatTimeInZone(
+                new Date(v),
+                timeCtx.timezone,
+                timeCtx.timeFormat,
+              )
+            : none;
+        const actual =
+          a.inTime || a.outTime
+            ? `${clock(a.inTime, 'no check-in')} - ${clock(a.outTime, 'no check-out')}`
+            : 'no punch';
+        const asked = `${clock(reg?.requestedInTime, '-')} - ${clock(reg?.requestedOutTime, '-')}`;
+        return {
+          type: 'REGULARIZATION' as const,
+          id: a.id,
+          employee: a.employee.name,
+          employeeId: a.employee.employeeId,
+          summary: `Attendance regularization (actual ${actual}; requested ${asked})`,
+          date: a.date,
+          endDate: null,
+          requestedAt: a.updatedAt,
+        };
+      }),
       ...this.groupWfhRows(wfh).map((g) => ({
         type: 'WFH' as const,
         // A multi-day request is decided as one, through its request id (groupId); a single day by its row id.
@@ -955,8 +1181,8 @@ export class DashboardService {
         date: g.rows[0].date,
         endDate: g.rows.length > 1 ? g.rows[g.rows.length - 1].date : null,
         requestedAt: g.rows[0].updatedAt,
-        // Why the employee asked, for the approver.
-        reason: g.rows[0].workArrangementReason ?? undefined,
+        // The employee's reason; every day of a multi-day request carries the same one.
+        reason: g.rows[0].workArrangementReason ?? null,
       })),
       ...overtime.map((o) => ({
         type: 'OVERTIME' as const,
@@ -967,6 +1193,9 @@ export class DashboardService {
         date: o.date,
         endDate: null,
         requestedAt: o.createdAt,
+        // Weekend / holiday work is compensated by the approver's choice, so the app needs these to offer it.
+        overtimeType: o.type,
+        employeeUserId: o.employeeId,
       })),
       ...compOffs.map((c) => ({
         type: 'COMP_OFF' as const,
@@ -982,9 +1211,15 @@ export class DashboardService {
     // Newest first: the latest request is on top. With more than LIMIT waiting the list is the LIMIT newest (each
     // type was also read newest first), and the counts beside it come from pending-counts, so nothing is hidden
     // silently.
-    return items
-      .sort((a, b) => b.requestedAt.getTime() - a.requestedAt.getTime())
-      .slice(0, LIMIT);
+    // Requests of a module the Super Admin switched off for this company are not shown.
+    const sorted = items
+      .filter((i) => !off.has(REQUEST_TYPE_MODULE[i.type] ?? ''))
+      .filter((i) => !options?.type || i.type === options.type)
+      .sort((a, b) => b.requestedAt.getTime() - a.requestedAt.getTime());
+    if (options?.page) {
+      return { ...slicePage(sorted, options.page), ...options.page };
+    }
+    return sorted.slice(0, LIMIT);
   }
 
   // Working days = every date of the month that is neither one of the employee's weekly offs (department schedule,
@@ -994,7 +1229,12 @@ export class DashboardService {
     organizationId: string,
     monthPrefix: string,
     today: string,
-  ): Promise<{ total: number; elapsed: number }> {
+  ): Promise<{
+    total: number;
+    elapsed: number;
+    holidayDays: string[];
+    weeklyOffDays: string[];
+  }> {
     const [employee, org] = await Promise.all([
       this.scopedPrisma.user.findFirst({
         where: { id: employeeId, organizationId },
@@ -1014,7 +1254,7 @@ export class DashboardService {
     const holidays = await this.scopedPrisma.holiday.findMany({
       where: {
         organizationId,
-        isActive: true,
+        AND: [holidayInEffect],
         date: { startsWith: monthPrefix },
         OR: employee?.departmentId
           ? [{ departmentId: null }, { departmentId: employee.departmentId }]
@@ -1029,15 +1269,23 @@ export class DashboardService {
         null) as OrganizationAttendancePrefs | null,
     );
     const joined = employee?.joiningDate?.toISOString().slice(0, 10) ?? '';
-    const working = dates.filter(
-      (d) =>
-        d >= joined &&
-        !holidayDates.has(d) &&
-        !isWeeklyOff(d, shiftConfig.weeklyOffs),
+    const exit = employee?.exitDate ?? null;
+    const inService = dates.filter((d) => d >= joined && (!exit || d <= exit));
+    const working = inService.filter(
+      (d) => !holidayDates.has(d) && !isWeeklyOff(d, shiftConfig.weeklyOffs),
     );
     return {
       total: working.length,
       elapsed: working.filter((d) => d <= today).length,
+      // The days the calendar makes non-working for this person, up to and including today (a holiday wins over a
+      // weekly off): what the attendance card lists as "Holiday" and "Weekly Off".
+      holidayDays: inService.filter((d) => d <= today && holidayDates.has(d)),
+      weeklyOffDays: inService.filter(
+        (d) =>
+          d <= today &&
+          !holidayDates.has(d) &&
+          isWeeklyOff(d, shiftConfig.weeklyOffs),
+      ),
     };
   }
 
@@ -1055,6 +1303,7 @@ export class DashboardService {
       settings.financialYearStartMonth,
     );
 
+    const off = await disabledModulesOf(organizationId);
     const [
       attendanceThisMonth,
       latestPayroll,
@@ -1072,22 +1321,26 @@ export class DashboardService {
       activeLoan,
       taxDeclaration,
     ] = await Promise.all([
-      this.scopedPrisma.attendance.findMany({
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.findMany({
         where: {
           organizationId,
           employeeId: actor.id,
           date: { startsWith: monthPrefix },
         },
-      }),
-      this.scopedPrisma.payrollRun.findFirst({
+      }), []),
+      gate(off, 'module.payroll', async () => this.scopedPrisma.payrollRun.findFirst({
         where: {
           organizationId,
           employeeId: actor.id,
           // Final payslips only: an approved one can still change (see EMPLOYEE_VISIBLE_STATUSES in payroll.service.ts).
           status: { in: [PayrollRunStatus.LOCKED, PayrollRunStatus.PAID] },
+          // The monthly salary: an arrears / off-cycle payment or the final settlement of the same month is not it, and
+          // would otherwise be picked arbitrarily when the months tie.
+          isFinalSettlement: false,
+          runSequence: 0,
         },
         orderBy: [{ year: 'desc' }, { month: 'desc' }],
-      }),
+      }), null),
       this.scopedPrisma.holiday.findMany({
         where: {
           organizationId,
@@ -1104,7 +1357,7 @@ export class DashboardService {
         orderBy: { date: 'asc' },
         take: 5,
       }),
-      this.scopedPrisma.leaveBalance.findMany({
+      gate(off, 'module.leave', async () => this.scopedPrisma.leaveBalance.findMany({
         where: {
           organizationId,
           employeeId: actor.id,
@@ -1120,61 +1373,54 @@ export class DashboardService {
             },
           },
         },
-      }),
-      this.compOffService.available(actor.id, organizationId),
-      this.scopedPrisma.leave.count({
+      }), []),
+      gate(off, 'module.leave', async () => this.compOffService.available(actor.id, organizationId), 0),
+      gate(off, 'module.leave', async () => this.scopedPrisma.leave.count({
         where: {
           organizationId,
           employeeId: actor.id,
           status: LeaveStatus.PENDING,
         },
-      }),
-      this.scopedPrisma.reimbursement.count({
+      }), 0),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.count({
         where: {
           organizationId,
           employeeId: actor.id,
           status: ReimbursementStatus.PENDING,
         },
-      }),
-      this.scopedPrisma.loan.count({
+      }), 0),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.loan.count({
         where: {
           organizationId,
           employeeId: actor.id,
           status: LoanStatus.PENDING,
         },
-      }),
-      this.scopedPrisma.attendance.count({
+      }), 0),
+      gate(off, 'module.attendance', async () => this.scopedPrisma.attendance.count({
         where: {
           organizationId,
           employeeId: actor.id,
           regularization: { path: ['status'], equals: 'pending' },
         },
-      }),
+      }), 0),
       // Days this month that still need a regularization request submitted
       // (not counted via the `regularization` JSON above — that only
       // tracks requests already made) — this is the "you need to act"
       // nudge, surfaced separately from the "waiting on HR" count.
-      this.scopedPrisma.attendance.count({
-        where: {
-          organizationId,
-          employeeId: actor.id,
-          date: { startsWith: monthPrefix },
-          status: AttendanceStatus.INCOMPLETE,
-        },
-      }),
-      this.scopedPrisma.compOff.count({
+      Promise.resolve(0), // worked out below from this month's rows, leaving out days already sent for regularization
+      gate(off, 'module.leave', async () => this.scopedPrisma.compOff.count({
         where: {
           organizationId,
           employeeId: actor.id,
           status: CompOffStatus.PENDING,
         },
-      }),
-      this.scopedPrisma.reimbursement.findMany({
+      }), 0),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.findMany({
         where: { organizationId, employeeId: actor.id },
         orderBy: { claimDate: 'desc' },
         take: 5,
-      }),
-      this.scopedPrisma.reimbursement.aggregate({
+      }), []),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.reimbursement.aggregate({
         where: {
           organizationId,
           employeeId: actor.id,
@@ -1182,24 +1428,30 @@ export class DashboardService {
         },
         _sum: { amount: true },
         _count: true,
-      }),
-      this.scopedPrisma.loan.findFirst({
+      }), { _sum: { amount: 0 }, _count: 0 } as never),
+      gate(off, 'module.loans_reimbursements', async () => this.scopedPrisma.loan.findFirst({
         where: {
           organizationId,
           employeeId: actor.id,
           status: LoanStatus.ACTIVE,
         },
         orderBy: { createdAt: 'desc' },
-      }),
-      this.scopedPrisma.employeeTaxDeclaration.findFirst({
+      }), null),
+      gate(off, 'module.statutory', async () => this.scopedPrisma.employeeTaxDeclaration.findFirst({
         where: {
           organizationId,
           employeeId: actor.id,
           financialYear: currentFinancialYear,
         },
-      }),
+      }), null),
     ]);
 
+    // Incomplete days still needing a request: the ones with a regularization already waiting are not asked for again.
+    const incompleteNeedingRequest = attendanceThisMonth.filter(
+      (r) =>
+        r.status === AttendanceStatus.INCOMPLETE &&
+        (r.regularization as { status?: string } | null)?.status !== 'pending',
+    ).length;
     const summary: Record<string, number> = {
       PRESENT: 0,
       HALF_DAY: 0,
@@ -1209,20 +1461,60 @@ export class DashboardService {
       WEEKLY_OFF: 0,
       INCOMPLETE: 0,
     };
+    // The calendar's holidays and weekly offs up to today are listed whether or not a row has been written for them yet
+    // (the nightly job writes them after the day), except where the person actually worked or took leave that day.
+    const calendar = await gate(
+      off,
+      'module.attendance',
+      async () =>
+        this.workingDaysThisMonth(actor.id, organizationId, monthPrefix, today),
+      { total: 0, elapsed: 0, holidayDays: [], weeklyOffDays: [] },
+    );
+    const offKind = new Map<string, AttendanceStatus>([
+      ...calendar.weeklyOffDays.map((d) => [d, AttendanceStatus.WEEKLY_OFF] as const),
+      ...calendar.holidayDays.map((d) => [d, AttendanceStatus.HOLIDAY] as const),
+    ]);
     for (const row of attendanceThisMonth) {
+      const calendarOff = offKind.get(row.date);
+      if (
+        calendarOff &&
+        (row.status === AttendanceStatus.ABSENT ||
+          row.status === AttendanceStatus.WEEKLY_OFF ||
+          row.status === AttendanceStatus.HOLIDAY)
+      ) {
+        // Counted below, once, as the calendar's own kind of off day.
+        offKind.set(row.date, calendarOff);
+        continue;
+      }
+      if (calendarOff) offKind.delete(row.date); // worked / on leave that day: it is that, not an off day
+      // "This month so far": a row dated after today is something planned - an approved Work From Home day (kept as an
+      // empty ABSENT row until it happens), approved leave still to come - not attendance yet. It is counted on the day
+      // it arrives, not before, so it neither reads as Absent nor as On Leave ahead of time.
+      if (row.date > today) continue;
       summary[row.status] = (summary[row.status] ?? 0) + 1;
+    }
+    for (const kind of offKind.values()) summary[kind] = (summary[kind] ?? 0) + 1;
+
+    // Work From Home this month. It is where the day was worked, not a status of its own (a day worked from home is
+    // still Present above), so it is counted separately: approved days so far, approved days still to come, and
+    // requests waiting for a decision.
+    const wfhThisMonth = { approved: 0, upcoming: 0, pending: 0 };
+    for (const row of attendanceThisMonth) {
+      if (row.workArrangement !== WorkArrangement.WFH) continue;
+      if (row.workArrangementStatus === WfhApprovalStatus.PENDING) {
+        wfhThisMonth.pending += 1;
+      } else if (row.workArrangementStatus === WfhApprovalStatus.APPROVED) {
+        if (row.date > today) wfhThisMonth.upcoming += 1;
+        else wfhThisMonth.approved += 1;
+      }
     }
 
     return {
       attendanceSummary: summary,
+      wfhThisMonth,
       // Working days in this month for the employee's own schedule (weekly offs + holidays excluded), and how many
       // of them have passed — the "x / working days" figure on the attendance card.
-      attendanceWorkingDays: await this.workingDaysThisMonth(
-        actor.id,
-        organizationId,
-        monthPrefix,
-        today,
-      ),
+      attendanceWorkingDays: { total: calendar.total, elapsed: calendar.elapsed },
       leaveBalances,
       compOffAvailable,
       payrollSnapshot: latestPayroll,
@@ -1240,7 +1532,7 @@ export class DashboardService {
       // Days this month marked Incomplete (punch-out missing) that the
       // employee hasn't yet requested regularization for — drives the
       // "N day(s) need your attention" dashboard nudge.
-      incompleteAttendanceCount,
+      incompleteAttendanceCount: incompleteNeedingRequest,
       reimbursements: {
         recent: recentReimbursements,
         pendingCount: reimbursementPending._count,
@@ -1259,10 +1551,9 @@ export class DashboardService {
   // from the operational HR dashboard (today/this-month focused vs.
   // trend/company-health focused).
   //
-  // Headcount "leavers" are sourced from OffboardingCase.completedAt
-  // instead of an EMPLOYEE_DEACTIVATED audit-log action (the original release's
-  // source) — OffboardingCase is actually a more precise signal anyway (a
-  // dedicated event, not an inferred one). This deliberately does NOT
+  // Headcount "leavers" are sourced from completed OffboardingCases instead of an EMPLOYEE_DEACTIVATED audit-log action
+  // (the original release's source) — a dedicated event, not an inferred one. A leaver is counted in the month of
+  // their LAST WORKING DAY, not the day the exit was marked complete in the portal (which can be weeks later). This deliberately does NOT
   // attempt to reconstruct exact historical total headcount for each past
   // month — it reports joiners, leavers, and net change per month, which
   // is honest given what's actually recorded, plus the current live
@@ -1277,18 +1568,24 @@ export class DashboardService {
   // employee with no personalData at all).
   async computeHeadcountTrend(months: number, organizationId: string) {
     // "Now" is the organisation's calendar day, not the server clock. Joining dates are calendar dates stored at UTC
-    // midnight, so they are bucketed by their UTC fields; a completed offboarding is an instant, so it is bucketed by
-    // its date in the organisation's time zone.
-    const timezone = await this.getOrgTimezone(organizationId);
+    // midnight, so they are bucketed by their UTC fields; a last working day is a plain YYYY-MM-DD calendar date.
     const today = await this.orgNow(organizationId);
     const windowStart = new Date(
       Date.UTC(today.getFullYear(), today.getMonth() - (months - 1), 1),
     );
     const windowStartDateStr = windowStart.toISOString().slice(0, 10);
-    const windowStartInstant = startOfDayInOrgTzUtc(
-      windowStartDateStr,
-      timezone,
-    );
+
+    // Someone whose account was switched off without a completed exit (an onboarding cancelled, a duplicate, a test
+    // account) never worked here as far as headcount goes: counting them as a joiner with no matching leaver left the
+    // figures unable to add up (15 joiners, 0 leavers, but 6 active). Only people who are active, or who left through
+    // a completed exit, count on either side.
+    const exited = await this.scopedPrisma.offboardingCase.findMany({
+      where: { organizationId, status: OffboardingStatus.COMPLETED },
+      select: { employeeId: true },
+    });
+    const countedPeople = {
+      OR: [{ isActive: true }, { id: { in: exited.map((e) => e.employeeId) } }],
+    };
 
     const [
       joiners,
@@ -1298,28 +1595,28 @@ export class DashboardService {
       leftBeforeWindow,
     ] = await Promise.all([
       this.scopedPrisma.user.findMany({
-        where: { organizationId, joiningDate: { gte: windowStart } },
+        where: { organizationId, joiningDate: { gte: windowStart }, ...countedPeople },
         select: { joiningDate: true },
       }),
       this.scopedPrisma.offboardingCase.findMany({
         where: {
           organizationId,
           status: OffboardingStatus.COMPLETED,
-          completedAt: { gte: windowStartInstant },
+          lastWorkingDay: { gte: windowStartDateStr },
         },
-        select: { completedAt: true },
+        select: { lastWorkingDay: true },
       }),
       this.scopedPrisma.user.count({
         where: { organizationId, isActive: true },
       }),
       this.scopedPrisma.user.count({
-        where: { organizationId, joiningDate: { lt: windowStart } },
+        where: { organizationId, joiningDate: { lt: windowStart }, ...countedPeople },
       }),
       this.scopedPrisma.offboardingCase.count({
         where: {
           organizationId,
           status: OffboardingStatus.COMPLETED,
-          completedAt: { lt: windowStartInstant },
+          lastWorkingDay: { lt: windowStartDateStr },
         },
       }),
     ]);
@@ -1329,15 +1626,7 @@ export class DashboardService {
       const key = `${j.joiningDate.getUTCFullYear()}-${j.joiningDate.getUTCMonth() + 1}`;
       joinersByKey.set(key, (joinersByKey.get(key) ?? 0) + 1);
     }
-    const leaversByKey = new Map<string, number>();
-    for (const l of leavers) {
-      if (!l.completedAt) continue;
-      const [cy, cm] = dateStrInOrgTz(timezone, l.completedAt)
-        .split('-')
-        .map(Number);
-      const key = `${cy}-${cm}`;
-      leaversByKey.set(key, (leaversByKey.get(key) ?? 0) + 1);
-    }
+    const leaversByKey = leaversByMonth(leavers.map((l) => l.lastWorkingDay));
 
     const rows: {
       year: number;
@@ -1399,7 +1688,9 @@ export class DashboardService {
   async executiveDashboard(organizationId: string) {
     const WINDOW_DAYS = 30;
     const today = await this.orgNow(organizationId);
+    const todayStr = todayInOrgTz(await this.getOrgTimezone(organizationId));
 
+    // Joined on or before today, whatever the time on the stored joining date (see employedOnWhere).
     // Birthdays only need the date of birth, which is stored as plain text inside personalData. Reading the whole
     // personalData would decrypt every employee's PAN / Aadhaar / bank fields just to throw them away, so the one key is
     // read in SQL (organizationId is a bound parameter).
@@ -1417,6 +1708,8 @@ export class DashboardService {
                "personalData"->>'dateOfBirth' AS "dateOfBirth"
           FROM "users"
          WHERE "organizationId" = ${organizationId} AND "isActive" = true
+           AND "joiningDate" <= ${new Date(`${todayStr}T23:59:59.999Z`)}
+           AND ("exitDate" IS NULL OR "exitDate" >= ${todayStr})
          ORDER BY "employeeId" ASC`,
     ]);
 
@@ -1425,6 +1718,8 @@ export class DashboardService {
       name: string;
       employeeId: string;
       daysAway: number;
+      // YYYY-MM-DD of the coming anniversary.
+      date: string;
       years: number;
     }[] = [];
     const upcomingBirthdays: {
@@ -1432,7 +1727,15 @@ export class DashboardService {
       name: string;
       employeeId: string;
       daysAway: number;
+      // YYYY-MM-DD of the coming birthday.
+      date: string;
     }[] = [];
+    // The calendar day `days` after today, as YYYY-MM-DD.
+    const dateAfter = (days: number): string => {
+      const d = new Date(today);
+      d.setDate(today.getDate() + days);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
     for (const e of activeEmployees) {
       const jd = e.joiningDate;
       const days = daysUntilNextOccurrence(
@@ -1450,6 +1753,7 @@ export class DashboardService {
             name: e.name,
             employeeId: e.employeeId,
             daysAway: days,
+            date: dateAfter(days),
             years,
           });
         }
@@ -1470,6 +1774,7 @@ export class DashboardService {
             name: e.name,
             employeeId: e.employeeId,
             daysAway: birthdayDays,
+            date: dateAfter(birthdayDays),
           });
         }
       }

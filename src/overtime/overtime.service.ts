@@ -5,6 +5,13 @@
 // Important: rateMultiplier is fixed per type at creation and not recalculated later, so a later change to
 // RATE_MULTIPLIERS only affects new records, not historical ones.
 import {
+  AUTO_APPROVAL_NOTE,
+  findAutoApprover,
+  loadAutoApproval,
+  overtimeQualifies,
+} from '../common/auto-approval';
+import { holidayInEffect } from '../holidays/holiday-in-effect';
+import {
   assertPayrollMonthsUnlocked,
   markPayrollInputsChanged,
 } from '../payroll/payroll-period-guard';
@@ -36,7 +43,21 @@ import {
   resolveWorkCompensation,
   selectableWorkCompensation,
 } from './work-compensation';
+import {
+  daysSince,
+  getOvertimePolicy,
+  overtimeCapProblem,
+  inNightWindow,
+  quarterRange,
+  roundOvertimeHours,
+  thresholdsFor,
+  type OvertimeCompensationMode,
+  type OvertimePolicy,
+} from './overtime-policy';
 import { overtimeDayProblem, type DayKind } from './overtime-day-rules';
+import { shiftDepartmentFor } from '../attendance/shift-rules';
+import { startOfDayInOrgTzUtc } from '../common/org-date';
+import { addDaysStr } from '../leaves/leave-rules';
 import {
   isWeeklyOff,
   resolveShiftConfig,
@@ -47,6 +68,7 @@ import { paginate, skip } from '../common/pagination';
 import {
   assertManagerScopeOrDelegate,
   deptScopedEmployeeIds,
+  isScopedReviewer,
 } from '../common/dept-scope';
 import { NotificationsService } from '../notifications/notifications.service';
 import { EmailService } from '../notifications/email.service';
@@ -54,6 +76,7 @@ import { EmailTemplatesService } from '../email-templates/email-templates.servic
 import { ApprovalDelegationService } from '../approval-delegation/approval-delegation.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
+import { applyRuleSetPolicy, applyRuleSetRates, pickRuleSet, type RuleSetPerson } from './overtime-rule-sets';
 import {
   formatDateDisplay,
   resolveOrgDateTimeFormat,
@@ -103,6 +126,28 @@ export async function getOvertimeRates(
   };
 }
 
+// The overtime policy and pay multipliers that apply to one person on one date: the company's, with the person's rule set
+// (Organization Settings > Overtime rule sets) laid over them. Exported so the punch-out auto-suggestion in
+// AttendanceService uses exactly the same rules.
+export async function getEffectiveOvertime(
+  db: Pick<Prisma.TransactionClient, 'organization' | 'payrollSettings' | 'overtimeRuleSet'>,
+  organizationId: string,
+  person: RuleSetPerson,
+  date: string,
+) {
+  const [companyPolicy, companyRates, sets] = await Promise.all([
+    getOvertimePolicy(db, organizationId),
+    getOvertimeRates(db, organizationId),
+    db.overtimeRuleSet.findMany({ where: { organizationId, isActive: true } }),
+  ]);
+  const set = pickRuleSet(sets, person, date);
+  return {
+    ruleSet: set ? { id: set.id, name: set.name } : null,
+    policy: applyRuleSetPolicy(companyPolicy, set),
+    rates: applyRuleSetRates(companyRates, set, MIN_OVERTIME_MULTIPLIER),
+  };
+}
+
 function monthRange(month: number, year: number): { from: string; to: string } {
   const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -129,7 +174,92 @@ export class OvertimeService {
     if (!(await isOvertimePayEnabled(this.scopedPrisma, organizationId))) {
       throw new BadRequestException(OVERTIME_PAY_OFF_MESSAGE);
     }
-    const type = dto.type ?? OvertimeType.REGULAR;
+    let type = dto.type ?? OvertimeType.REGULAR;
+
+    // The Admin's overtime policy (Org Settings > General Settings > Overtime): who may log, how late, how much.
+    const { policy, rates } = await getEffectiveOvertime(
+      this.scopedPrisma,
+      organizationId,
+      actor,
+      dto.date,
+    );
+    // Ordinary overtime that ends inside the company's night window is night overtime, however it was entered.
+    if (type === OvertimeType.REGULAR && policy.nightStart && policy.nightEnd) {
+      const day = await this.scopedPrisma.attendance.findFirst({
+        where: { organizationId, employeeId: actor.id, date: dto.date },
+        select: { outTime: true },
+      });
+      if (day?.outTime) {
+        const { timeZone: zone } = await resolveOrgDateTimeFormat(
+          this.scopedPrisma,
+          organizationId,
+        );
+        const leftAt = new Intl.DateTimeFormat('en-GB', {
+          timeZone: zone,
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+        }).format(day.outTime);
+        if (inNightWindow(policy, leftAt)) type = OvertimeType.NIGHT;
+      }
+    }
+    if (!policy.eligible) {
+      throw new BadRequestException(
+        'Overtime does not apply to your role. Please speak to HR if you think this is wrong.',
+      );
+    }
+    if (policy.creationMode === 'AUTO') {
+      throw new BadRequestException(
+        'Overtime is recorded automatically from your punches, so it cannot be logged by hand.',
+      );
+    }
+    if (policy.claimWithinDays !== null) {
+      const { timeZone } = await resolveOrgDateTimeFormat(
+        this.scopedPrisma,
+        organizationId,
+      );
+      const today = new Intl.DateTimeFormat('en-CA', { timeZone }).format(
+        new Date(),
+      );
+      if (daysSince(dto.date, today) > policy.claimWithinDays) {
+        throw new BadRequestException(
+          `Overtime can be requested within ${policy.claimWithinDays} day(s) of the date. Please speak to HR.`,
+        );
+      }
+    }
+    const hours = roundOvertimeHours(dto.hours, policy);
+    const threshold = thresholdsFor(policy, type);
+    if (hours * 60 < threshold.minMinutes) {
+      throw new BadRequestException(
+        `Overtime under ${threshold.minMinutes} minute(s) is not counted.`,
+      );
+    }
+    // Not enough of the day worked: the Admin's "minimum hours worked to qualify" (company or rule set).
+    if (threshold.minWorkedHours !== null) {
+      const day = await this.scopedPrisma.attendance.findFirst({
+        where: { organizationId, employeeId: actor.id, date: dto.date },
+        select: { workDurationMinutes: true },
+      });
+      const workedHours = (day?.workDurationMinutes ?? 0) / 60;
+      if (workedHours + 1e-9 < threshold.minWorkedHours) {
+        throw new BadRequestException(
+          `Overtime counts only on days with at least ${threshold.minWorkedHours} hour(s) worked (${Math.round(workedHours * 100) / 100} on that day).`,
+        );
+      }
+    }
+    const { usedThisMonth, usedThisQuarter } = await this.usageFor(
+      actor.id,
+      dto.date,
+      organizationId,
+    );
+    const capProblem = overtimeCapProblem(
+      policy,
+      hours,
+      0,
+      usedThisMonth,
+      usedThisQuarter,
+    );
+    if (capProblem.block) throw new BadRequestException(capProblem.block);
 
     // REGULAR/NIGHT overtime means "extra hours on top of a normal working
     // day" — logging it for a day the employee was ABSENT, ON_LEAVE, or
@@ -157,7 +287,13 @@ export class OvertimeService {
       }
     }
 
-    await this.assertDayAllowsOvertime(dto, type, actor, organizationId);
+    await this.assertDayAllowsOvertime(
+      dto,
+      type,
+      actor,
+      organizationId,
+      policy.startAfterMinutes,
+    );
 
     // One day, one benefit: weekend/holiday work already claimed as comp-off is not also logged as overtime.
     if (type === OvertimeType.WEEKEND || type === OvertimeType.HOLIDAY) {
@@ -195,11 +331,9 @@ export class OvertimeService {
         organizationId,
         employeeId: actor.id,
         date: dto.date,
-        hours: dto.hours,
+        hours,
         type,
-        rateMultiplier: (
-          await getOvertimeRates(this.scopedPrisma, organizationId)
-        )[type],
+        rateMultiplier: rates[type],
       },
     });
 
@@ -209,7 +343,7 @@ export class OvertimeService {
       module: 'ATTENDANCE',
       organizationId,
       targetId: record.id,
-      details: { employeeId: actor.id, date: dto.date, hours: dto.hours, type },
+      details: { employeeId: actor.id, date: dto.date, hours, type },
     });
     const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(
       this.scopedPrisma,
@@ -220,18 +354,128 @@ export class OvertimeService {
       employeeId: actor.id,
       eventKey: 'OVERTIME_LOGGED',
       performedById: actor.id,
-      description: `Logged ${dto.hours} hour(s) of ${type.toLowerCase()} overtime on ${formatDateDisplay(dto.date, '', dateFormat, timeZone)}.`,
+      description: `Logged ${hours} hour(s) of ${type.toLowerCase()} overtime on ${formatDateDisplay(dto.date, '', dateFormat, timeZone)}.`,
     });
+    // Companies that turned on automatic approval: regular/night overtime within the monthly cap is approved right away
+    // through the normal review path (weekend/holiday work needs a compensation choice, so it always waits for a person).
+    const autoApproved = await this.tryAutoApprove(record.id, type, hours, usedThisMonth, actor, organizationId, policy);
+    if (autoApproved) return autoApproved;
+    await this.warnNearingCaps(policy, hours, usedThisMonth, usedThisQuarter, actor, organizationId);
     await this.notificationsService.notifyReviewers({
       organizationId,
       requester: actor,
       title: 'Overtime Requested',
-      message: `${actor.name} logged ${dto.hours} hour(s) of overtime for ${formatDateDisplay(dto.date, '', dateFormat, timeZone)}, pending your approval.`,
+      message: `${actor.name} logged ${hours} hour(s) of overtime for ${formatDateDisplay(dto.date, '', dateFormat, timeZone)}, pending your approval.`,
       category: NotificationCategory.ATTENDANCE,
-      managerFirst: true,
+      managerFirst: policy.approvalLevel === 'MANAGER',
     });
 
-    return record;
+    // WARN mode: saved, but the person is told the cap was passed.
+    return capProblem.warn ? { ...record, warning: capProblem.warn } : record;
+  }
+
+  // Returns the approved record, or null when the request does not qualify (or anything goes wrong: it then stays pending).
+  private async tryAutoApprove(
+    id: string,
+    type: OvertimeType,
+    hours: number,
+    usedThisMonth: number,
+    requester: Actor,
+    organizationId: string,
+    policy: OvertimePolicy,
+  ) {
+    try {
+      if (type !== OvertimeType.REGULAR && type !== OvertimeType.NIGHT) return null;
+      // A rule set can switch automatic approval off for its people, or on with its own monthly limit; otherwise the
+      // company's rule decides.
+      if (policy.autoApprove === 'OFF') return null;
+      const company = await loadAutoApproval(this.scopedPrisma, organizationId);
+      const overtimeRule =
+        policy.autoApprove === 'ON'
+          ? { on: true, monthlyCapHours: policy.autoApproveMonthlyCapHours ?? company.overtime.monthlyCapHours }
+          : company.overtime;
+      if (!overtimeQualifies(overtimeRule, hours, usedThisMonth)) return null;
+      const approver = await findAutoApprover(this.scopedPrisma, organizationId, requester.id);
+      if (!approver) return null;
+      return await this.review(id, { status: OvertimeStatus.APPROVED, comments: AUTO_APPROVAL_NOTE } as never, approver as never, organizationId);
+    } catch {
+      return null;
+    }
+  }
+
+  // Overtime already logged (pending or approved) in the month of `date`, and on that day.
+  async usageFor(employeeId: string, date: string, organizationId: string) {
+    const [y, m] = date.split('-').map(Number);
+    const { from, to } = monthRange(m, y);
+    const quarter = quarterRange(date);
+    const quarterRows = await this.scopedPrisma.overtimeRecord.findMany({
+      where: {
+        organizationId,
+        employeeId,
+        date: { gte: quarter.from, lte: quarter.to },
+        status: { not: OvertimeStatus.REJECTED },
+      },
+      select: { hours: true },
+    });
+    const rows = await this.scopedPrisma.overtimeRecord.findMany({
+      where: {
+        organizationId,
+        employeeId,
+        date: { gte: from, lte: to },
+        status: { not: OvertimeStatus.REJECTED },
+      },
+      select: { date: true, hours: true },
+    });
+    return {
+      usedThisQuarter: quarterRows.reduce((a, r) => a + r.hours, 0),
+      usedThisMonth: rows.reduce((a, r) => a + r.hours, 0),
+      usedToday: rows
+        .filter((r) => r.date === date)
+        .reduce((a, r) => a + r.hours, 0),
+    };
+  }
+
+  // The policy plus the caller's own usage this month, so the log form can show "x of y hours used" and hide itself
+  // for someone who is not eligible.
+  async myPolicy(actor: Actor, organizationId: string) {
+    const { timeZone } = await resolveOrgDateTimeFormat(
+      this.scopedPrisma,
+      organizationId,
+    );
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone }).format(
+      new Date(),
+    );
+    const { policy, ruleSet } = await getEffectiveOvertime(
+      this.scopedPrisma,
+      organizationId,
+      actor,
+      today,
+    );
+    const { usedThisMonth, usedThisQuarter } = await this.usageFor(
+      actor.id,
+      today,
+      organizationId,
+    );
+    return {
+      ruleSetName: ruleSet?.name ?? null,
+      eligible: policy.eligible,
+      startAfterMinutes: policy.startAfterMinutes,
+      maxHoursPerQuarter: policy.maxHoursPerQuarter,
+      usedThisQuarter: Math.round(usedThisQuarter * 100) / 100,
+      compensationMode: policy.compensationMode,
+      nightStart: policy.nightStart,
+      nightEnd: policy.nightEnd,
+      dayRules: policy.dayRules,
+      creationMode: policy.creationMode,
+      minMinutes: policy.minMinutes,
+      minWorkedHours: policy.minWorkedHours,
+      roundingMinutes: policy.roundingMinutes,
+      maxHoursPerDay: policy.maxHoursPerDay,
+      maxHoursPerMonth: policy.maxHoursPerMonth,
+      capMode: policy.capMode,
+      claimWithinDays: policy.claimWithinDays,
+      usedThisMonth: Math.round(usedThisMonth * 100) / 100,
+    };
   }
 
   // The type picks the pay rate, so it has to match the calendar (weekly off -> weekend, holiday -> holiday, else
@@ -241,6 +485,7 @@ export class OvertimeService {
     type: OvertimeType,
     actor: Actor,
     organizationId: string,
+    startAfterMinutes = 0,
   ) {
     const [org, employee, attendance] = await Promise.all([
       this.scopedPrisma.organization.findFirst({
@@ -257,14 +502,22 @@ export class OvertimeService {
     ]);
     const timeZone = org?.timezone || 'Asia/Kolkata';
     const shiftConfig = resolveShiftConfig(
-      employee?.department ?? null,
+      employee
+        ? (shiftDepartmentFor(
+            employee.department,
+            employee,
+            await this.scopedPrisma.shiftRule.findMany({
+              where: { organizationId, isActive: true },
+            }),
+          ) ?? null)
+        : null,
       org?.attendancePayrollPrefs as never,
       timeZone,
     );
     const holiday = await this.scopedPrisma.holiday.findFirst({
       where: {
         organizationId,
-        isActive: true,
+        AND: [holidayInEffect],
         date: dto.date,
         OR: employee?.departmentId
           ? [{ departmentId: null }, { departmentId: employee.departmentId }]
@@ -283,6 +536,21 @@ export class OvertimeService {
       month: '2-digit',
       day: '2-digit',
     }).format(new Date());
+    // For a delayed start: how long after the shift end the last punch-out was.
+    let minutesPastShiftEnd: number | null = null;
+    if (startAfterMinutes > 0 && attendance?.outTime) {
+      const shiftDay = shiftConfig.crossesMidnight
+        ? addDaysStr(dto.date, 1)
+        : dto.date;
+      const [eh, em] = shiftConfig.shiftEndTime.split(':').map(Number);
+      const shiftEnd = new Date(
+        startOfDayInOrgTzUtc(shiftDay, timeZone).getTime() +
+          ((eh || 0) * 60 + (em || 0)) * 60000,
+      );
+      minutesPastShiftEnd = Math.round(
+        (attendance.outTime.getTime() - shiftEnd.getTime()) / 60000,
+      );
+    }
     const problem = overtimeDayProblem({
       type,
       date: dto.date,
@@ -291,26 +559,106 @@ export class OvertimeService {
       workedMinutes: attendance?.workDurationMinutes ?? 0,
       hours: dto.hours,
       breakMinutes: shiftConfig.breakMinutes ?? 0,
+      startAfterMinutes,
+      minutesPastShiftEnd,
     });
     if (problem) throw new BadRequestException(problem);
   }
 
   // The compensation options for weekend/holiday work and which one is the default.
-  async compensationOptions(organizationId: string) {
+  async compensationOptions(
+    organizationId: string,
+    mode: OvertimeCompensationMode = 'ANY',
+  ) {
     const settings = await this.scopedPrisma.payrollSettings.findFirst({
       where: { organizationId },
       select: { workCompensation: true },
     });
     // Only the options that grant something: 0 / 0 placeholders are not offered, and not accepted on approval.
-    return selectableWorkCompensation(
+    const all = selectableWorkCompensation(
       resolveWorkCompensation(settings?.workCompensation),
     );
+    // A rule set can allow pay only (no comp-off) or comp-off only.
+    if (mode === 'ANY') return all;
+    const options = all.options.filter((o) =>
+      mode === 'COMP_OFF' ? o.compOffDays > 0 : o.compOffDays === 0,
+    );
+    return {
+      options,
+      defaultKey: options.some((o) => o.key === all.defaultKey)
+        ? all.defaultKey
+        : null,
+    };
+  }
+
+  // The options an approver may pick for one person's overtime (their rule set's compensation mode applied).
+  async compensationOptionsFor(
+    organizationId: string,
+    employeeId?: string,
+    date?: string,
+  ) {
+    if (!employeeId) return this.compensationOptions(organizationId);
+    const person = await this.scopedPrisma.user.findFirst({
+      where: { id: employeeId, organizationId },
+      select: { id: true, departmentId: true, employeeType: true, designation: true },
+    });
+    const { policy } = await getEffectiveOvertime(
+      this.scopedPrisma,
+      organizationId,
+      person ?? { id: employeeId },
+      date ?? new Date().toISOString().slice(0, 10),
+    );
+    return {
+      ...(await this.compensationOptions(organizationId, policy.compensationMode)),
+      mode: policy.compensationMode,
+    };
+  }
+
+  // Tells the person (and their reporting manager) when a request takes them past 80% of a monthly or quarterly limit.
+  private async warnNearingCaps(
+    policy: OvertimePolicy,
+    hours: number,
+    usedThisMonth: number,
+    usedThisQuarter: number,
+    person: Actor,
+    organizationId: string,
+  ) {
+    const checks: [string, number | null, number][] = [
+      ['month', policy.maxHoursPerMonth, usedThisMonth],
+      ['quarter', policy.maxHoursPerQuarter, usedThisQuarter],
+    ];
+    for (const [label, limit, used] of checks) {
+      if (limit === null) continue;
+      // Only when this request is the one that crosses 80%, so it is said once.
+      if (used >= limit * 0.8 || used + hours < limit * 0.8) continue;
+      const message = `${person.name} has used ${Math.round((used + hours) * 100) / 100} of ${limit} overtime hours allowed this ${label}.`;
+      const targets = [person.id, (person as { reportingManagerId?: string | null }).reportingManagerId].filter(Boolean) as string[];
+      for (const userId of targets) {
+        try {
+          const forManager = userId !== person.id;
+          await this.notificationsService.create({
+            organizationId,
+            userId,
+            // Directional: the manager's notice names the person and opens the approvals page.
+            title: forManager
+              ? `Overtime limit nearly reached for ${person.name}`
+              : 'Overtime limit nearly reached',
+            message,
+            category: NotificationCategory.ATTENDANCE,
+          });
+        } catch {
+          /* a failed notice must not fail the request */
+        }
+      }
+    }
   }
 
   // Current multipliers for each overtime type, so the log form can show
   // them (e.g. "Holiday (2x)") instead of hardcoding them client-side.
-  getRates(organizationId: string) {
-    return getOvertimeRates(this.scopedPrisma, organizationId);
+  async getRates(organizationId: string, person?: Actor) {
+    if (!person) return getOvertimeRates(this.scopedPrisma, organizationId);
+    const today = new Date().toISOString().slice(0, 10);
+    return (await getEffectiveOvertime(this.scopedPrisma, organizationId, person, today)).rates;
   }
 
   // Whether overtime is currently paid (the Overtime Pay salary component is active). The web and mobile apps use it
@@ -326,7 +674,7 @@ export class OvertimeService {
 
     if (actor.role === Role.EMPLOYEE) {
       where.employeeId = actor.id;
-    } else if (actor.role === Role.MANAGER) {
+    } else if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       const deptIds = await deptScopedEmployeeIds(
         this.scopedPrisma,
         actor,
@@ -385,6 +733,22 @@ export class OvertimeService {
       where: { id, organizationId },
     });
     if (!record) throw new NotFoundException('Overtime record not found.');
+    // The person's rule set decides who may review (HR only) and how off-day work may be compensated.
+    const owner = await this.scopedPrisma.user.findFirst({
+      where: { id: record.employeeId, organizationId },
+      select: { id: true, departmentId: true, employeeType: true, designation: true },
+    });
+    const { policy: ownerPolicy } = await getEffectiveOvertime(
+      this.scopedPrisma,
+      organizationId,
+      owner ?? { id: record.employeeId },
+      record.date,
+    );
+    if (ownerPolicy.approvalLevel === 'HR' && actor.role === Role.MANAGER) {
+      throw new ForbiddenException(
+        'Overtime for this employee is approved by HR or an Admin.',
+      );
+    }
     await assertManagerScopeOrDelegate(
       this.scopedPrisma,
       this.delegationService,
@@ -438,10 +802,23 @@ export class OvertimeService {
     const option =
       dto.status === OvertimeStatus.APPROVED && isOffDayWork
         ? pickWorkCompensation(
-            await this.compensationOptions(organizationId),
+            await this.compensationOptions(
+              organizationId,
+              ownerPolicy.compensationMode,
+            ),
             dto.compensationKey,
           )
         : null;
+    if (
+      dto.status === OvertimeStatus.APPROVED &&
+      isOffDayWork &&
+      ownerPolicy.compensationMode === 'COMP_OFF' &&
+      !option
+    ) {
+      throw new BadRequestException(
+        'This employee gets comp-off for weekend and holiday work. Choose a comp-off option.',
+      );
+    }
 
     // One day, one benefit: a comp-off already claimed for the same day (or granted by an approved record) stops a
     // second reward for the same work.

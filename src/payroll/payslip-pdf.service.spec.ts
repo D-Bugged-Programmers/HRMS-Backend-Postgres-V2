@@ -117,6 +117,7 @@ function build(
         dateFormat: 'DD-MM-YYYY',
       }),
     } as never,
+    { forBrand: async () => ({ brandId: null }) } as never,
   );
   return { service, created };
 }
@@ -126,6 +127,10 @@ async function pages(buffer: Buffer) {
   return (buffer.toString('latin1').match(/\/Type \/Page(?![s\w])/g) ?? [])
     .length;
 }
+
+// Rendering real PDFs with embedded fonts takes a few seconds when the whole unit suite runs in parallel; the default
+// 5 s limit then fails these at random.
+jest.setTimeout(30_000);
 
 describe('payslip PDF: output', () => {
   it('produces a real, loadable single-page PDF for an ordinary run, named after the employee and month', async () => {
@@ -301,5 +306,32 @@ describe('payslip PDF: the template an organisation starts with', () => {
     );
     expect(buffer.subarray(0, 5).toString()).toBe('%PDF-');
     expect(await pages(buffer)).toBe(1);
+  });
+});
+
+describe('payslip PDF: company brand', () => {
+  const brand = { brandId: 'b1', companyName: 'Sister A', address: 'A Street', contactEmail: null, website: null, phone: null, logoUrl: 'org/a.png' };
+
+  async function headerUsed(runRow: Record<string, any> | null, lookup: Record<string, any>) {
+    const { service } = build(runRow);
+    (service as any).brandingLookup = lookup;
+    const spy = jest.spyOn(service as any, 'renderPayslipPdf');
+    await service.buildPayslipPdfBuffer('r1', 'org');
+    return spy.mock.calls[0][1] as Record<string, any>;
+  }
+
+  it('shows the brand name, logo and address when the run carries a brand', async () => {
+    const t = await headerUsed(run({ brandId: 'b1' }), { forBrand: async () => brand });
+    expect(t).toMatchObject({ companyName: 'Sister A', companyAddress: 'A Street', companyLogoUrl: 'org/a.png' });
+  });
+
+  it('keeps the template exactly as it is for a run with no brand', async () => {
+    const t = await headerUsed(run({ brandId: null }), { forBrand: async () => { throw new Error('must not be asked'); } });
+    expect(t.companyName).not.toBe('Sister A');
+  });
+
+  it('keeps the template when the brand no longer resolves', async () => {
+    const t = await headerUsed(run({ brandId: 'gone' }), { forBrand: async () => ({ ...brand, brandId: null }) });
+    expect(t.companyName).not.toBe('Sister A');
   });
 });

@@ -1,8 +1,10 @@
 // Purpose: Unit tests for the pure rules behind the scheduled reminder jobs.
 import {
+  isResignationReminderDue,
   dateOf,
   daysBetween,
   isEscalationDue,
+  isProbationEndOrOverdueReminderDay,
   isTaxDeclarationReminderDay,
   leaveExpiryDaysLeft,
   monthLabel,
@@ -130,5 +132,23 @@ describe('taxDeclarationWindow', () => {
   it('respects a non-April financial-year start', () => {
     expect(taxDeclarationWindow('2026-02-10', 1).opens).toBe('2026-01-01');
     expect(taxDeclarationWindow('2026-02-10', 1).deadline).toBe('2026-10-31');
+  });
+});
+
+describe('isProbationEndOrOverdueReminderDay', () => {
+  it('fires on the end date, then the day after and every 7 days from there', () => {
+    expect(isProbationEndOrOverdueReminderDay(0)).toBe(true);
+    expect(isProbationEndOrOverdueReminderDay(-1)).toBe(true);
+    expect(isProbationEndOrOverdueReminderDay(-8)).toBe(true);
+    expect(isProbationEndOrOverdueReminderDay(-15)).toBe(true);
+  });
+  it('stays quiet on the other days', () => {
+    for (const d of [15, 7, 1, -2, -7, -9]) expect(isProbationEndOrOverdueReminderDay(d)).toBe(false);
+  });
+});
+
+describe('isResignationReminderDue', () => {
+  it('from day 2, then every 2 days', () => {
+    expect([0, 1, 2, 3, 4, 5, 6, 8].map(isResignationReminderDue)).toEqual([false, false, true, false, true, false, true, true]);
   });
 });

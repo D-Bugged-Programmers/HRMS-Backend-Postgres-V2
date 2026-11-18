@@ -1,5 +1,7 @@
 import {
   AttendanceStatus,
+  EmploymentStatus,
+  FieldVisitStatus,
   LeaveStatus,
   PayrollRunStatus,
   Prisma,
@@ -8,11 +10,13 @@ import {
   EMPLOYEE_ORDER_BY,
   EMPLOYEE_RELATION_ORDER_BY,
 } from '../common/employee-order';
+import { dateStrInOrgTz } from '../common/org-date';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { REPORT_ROW_LIMIT, assertWithinReportLimit } from './report-limits';
 import {
   formatDateDisplay,
   formatTimeInZone,
+  resolveOrgTimeContext,
   type TimeFormatPattern,
 } from '../payroll/format-date';
 
@@ -43,6 +47,10 @@ interface CustomReportColumn<Row> {
 
 interface CustomReportSource<Row> {
   label: string;
+  // A company feature flag the source needs; the source is hidden and refused for companies that do not have it.
+  feature?: string;
+  // The choices the builder offers for the Status filter of this source (omitted = no Status filter shown).
+  statuses?: { value: string; label: string }[];
   columns: Record<string, CustomReportColumn<Row>>;
   fetch: (
     filters: CustomReportFilters,
@@ -97,10 +105,27 @@ const employeesSource: CustomReportSource<
 
 const attendanceSource: CustomReportSource<
   Prisma.AttendanceGetPayload<{
-    include: { employee: { select: { name: true; employeeId: true } } };
+    include: {
+      employee: {
+        select: { name: true; employeeId: true; joiningDate: true };
+      };
+    };
   }>
 > = {
   label: 'Attendance',
+  statuses: [
+    // "Late & early exits" views: HR's monthly look at who is regularly late or leaves early.
+    { value: 'LATE', label: 'Late arrivals only' },
+    { value: 'EARLY_OUT', label: 'Early exits only' },
+    { value: 'LATE_OR_EARLY', label: 'Late arrivals and early exits' },
+    ...Object.values(AttendanceStatus).map((v) => ({
+      value: v,
+      label: v
+        .replace(/_/g, ' ')
+        .toLowerCase()
+        .replace(/^\w/, (c) => c.toUpperCase()),
+    })),
+  ],
   columns: {
     employeeId: { header: 'Employee ID', get: (r) => r.employee.employeeId },
     employeeName: { header: 'Employee Name', get: (r) => r.employee.name },
@@ -115,6 +140,15 @@ const attendanceSource: CustomReportSource<
       get: (r, ctx) =>
         formatTimeInZone(r.outTime, ctx.timezone, ctx.timeFormat),
     },
+    late: { header: 'Late', get: (r) => (r.isLate ? 'Yes' : 'No') },
+    earlyOut: {
+      header: 'Early Out',
+      get: (r) => (r.isEarlyOut ? 'Yes' : 'No'),
+    },
+    workArrangement: {
+      header: 'Work Arrangement',
+      get: (r) => r.workArrangement,
+    },
   },
   fetch: async (filters, organizationId, prisma) => {
     const where: Prisma.AttendanceWhereInput = { organizationId };
@@ -123,13 +157,125 @@ const attendanceSource: CustomReportSource<
       if (filters.from) where.date.gte = filters.from;
       if (filters.to) where.date.lte = filters.to;
     }
-    if (filters.status) where.status = filters.status as AttendanceStatus;
+    if (filters.status === 'LATE') where.isLate = true;
+    else if (filters.status === 'EARLY_OUT') where.isEarlyOut = true;
+    else if (filters.status === 'LATE_OR_EARLY')
+      where.OR = [{ isLate: true }, { isEarlyOut: true }];
+    else if (filters.status) where.status = filters.status as AttendanceStatus;
     if (filters.department)
       where.employee = { departmentId: filters.department };
     const rows = await prisma.attendance.findMany({
       where,
-      include: { employee: { select: { name: true, employeeId: true } } },
+      include: {
+        employee: {
+          select: { name: true, employeeId: true, joiningDate: true },
+        },
+      },
       orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { date: 'desc' }],
+      take: FETCH_LIMIT,
+    });
+    assertWithinReportLimit(rows);
+    // Nothing for a day before the employee joined (same rule as the tracker and the attendance report).
+    return rows.filter(
+      (r) => r.date >= r.employee.joiningDate.toISOString().slice(0, 10),
+    );
+  },
+};
+
+type ProbationRow = Prisma.UserGetPayload<{
+  include: { department: { select: { name: true } } };
+}>;
+
+const PROBATION_DUE_SOON_DAYS = 30;
+
+// Whole days from `today` to the probation end date (negative = already past it); null when no end date is set.
+function daysToProbationEnd(row: ProbationRow, today: string): number | null {
+  if (!row.probationEndDate) return null;
+  return Math.round(
+    (Date.parse(`${row.probationEndDate}T00:00:00Z`) -
+      Date.parse(`${today}T00:00:00Z`)) /
+      86_400_000,
+  );
+}
+
+// Employees still on probation (or on an extended one), with how far each is from the confirmation date - the weekly
+// list HR chases. Status filter: overdue / due in the next 30 days / extended; From-To narrows the end date.
+const probationSource: CustomReportSource<ProbationRow> = {
+  label: 'Probation & Confirmation',
+  statuses: [
+    { value: 'overdue', label: 'Overdue (end date passed)' },
+    { value: 'due_30', label: 'Due in the next 30 days' },
+    { value: 'extended', label: 'Extended probation' },
+  ],
+  columns: {
+    employeeId: { header: 'Employee ID', get: (r) => r.employeeId },
+    name: { header: 'Name', get: (r) => r.name },
+    department: { header: 'Department', get: (r) => r.department?.name ?? '' },
+    designation: { header: 'Designation', get: (r) => r.designation },
+    joiningDate: {
+      header: 'Joining Date',
+      get: (r) => formatDateDisplay(r.joiningDate),
+    },
+    probationEndDate: {
+      header: 'Probation Ends',
+      get: (r) =>
+        r.probationEndDate ? formatDateDisplay(r.probationEndDate) : '',
+    },
+    daysLeft: {
+      header: 'Days Left',
+      get: (r, ctx) =>
+        daysToProbationEnd(r, dateStrInOrgTz(ctx.timezone)) ?? '',
+    },
+    stage: {
+      header: 'Stage',
+      get: (r) =>
+        r.employmentStatus === EmploymentStatus.EXTENDED_PROBATION
+          ? 'Extended probation'
+          : 'Probation',
+    },
+    due: {
+      header: 'Confirmation',
+      get: (r, ctx) => {
+        const days = daysToProbationEnd(r, dateStrInOrgTz(ctx.timezone));
+        if (days === null) return 'No end date set';
+        if (days < 0) return `Overdue by ${-days} day(s)`;
+        return days <= PROBATION_DUE_SOON_DAYS
+          ? `Due in ${days} day(s)`
+          : 'Later';
+      },
+    },
+  },
+  fetch: async (filters, organizationId, prisma) => {
+    const { timezone } = await resolveOrgTimeContext(prisma, organizationId);
+    const today = dateStrInOrgTz(timezone);
+    const soon = new Date(`${today}T00:00:00Z`);
+    soon.setUTCDate(soon.getUTCDate() + PROBATION_DUE_SOON_DAYS);
+    const soonStr = soon.toISOString().slice(0, 10);
+    const where: Prisma.UserWhereInput = {
+      organizationId,
+      isActive: true,
+      employmentStatus: {
+        in: [EmploymentStatus.PROBATION, EmploymentStatus.EXTENDED_PROBATION],
+      },
+    };
+    if (filters.department) where.departmentId = filters.department;
+    const end: Prisma.StringNullableFilter = {};
+    if (filters.from) end.gte = filters.from;
+    if (filters.to) end.lte = filters.to;
+    if (filters.status === 'overdue') end.lt = today;
+    if (filters.status === 'due_30') {
+      end.gte = end.gte && end.gte > today ? end.gte : today;
+      end.lte = end.lte && end.lte < soonStr ? end.lte : soonStr;
+    }
+    if (filters.status === 'extended') {
+      where.employmentStatus = EmploymentStatus.EXTENDED_PROBATION;
+    }
+    if (Object.keys(end).length > 0) where.probationEndDate = end;
+    const rows = await prisma.user.findMany({
+      where,
+      include: { department: { select: { name: true } } },
+      // Soonest end date first - the most urgent at the top; people with no end date last.
+      orderBy: [{ probationEndDate: { sort: 'asc', nulls: 'last' } }],
       take: FETCH_LIMIT,
     });
     assertWithinReportLimit(rows);
@@ -246,9 +392,71 @@ const payrollSource: CustomReportSource<
   },
 };
 
+const fieldVisitsSource: CustomReportSource<
+  Prisma.FieldVisitGetPayload<{
+    include: { employee: { select: { name: true; employeeId: true } } };
+  }>
+> = {
+  label: 'Field visits',
+  feature: 'feature.field_tracking',
+  statuses: Object.values(FieldVisitStatus).map((v) => ({
+    value: v,
+    label: v.charAt(0) + v.slice(1).toLowerCase().replace(/_/g, ' '),
+  })),
+  columns: {
+    employeeId: { header: 'Employee ID', get: (r) => r.employee.employeeId },
+    employeeName: { header: 'Employee Name', get: (r) => r.employee.name },
+    date: { header: 'Visit Date', get: (r) => r.scheduledFor },
+    client: { header: 'Client', get: (r) => r.clientName },
+    address: { header: 'Address', get: (r) => r.address },
+    purpose: { header: 'Purpose', get: (r) => r.purpose },
+    status: { header: 'Status', get: (r) => r.status },
+    checkIn: {
+      header: 'Checked In',
+      get: (r, ctx) =>
+        formatTimeInZone(r.checkInAt, ctx.timezone, ctx.timeFormat),
+    },
+    checkOut: {
+      header: 'Checked Out',
+      get: (r, ctx) =>
+        formatTimeInZone(r.checkOutAt, ctx.timezone, ctx.timeFormat),
+    },
+    minutes: {
+      header: 'Minutes at Client',
+      get: (r) => r.durationMinutes ?? '',
+    },
+    farFromClient: {
+      header: 'Checked in far from client',
+      get: (r) => (r.checkInWithinRange === false ? 'Yes' : 'No'),
+    },
+    outcome: { header: 'Outcome', get: (r) => r.outcome },
+  },
+  fetch: async (filters, organizationId, prisma) => {
+    const where: Prisma.FieldVisitWhereInput = { organizationId };
+    if (filters.from || filters.to) {
+      where.scheduledFor = {};
+      if (filters.from) where.scheduledFor.gte = filters.from;
+      if (filters.to) where.scheduledFor.lte = filters.to;
+    }
+    if (filters.status) where.status = filters.status as FieldVisitStatus;
+    if (filters.department)
+      where.employee = { departmentId: filters.department };
+    const rows = await prisma.fieldVisit.findMany({
+      where,
+      include: { employee: { select: { name: true, employeeId: true } } },
+      orderBy: [{ scheduledFor: 'desc' }, { createdAt: 'asc' }],
+      take: FETCH_LIMIT,
+    });
+    assertWithinReportLimit(rows);
+    return rows;
+  },
+};
+
 export const CUSTOM_REPORT_SOURCES: Record<string, AnyCustomReportSource> = {
   employees: employeesSource as unknown as AnyCustomReportSource,
   attendance: attendanceSource as unknown as AnyCustomReportSource,
   leaves: leavesSource as unknown as AnyCustomReportSource,
+  probation: probationSource as unknown as AnyCustomReportSource,
   payroll: payrollSource as unknown as AnyCustomReportSource,
+  fieldVisits: fieldVisitsSource as unknown as AnyCustomReportSource,
 };

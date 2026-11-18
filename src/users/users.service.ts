@@ -8,6 +8,7 @@ import { Prisma, User } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { isOrganizationActive } from '../common/org-status';
+import { organizationToday } from '../common/exit-access';
 
 // Deliberately thin — this phase only needs enough to support Auth.
 // A real Employees module (profile fields, org-wide listing, etc.) is a
@@ -48,6 +49,19 @@ export class UsersService {
     return lookup({ email: normalized });
   }
 
+  // Everyone who can sign in with this employee ID (compared without regard to case). Company ID prefixes are unique, so this is normally
+  // one person; two older companies that still share the default prefix can return two. Same tenant-unknown reasoning as findByEmail
+  // above; at most 3 are returned.
+  findByEmployeeId(employeeId: string): Promise<User[]> {
+    type FindManyArgs = Parameters<typeof this.prisma.user.findMany>[0];
+    const args = {
+      where: { employeeId: { equals: employeeId.trim(), mode: 'insensitive' }, isActive: true },
+      take: 3,
+      __tenantScopeBypass: true,
+    } as unknown as FindManyArgs;
+    return this.prisma.user.findMany(args);
+  }
+
   // A reset-token hash alone identifies the account — same tenant-unknown
   // reasoning as findByEmail above.
   findByResetToken(tokenHash: string): Promise<User | null> {
@@ -62,6 +76,11 @@ export class UsersService {
   // Whether the user's organisation is switched on (not suspended/archived by the platform) - see org-status.ts.
   isOrganizationActive(organizationId: string): Promise<boolean> {
     return isOrganizationActive(this.prisma, organizationId);
+  }
+
+  // Today's date in the organisation's own time zone (cached for a minute) - used to end access after a last working day.
+  organizationToday(organizationId: string): Promise<string> {
+    return organizationToday(this.prisma, organizationId);
   }
 
   findByIdInOrg(id: string, organizationId: string): Promise<User | null> {

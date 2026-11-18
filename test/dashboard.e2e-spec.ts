@@ -144,6 +144,13 @@ describe('Dashboard (e2e)', () => {
       });
     const empBody = empCreate.body as EmployeeCreateBody;
     employeeId = empBody.employee.id;
+
+    // Joined before the sample dates used below: a claim / comp-off / record is not accepted for a day before the
+    // person joined.
+    await prisma.user.updateMany({
+      where: { email: { startsWith: 'dash-e2e-emp' } },
+      data: { joiningDate: new Date('2020-01-01T00:00:00.000Z') },
+    });
     const empLogin = await request(app.getHttpServer())
       .post('/auth/login')
       .send({
@@ -577,6 +584,145 @@ describe('Dashboard (e2e)', () => {
     expect(body.payrollSnapshot).toBeNull();
   });
 
+  it('planned future days (approved Work From Home, approved leave still to come) are not counted yet', async () => {
+    const summary = async () =>
+      (
+        await request(app.getHttpServer())
+          .get('/dashboard/employee')
+          .set('Authorization', `Bearer ${employeeToken}`)
+          .expect(200)
+      ).body as { attendanceSummary: Record<string, number> };
+    const before = (await summary()).attendanceSummary;
+    // The last two days of the month are after today unless today is among them, in which case only the days that are
+    // really still to come are planted.
+    const now = new Date();
+    const lastDay = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0),
+    );
+    const ymd = (offset: number) => {
+      const d = new Date(lastDay);
+      d.setUTCDate(d.getUTCDate() - offset);
+      return d.toISOString().slice(0, 10);
+    };
+    const planted: string[] = [];
+    if (ymd(0) > todayStr()) {
+      await prisma.attendance.create({
+        data: {
+          organizationId,
+          employeeId,
+          date: ymd(0),
+          status: 'ABSENT',
+          source: 'FACE_API',
+          workArrangement: 'WFH',
+        },
+      });
+      planted.push(ymd(0));
+    }
+    if (ymd(1) > todayStr()) {
+      await prisma.attendance.create({
+        data: {
+          organizationId,
+          employeeId,
+          date: ymd(1),
+          status: 'ON_LEAVE',
+          source: 'SYSTEM',
+        },
+      });
+      planted.push(ymd(1));
+    }
+    const after = (await summary()).attendanceSummary;
+    expect(after.ABSENT ?? 0).toBe(before.ABSENT ?? 0);
+    expect(after.ON_LEAVE ?? 0).toBe(before.ON_LEAVE ?? 0);
+    await prisma.attendance.deleteMany({
+      where: { employeeId, date: { in: planted } },
+    });
+  });
+
+  it("This Month's Attendance counts Work From Home days (approved so far, and waiting) apart from Present", async () => {
+    const wfh = async () =>
+      (
+        (
+          await request(app.getHttpServer())
+            .get('/dashboard/employee')
+            .set('Authorization', `Bearer ${employeeToken}`)
+            .expect(200)
+        ).body as {
+          wfhThisMonth: { approved: number; upcoming: number; pending: number };
+        }
+      ).wfhThisMonth;
+    const before = await wfh();
+    const row = await prisma.attendance.findFirstOrThrow({
+      where: { employeeId, date: todayStr() },
+    });
+    await prisma.attendance.update({
+      where: { id: row.id },
+      data: { workArrangement: 'WFH', workArrangementStatus: 'APPROVED' },
+    });
+    expect((await wfh()).approved).toBe(before.approved + 1);
+    await prisma.attendance.update({
+      where: { id: row.id },
+      data: { workArrangementStatus: 'PENDING' },
+    });
+    const waiting = await wfh();
+    expect(waiting.approved).toBe(before.approved);
+    expect(waiting.pending).toBe(before.pending + 1);
+    await prisma.attendance.update({
+      where: { id: row.id },
+      data: {
+        workArrangement: row.workArrangement,
+        workArrangementStatus: row.workArrangementStatus,
+      },
+    });
+  });
+
+  it("This Month's Attendance lists holidays and weekly offs from the calendar, never as Absent", async () => {
+    const summary = async () =>
+      (
+        await request(app.getHttpServer())
+          .get('/dashboard/employee')
+          .set('Authorization', `Bearer ${employeeToken}`)
+          .expect(200)
+      ).body as { attendanceSummary: Record<string, number> };
+    const before = (await summary()).attendanceSummary;
+    const firstOfMonth = `${todayStr().slice(0, 7)}-01`; // always today or earlier
+    await prisma.holiday.create({
+      data: {
+        organizationId,
+        name: 'Dashboard Test Holiday',
+        date: firstOfMonth,
+        year: Number(firstOfMonth.slice(0, 4)),
+      },
+    });
+    // An empty Absent row on that holiday (what a migration import leaves) must not read as Absent.
+    await prisma.attendance.upsert({
+      where: {
+        organizationId_employeeId_date: {
+          organizationId,
+          employeeId,
+          date: firstOfMonth,
+        },
+      },
+      update: { status: 'ABSENT' },
+      create: {
+        organizationId,
+        employeeId,
+        date: firstOfMonth,
+        status: 'ABSENT',
+        source: 'EXCEL_IMPORT',
+      },
+    });
+    const after = (await summary()).attendanceSummary;
+    expect(after.HOLIDAY).toBeGreaterThanOrEqual((before.HOLIDAY ?? 0) + 1);
+    expect(after.ABSENT ?? 0).toBeLessThanOrEqual(before.ABSENT ?? 0);
+    expect(after.WEEKLY_OFF).toEqual(expect.any(Number));
+    await prisma.attendance.deleteMany({
+      where: { employeeId, date: firstOfMonth },
+    });
+    await prisma.holiday.deleteMany({
+      where: { organizationId, name: 'Dashboard Test Holiday' },
+    });
+  });
+
   it('EMPLOYEE dashboard rolls up pending requests, reimbursements, active loan, and tax declaration status', async () => {
     // beforeAll already applied one PENDING leave AND one PENDING ₹1000
     // reimbursement for this employee (used by the HR-dashboard
@@ -669,6 +815,45 @@ describe('Dashboard (e2e)', () => {
     expect(body.activeLoan?.outstandingBalance).toBe(8000);
     expect(body.activeLoan?.emiAmount).toBe(2000);
     expect(body.taxDeclaration.status).toBe('DRAFT');
+  });
+
+  it('a pending regularization in the approvals list shows the actual punch and the requested times', async () => {
+    await prisma.attendance.create({
+      data: {
+        organizationId,
+        employeeId,
+        date: '2026-06-02',
+        status: 'PRESENT',
+        source: 'FACE_API',
+        inTime: new Date('2026-06-02T05:30:00.000Z'),
+        outTime: new Date('2026-06-02T13:00:00.000Z'),
+        regularization: {
+          requested: true,
+          reason: 'Forgot to punch',
+          requestedInTime: '2026-06-02T04:30:00.000Z',
+          requestedOutTime: '2026-06-02T13:30:00.000Z',
+          status: 'pending',
+          reviewedBy: null,
+          reviewedAt: null,
+          reviewComments: '',
+        },
+      },
+    });
+    const res = await request(app.getHttpServer())
+      .get('/dashboard/hr')
+      .set('Authorization', `Bearer ${hrToken}`)
+      .expect(200);
+    const item = (
+      res.body as {
+        pendingItems: { type: string; date: string; summary: string }[];
+      }
+    ).pendingItems.find(
+      (i) => i.type === 'REGULARIZATION' && i.date === '2026-06-02',
+    );
+    expect(item?.summary).toMatch(
+      /^Attendance regularization \(actual .+ - .+; requested .+ - .+\)$/,
+    );
+    expect(item?.summary).not.toMatch(/no punch/);
   });
 
   it('ADMIN sees the executive dashboard with headcount + the seeded work anniversary + birthday', async () => {

@@ -9,22 +9,26 @@ import {
   EMPLOYEE_ORDER_BY,
   EMPLOYEE_RELATION_ORDER_BY,
 } from '../common/employee-order';
-import { Inject, Injectable } from '@nestjs/common';
+import { ForbiddenException, Inject, Injectable } from '@nestjs/common';
 import { LeaveStatus, Prisma, Role, User } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import {
-  assertManagerDeptScope,
   deptScopedEmployeeIds,
+  inReviewerScope,
+  isScopedReviewer,
+  reviewerScope,
 } from '../common/dept-scope';
 import {
   formatDateDisplay,
   formatTimeInZone,
   resolveOrgTimeContext,
 } from '../payroll/format-date';
-import { dateStrInOrgTz } from '../common/org-date';
+import { dateStrInOrgTz, todayInOrgTz } from '../common/org-date';
+import { employedOnWhere, isEmployedOn } from '../common/managers';
 import { DashboardService } from '../dashboard/dashboard.service';
 import { ReportColumn } from './report-export';
+import { featureEnabledFor } from '../module-access/module-gate';
 import {
   AttendanceReportQueryDto,
   DepartmentLeaveSummaryReportQueryDto,
@@ -83,18 +87,23 @@ export class ReportsService {
     const where: Prisma.AttendanceWhereInput = { organizationId };
     // No dates given used to mean every day anyone ever punched - thousands of rows and several seconds. It now means
     // the current month, the same period the screen opens on; a caller who wants more names a from/to.
-    const now = new Date();
-    const from =
-      query.from ??
-      (query.to
-        ? undefined
-        : `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-01`);
+    // The current month in the organisation's own time zone (not the server's UTC date, which is still last month for the
+    // first hours of a month in India).
+    const orgTodayStr = todayInOrgTz(
+      (
+        await this.scopedPrisma.organization.findFirst({
+          where: { id: organizationId },
+          select: { timezone: true },
+        })
+      )?.timezone ?? 'Asia/Kolkata',
+    );
+    const from = query.from ?? (query.to ? undefined : `${orgTodayStr.slice(0, 7)}-01`);
     if (from || query.to) {
       where.date = {};
       if (from) where.date.gte = from;
       if (query.to) where.date.lte = query.to;
     }
-    if (actor.role === Role.MANAGER) {
+    if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       // Ignore query.department for MANAGER — always their own, never a
       // caller-chosen one, so a MANAGER can't request another dept's report.
       // deptScopedEmployeeIds scopes a departmentless MANAGER to nobody —
@@ -111,13 +120,25 @@ export class ReportsService {
       where.employee = { departmentId: query.department };
     }
 
-    const records = await this.scopedPrisma.attendance.findMany({
+    const fetched = await this.scopedPrisma.attendance.findMany({
       where,
-      include: { employee: { select: { name: true, employeeId: true } } },
+      include: {
+        employee: {
+          select: { name: true, employeeId: true, joiningDate: true, exitDate: true },
+        },
+      },
       take: REPORT_ROW_LIMIT + 1,
       orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { date: 'asc' }],
     });
-    assertWithinReportLimit(records);
+    assertWithinReportLimit(fetched);
+    // Nothing is reported for a day before the employee joined (an import or manual entry can carry one), the same
+    // rule as the attendance tracker and the Attendance Records list.
+    // ...nor after their last working day.
+    const records = fetched.filter(
+      (r) =>
+        r.date >= r.employee.joiningDate.toISOString().slice(0, 10) &&
+        isEmployedOn(r.employee.exitDate, r.date),
+    );
 
     // Punch times are instants: print them as clock times in the ORG's timezone (the Date column already says which
     // day), not the server's. A check-out on a later calendar day than the check-in (night shift) keeps its date.
@@ -171,9 +192,13 @@ export class ReportsService {
     actor: Actor,
     organizationId: string,
   ): Promise<ReportPayload> {
+    assertValidDateRange(query.from, query.to);
     const where: Prisma.LeaveWhereInput = { organizationId };
     if (query.status) where.status = query.status;
-    if (actor.role === Role.MANAGER) {
+    // Leave that overlaps the window, same rule as the department summary.
+    if (query.from) where.endDate = { gte: query.from };
+    if (query.to) where.startDate = { lte: query.to };
+    if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       where.employeeId = {
         in: await deptScopedEmployeeIds(
           this.scopedPrisma,
@@ -246,7 +271,7 @@ export class ReportsService {
       year: targetYear,
       leaveType: { showInLeaveTracker: true },
     };
-    if (actor.role === Role.MANAGER) {
+    if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       where.employeeId = {
         in: await deptScopedEmployeeIds(
           this.scopedPrisma,
@@ -304,17 +329,23 @@ export class ReportsService {
     actor: Actor,
     organizationId: string,
   ): Promise<ReportPayload> {
-    if (actor.role === Role.MANAGER) {
-      await assertManagerDeptScope(
-        this.scopedPrisma,
-        actor,
-        organizationId,
-        query.employeeId,
+    assertValidDateRange(query.from, query.to);
+    if (
+      actor.role !== Role.ADMIN &&
+      !(await inReviewerScope(this.scopedPrisma, actor, organizationId, query.employeeId))
+    ) {
+      throw new ForbiddenException(
+        'You can only view employees in the departments you head or who report to you.',
       );
     }
 
     const leaves = await this.scopedPrisma.leave.findMany({
-      where: { organizationId, employeeId: query.employeeId },
+      where: {
+        organizationId,
+        employeeId: query.employeeId,
+        ...(query.from && { endDate: { gte: query.from } }),
+        ...(query.to && { startDate: { lte: query.to } }),
+      },
       include: { leaveType: { select: { name: true } } },
       orderBy: { startDate: 'desc' },
     });
@@ -357,21 +388,24 @@ export class ReportsService {
     };
     if (query.from) where.endDate = { gte: query.from };
     if (query.to) where.startDate = { lte: query.to };
-    if (actor.role === Role.MANAGER) {
-      // Same null-department guard as attendanceReport.
-      where.employeeId = {
-        in: await deptScopedEmployeeIds(
-          this.scopedPrisma,
-          actor,
-          organizationId,
-        ),
-      };
-    }
+    const scope =
+      actor.role === Role.ADMIN ? null : await reviewerScope(this.scopedPrisma, actor, organizationId);
+    if (scope) where.employeeId = { in: scope };
 
-    const departmentWhere: Prisma.DepartmentWhereInput =
-      actor.role === Role.MANAGER
-        ? { organizationId, id: actor.departmentId ?? undefined }
-        : { organizationId };
+    // A department head sees the departments their people are in.
+    const departmentWhere: Prisma.DepartmentWhereInput = scope
+      ? {
+          organizationId,
+          id: {
+            in: (
+              await this.scopedPrisma.user.findMany({
+                where: { organizationId, id: { in: scope }, departmentId: { not: null } },
+                select: { departmentId: true },
+              })
+            ).map((u) => u.departmentId as string),
+          },
+        }
+      : { organizationId };
 
     const [leaves, departments] = await Promise.all([
       this.scopedPrisma.leave.findMany({
@@ -483,6 +517,11 @@ export class ReportsService {
   }
 
   async employeeReport(organizationId: string): Promise<ReportPayload> {
+    // A Live tracking column, only for companies that have the feature on.
+    const trackingOn = await featureEnabledFor(
+      organizationId,
+      'feature.field_tracking',
+    );
     const employees = await this.scopedPrisma.user.findMany({
       where: { organizationId },
       include: { department: { select: { name: true } } },
@@ -497,7 +536,9 @@ export class ReportsService {
       designation: e.designation,
       role: e.role,
       joiningDate: formatDateDisplay(e.joiningDate),
+      confirmationDate: e.confirmationDate ? formatDateDisplay(e.confirmationDate) : '',
       isActive: e.isActive ? 'Active' : 'Inactive',
+      liveTracking: e.fieldTrackingEnabled ? 'Yes' : 'No',
     }));
 
     const columns: ReportColumn[] = [
@@ -508,7 +549,11 @@ export class ReportsService {
       { header: 'Designation', key: 'designation', width: 18 },
       { header: 'Role', key: 'role', width: 16 },
       { header: 'Joining Date', key: 'joiningDate', width: 14 },
+      { header: 'Confirmation Date', key: 'confirmationDate', width: 16 },
       { header: 'Status', key: 'isActive', width: 12 },
+      ...(trackingOn
+        ? [{ header: 'Live tracking', key: 'liveTracking', width: 14 }]
+        : []),
     ];
 
     return {
@@ -529,7 +574,17 @@ export class ReportsService {
       // (was an N+1 — a query per row of the report).
       this.scopedPrisma.user.groupBy({
         by: ['departmentId'],
-        where: { organizationId, departmentId: { not: null } },
+        // People working there today: active, joined, and not past their last working day.
+        where: {
+          organizationId,
+          departmentId: { not: null },
+          isActive: true,
+          ...employedOnWhere(
+            todayInOrgTz(
+              (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata',
+            ),
+          ),
+        },
         _count: { _all: true },
       }),
     ]);

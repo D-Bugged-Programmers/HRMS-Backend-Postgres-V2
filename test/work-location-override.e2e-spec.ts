@@ -68,13 +68,15 @@ describe('Per-employee work location + personalData encryption (e2e)', () => {
 
     // The API only accepts the supported state (Maharashtra); a second state is written straight to
     // the DB to simulate existing multi-state data, which the override logic must still handle.
+    // Each location its own spot: the same fence twice is refused as a duplicate.
+    let seq = 0;
     const mk = async (name: string, state: string) => {
       const id = (
         (
           await admin(http().post('/work-locations')).send({
             name,
             state: 'Maharashtra',
-            latitude: 19.07,
+            latitude: 19.07 + ++seq * 0.01,
             longitude: 72.87,
           })
         ).body as { id: string }
@@ -205,10 +207,17 @@ describe('Per-employee work location + personalData encryption (e2e)', () => {
     expect(stored.currentAddress).toBe('1 Test Street');
     expect(JSON.stringify(raw.personalData)).not.toContain('ABCDE1234F');
 
+    // Read back decrypted - masked in the response, in full from the reveal endpoint.
     const res = await admin(http().get(`/employees/${empId}`)).expect(200);
     const pd = (res.body as EmployeeBody).personalData;
-    expect(pd.panNumber).toBe('ABCDE1234F');
-    expect(pd.bankAccountNo).toBe('000123456789');
+    expect(pd.panNumber).toBe('******234F');
+    const full = await admin(
+      http().get(`/employees/${empId}/personal-data/sensitive`),
+    ).expect(200);
+    expect((full.body as Record<string, string>).panNumber).toBe('ABCDE1234F');
+    expect((full.body as Record<string, string>).bankAccountNo).toBe(
+      '000123456789',
+    );
   });
 
   it('legacy plaintext values already in the DB still read back', async () => {
@@ -216,9 +225,9 @@ describe('Per-employee work location + personalData encryption (e2e)', () => {
       where: { id: empId },
       data: { personalData: { panNumber: 'LEGACY1234Z' } },
     });
-    const res = await admin(http().get(`/employees/${empId}`)).expect(200);
-    expect((res.body as EmployeeBody).personalData.panNumber).toBe(
-      'LEGACY1234Z',
-    );
+    const res = await admin(
+      http().get(`/employees/${empId}/personal-data/sensitive`),
+    ).expect(200);
+    expect((res.body as Record<string, string>).panNumber).toBe('LEGACY1234Z');
   });
 });

@@ -6,6 +6,8 @@
 // whole scoped list.
 // Important: No new data models — everything here is a read/derivation over Attendance, Leave+LeaveType,
 // Holiday, LeaveBalance, and CompOff, exactly as those already exist.
+import { markPendingLeave } from './pending-leave-cells';
+import { holidayInEffect } from '../holidays/holiday-in-effect';
 import { getLeaveYearConfig } from '../leave-balances/leave-year-config';
 import {
   leaveYearBounds,
@@ -13,7 +15,7 @@ import {
   leaveYearOf,
 } from '../leave-balances/leave-year';
 import { EMPLOYEE_ORDER_BY, compareEmployees } from '../common/employee-order';
-import { ForbiddenException, Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import {
   AllocationType,
   AttendanceStatus,
@@ -25,13 +27,27 @@ import {
 } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
-import { deptScopedEmployeeIds } from '../common/dept-scope';
+import { deptScopedEmployeeIds, isScopedReviewer } from '../common/dept-scope';
 import { LeaveBalanceService } from '../leave-balances/leave-balance.service';
 import { isEligible } from '../leave-balances/leave-eligibility';
 import { CompOffService } from '../comp-offs/comp-off.service';
 import { LEAVE_TYPE_CODES } from '../common/reserved-codes';
 import { todayInOrgTz } from '../common/org-date';
-import { clampLeaveDaysToMonth } from '../payroll/payroll-date-math';
+import {
+  isWeeklyOff,
+  resolveShiftConfig,
+  type OrganizationAttendancePrefs,
+} from '../attendance/attendance-shift-config';
+import {
+  chargedKindsOf,
+  effectiveLeaveRules,
+  type LeaveRules,
+} from '../leaves/leave-rules';
+import {
+  chargedDaysInWindow,
+  crossesWindow,
+  type WindowRules,
+} from '../leaves/leave-window-days';
 import { QueryLeaveTrackerGridDto } from './dto/query-leave-tracker-grid.dto';
 import { QueryLeaveTrackerBalancesDto } from './dto/query-leave-tracker-balances.dto';
 import { ExportLeaveTrackerGridDto } from './dto/export-leave-tracker-grid.dto';
@@ -59,6 +75,10 @@ function monthBounds(
   };
 }
 
+// Leave Without Pay: the unlimited, unpaid leave type (code LWP). It has no balance row, so it is counted from the
+// approved leaves themselves.
+const LWP_CODE = 'LWP';
+
 function isCompOffType(leaveType: Pick<LeaveType, 'code'>): boolean {
   return leaveType.code === LEAVE_TYPE_CODES.COMPOFF;
 }
@@ -70,8 +90,10 @@ export type LeaveTrackerCellCode =
   | 'WFH'
   | 'ON_LEAVE'
   | 'COMP_OFF'
+  | 'LWP'
   | 'WEEKLY_OFF'
   | 'HOLIDAY'
+  | 'IN_PROGRESS'
   | 'INCOMPLETE';
 
 // Same short codes as the frontend grid's own CELL_SHORT map
@@ -84,8 +106,10 @@ const CELL_SHORT: Record<LeaveTrackerCellCode, string> = {
   WFH: 'WFH',
   ON_LEAVE: 'L',
   COMP_OFF: 'CO',
+  LWP: 'LWP',
   WEEKLY_OFF: 'WO',
   HOLIDAY: 'H',
+  IN_PROGRESS: 'CI',
   INCOMPLETE: 'I',
 };
 
@@ -99,20 +123,27 @@ export class LeaveTrackerService {
     private readonly compOffService: CompOffService,
   ) {}
 
-  // ADMIN/HR: org-wide, optionally narrowed to one department via
-  // `departmentId`. MANAGER: forced to their own department regardless —
-  // an explicit `departmentId` that isn't their own is rejected (403),
-  // never silently widened or narrowed to something else.
+  // ADMIN (and HR who heads no department): org-wide, optionally narrowed to one department via `departmentId`.
+  // A department head (MANAGER or HR, see reviewerScope): only the people they look after; `departmentId` can
+  // narrow that, never widen it.
   private async resolveScopedEmployeeIds(
     actor: Actor,
     organizationId: string,
     departmentId?: string,
   ): Promise<string[]> {
-    if (actor.role === Role.MANAGER) {
-      if (departmentId && departmentId !== actor.departmentId) {
-        throw new ForbiddenException('You can only view your own department.');
-      }
-      return deptScopedEmployeeIds(this.scopedPrisma, actor, organizationId);
+    if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
+      // A department picked in the filter narrows the reviewer's own people; it never widens them.
+      const scope = await deptScopedEmployeeIds(
+        this.scopedPrisma,
+        actor,
+        organizationId,
+      );
+      if (!departmentId) return scope;
+      const inDept = await this.scopedPrisma.user.findMany({
+        where: { organizationId, departmentId, id: { in: scope } },
+        select: { id: true },
+      });
+      return inDept.map((e) => e.id);
     }
     const employees = await this.scopedPrisma.user.findMany({
       where: { organizationId, ...(departmentId && { departmentId }) },
@@ -141,11 +172,11 @@ export class LeaveTrackerService {
     // `in: []` is a no-op filter (Prisma/Postgres correctly return zero
     // rows for it) — no need to branch on employeeIds.length here, unlike
     // balances() below where the loop body itself must be skipped.
-    const [org, employees, attendanceRows, leaves, holidays] =
+    const [org, employees, attendanceRows, leaves, holidays, pendingLeaves] =
       await Promise.all([
         this.scopedPrisma.organization.findFirst({
           where: { id: organizationId },
-          select: { timezone: true },
+          select: { timezone: true, attendancePayrollPrefs: true },
         }),
         this.scopedPrisma.user.findMany({
           where: { id: { in: employeeIds }, organizationId },
@@ -154,6 +185,11 @@ export class LeaveTrackerService {
             name: true,
             employeeId: true,
             joiningDate: true,
+            departmentId: true,
+            isActive: true,
+            exitDate: true,
+            // The department's shift decides each person's weekly offs.
+            department: true,
           },
           orderBy: EMPLOYEE_ORDER_BY,
         }),
@@ -177,7 +213,7 @@ export class LeaveTrackerService {
         this.scopedPrisma.holiday.findMany({
           where: {
             organizationId,
-            isActive: true,
+            AND: [holidayInEffect],
             year: query.year,
             ...(effectiveDepartmentId
               ? {
@@ -191,8 +227,40 @@ export class LeaveTrackerService {
                 actor.role === Role.MANAGER && { departmentId: null }),
           },
         }),
+        // Leave that has been applied for and is waiting for a decision: shown in the grid as leave (marked pending),
+        // not as Absent, until it is approved or rejected.
+        this.scopedPrisma.leave.findMany({
+          where: {
+            organizationId,
+            employeeId: { in: employeeIds },
+            status: LeaveStatus.PENDING,
+            startDate: { lte: end },
+            endDate: { gte: start },
+          },
+          include: { leaveType: true },
+        }),
       ]);
     employees.sort(compareEmployees);
+
+    // Someone appears from their joining date on: not listed for a month that ended before they joined, and no day
+    // before it carries any data, whatever was recorded against it.
+    const joiningOf = new Map(
+      employees.map((e) => [e.id, e.joiningDate.toISOString().slice(0, 10)]),
+    );
+    // ...and up to their last working day: not listed for a month that began after it, and no day after it carries
+    // data. A deactivated employee with no last working day on record is not listed at all.
+    const exitOf = new Map(employees.map((e) => [e.id, e.exitDate ?? null]));
+    for (let i = employees.length - 1; i >= 0; i--) {
+      const e = employees[i];
+      if ((joiningOf.get(e.id) ?? '') > end) employees.splice(i, 1);
+      else if (e.exitDate && e.exitDate < start) employees.splice(i, 1);
+      else if (!e.isActive && !e.exitDate) employees.splice(i, 1);
+    }
+    const onBooks = (employeeId: string, date: string) => {
+      const joined = joiningOf.get(employeeId);
+      const exit = exitOf.get(employeeId);
+      return joined !== undefined && date >= joined && (!exit || date <= exit);
+    };
 
     const leavesByEmployee = new Map<string, typeof leaves>();
     for (const leave of leaves) {
@@ -211,6 +279,7 @@ export class LeaveTrackerService {
     // give back the exact minute (8.33h -> 8h 20m vs the real 8h 19m).
     const minutes: Record<string, Record<number, number>> = {};
     for (const row of attendanceRows) {
+      if (!onBooks(row.employeeId, row.date)) continue;
       const day = Number(row.date.slice(8, 10));
       if (row.workDurationMinutes > 0) {
         (hours[row.employeeId] ??= {})[day] =
@@ -230,10 +299,22 @@ export class LeaveTrackerService {
         const matching = employeeLeaves.find(
           (l) => l.startDate <= row.date && l.endDate >= row.date,
         );
+        // A day on Leave Without Pay is its own code, so the unpaid days stand out from paid leave (a half day on
+        // LWP is also shown as LWP, since the half is what is unpaid).
         code =
           matching && isCompOffType(matching.leaveType)
             ? 'COMP_OFF'
-            : row.status;
+            : matching?.leaveType.code === LWP_CODE
+              ? 'LWP'
+              : row.status;
+      } else if (
+        row.status === AttendanceStatus.PRESENT &&
+        !!row.inTime &&
+        !row.outTime
+      ) {
+        // A punch-in with no punch-out yet (stored as PRESENT): shown as Checked in until the punch-out, as in the
+        // attendance calendar and the mobile app.
+        code = 'IN_PROGRESS';
       } else if (row.workArrangement === WorkArrangement.WFH) {
         code = 'WFH';
       } else {
@@ -242,11 +323,21 @@ export class LeaveTrackerService {
       (cells[row.employeeId] ??= {})[day] = code;
     }
 
+    // The column header names a holiday only when it applies to everyone on the grid: company-wide, or - when the grid is
+    // narrowed to one department (or a Manager's own) - that department's. An optional holiday is the employee's own
+    // choice, so it never marks a day for the whole column. A department-only holiday is shown per employee below.
+    const columnHolidays = holidays.filter(
+      (h) =>
+        !h.isOptional &&
+        (h.departmentId === null ||
+          (!!effectiveDepartmentId &&
+            h.departmentId === effectiveDepartmentId)),
+    );
     const days = Array.from({ length: daysInMonth }, (_, i) => {
       const day = i + 1;
       const dateStr = `${query.year}-${pad(query.month)}-${pad(day)}`;
       const dow = new Date(`${dateStr}T00:00:00.000Z`).getUTCDay();
-      const holiday = holidays.find((h) => h.date === dateStr);
+      const holiday = columnHolidays.find((h) => h.date === dateStr);
       return {
         day,
         dow,
@@ -255,34 +346,87 @@ export class LeaveTrackerService {
       };
     });
 
-    // A working day (not a weekend/holiday) strictly before today, on or
-    // after the employee's own joining date, with no Attendance row at all
-    // — no punch, no leave, nothing — means the employee simply didn't show
-    // up: mark it ABSENT rather than leaving it blank. Today itself is left
-    // alone (the day isn't over — someone can still check in), future days
-    // are never touched, and days before someone joined are never touched
-    // either (they weren't an employee yet — blank, not Absent).
-    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    // As per the holiday calendar: every employee gets a Holiday cell on a day the calendar marks as a holiday for them
+    // (company-wide, or their own department's; never an optional one), from their joining date, even when no
+    // attendance row exists yet - so the grid and its Excel/PDF export always follow the calendar, and a department-only
+    // holiday is not mistaken for a working day (or backfilled as Absent) below. A recorded row is never overridden here.
     for (const employee of employees) {
-      const joiningDateStr = employee.joiningDate.toISOString().slice(0, 10);
       for (const day of days) {
-        if (day.dow === 0 || day.dow === 6 || day.holidayName) continue;
+        if (!onBooks(employee.id, day.dateStr)) continue;
+        if ((cells[employee.id] ?? {})[day.day]) continue;
+        const applies = holidays.some(
+          (h) =>
+            h.date === day.dateStr &&
+            !h.isOptional &&
+            (h.departmentId === null ||
+              h.departmentId === employee.departmentId),
+        );
+        if (applies) (cells[employee.id] ??= {})[day.day] = 'HOLIDAY';
+      }
+    }
+
+    // Each person's own weekly offs (their department's shift, else the organisation's default - not always Saturday and
+    // Sunday) are shown as Weekly Off from their joining date, even before the nightly job has written the row. A
+    // working day strictly before today, on or after the joining date, with no Attendance row at all — no punch, no
+    // leave, nothing — means the employee simply didn't show up: mark it ABSENT rather than leaving it blank. Today
+    // itself is left alone (the day isn't over — someone can still check in), future days are never marked Absent, and
+    // days before someone joined or after they left are never touched (blank, not Absent).
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const orgPrefs =
+      (org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null) ??
+      null;
+    const timeZone = org?.timezone ?? 'Asia/Kolkata';
+    for (const employee of employees) {
+      const { weeklyOffs } = resolveShiftConfig(
+        employee.department,
+        orgPrefs,
+        timeZone,
+      );
+      for (const day of days) {
+        if (!onBooks(employee.id, day.dateStr)) continue;
+        if (cells[employee.id]?.[day.day]) continue;
+        if (isWeeklyOff(day.dateStr, weeklyOffs)) {
+          (cells[employee.id] ??= {})[day.day] = 'WEEKLY_OFF';
+          continue;
+        }
+        if (day.holidayName) continue;
         if (day.dateStr >= today) continue;
-        if (day.dateStr < joiningDateStr) continue;
-        const existing = cells[employee.id]?.[day.day];
-        if (existing) continue;
         (cells[employee.id] ??= {})[day.day] = 'ABSENT';
       }
     }
+
+    // A day covered by a leave that is still pending reads as leave (marked pending) when it would otherwise be Absent
+    // or blank: the person has asked for it, so it is not an absence, but it is not approved leave either. A day
+    // worked, a weekly off or a holiday is left as it is.
+    const pending = markPendingLeave(
+      cells,
+      pendingLeaves.map((l) => ({
+        employeeId: l.employeeId,
+        startDate: l.startDate,
+        endDate: l.endDate,
+        kind: isCompOffType(l.leaveType)
+          ? ('COMP_OFF' as const)
+          : l.leaveType.code === LWP_CODE
+            ? ('LWP' as const)
+            : ('ON_LEAVE' as const),
+      })),
+      days,
+      onBooks,
+    );
 
     return {
       employees: employees.map((e) => ({
         id: e.id,
         name: e.name,
         employeeId: e.employeeId,
+        // So the grid leaves the days before joining / after leaving blank instead of drawing a weekend there.
+        joiningDate: joiningOf.get(e.id) ?? null,
+        exitDate: e.exitDate ?? null,
       })),
       days,
       cells,
+      // Days whose leave cell is a pending application (employee id -> day numbers), so clients can mark them.
+      pending,
       hours,
       minutes,
     };
@@ -330,10 +474,33 @@ export class LeaveTrackerService {
         joiningDate: true,
         // An inactive employee earns no leave: no balance row is created for them here (existing rows still show).
         isActive: true,
+        exitDate: true,
+        // Shown by the Employee Leave Stat page.
+        designation: true,
+        // The name is shown; the whole row also carries the shift that decides this person's weekly offs.
+        department: true,
       },
       orderBy: EMPLOYEE_ORDER_BY,
     });
     employees.sort(compareEmployees);
+
+    // With a month chosen, an employee appears only from the month they joined: someone who joined after that month
+    // ended is not listed for it (the same rule as the attendance grid). With no month, the whole leave year is shown
+    // and everyone stays listed.
+    const joinedOn = (e: { joiningDate: Date }) =>
+      e.joiningDate.toISOString().slice(0, 10);
+    if (periodEnd) {
+      for (let i = employees.length - 1; i >= 0; i--) {
+        if (joinedOn(employees[i]) > periodEnd) employees.splice(i, 1);
+        // ...and only up to the month of their last working day: a month that began after it does not list them.
+        else if (
+          periodStart &&
+          employees[i].exitDate &&
+          employees[i].exitDate! < periodStart
+        )
+          employees.splice(i, 1);
+      }
+    }
 
     // Fetched once for the whole loop (was once per employee) — same
     // query/ordering as LeaveBalanceService.getEligibleLeaveTypes.
@@ -368,22 +535,31 @@ export class LeaveTrackerService {
     // availableForEmployees() sweeps once and fetches every employee's comp-off
     // rows in a single findMany; the attendance groupBy replaces N separate
     // counts with one grouped query — same final per-employee numbers either way.
-    const [compOffAvailableByEmployee, wfhCounts, monthLeaves] =
+    const [compOffAvailableByEmployee, wfhCounts, monthLeaves, lwpLeaves] =
       await Promise.all([
-        this.compOffService.availableForEmployees(
-          balanceEmployeeIds,
-          organizationId,
-        ),
-        this.scopedPrisma.attendance.groupBy({
-          by: ['employeeId'],
-          where: {
-            organizationId,
-            employeeId: { in: balanceEmployeeIds },
-            date: { gte: periodStart ?? yearStart, lte: periodEnd ?? yearEnd },
-            workArrangement: WorkArrangement.WFH,
-          },
-          _count: { _all: true },
-        }),
+        query.lite
+          ? Promise.resolve(new Map<string, number>())
+          : this.compOffService.availableForEmployees(
+              balanceEmployeeIds,
+              organizationId,
+            ),
+        query.lite
+          ? Promise.resolve(
+              [] as { employeeId: string; _count: { _all: number } }[],
+            )
+          : this.scopedPrisma.attendance.groupBy({
+              by: ['employeeId'],
+              where: {
+                organizationId,
+                employeeId: { in: balanceEmployeeIds },
+                date: {
+                  gte: periodStart ?? yearStart,
+                  lte: periodEnd ?? yearEnd,
+                },
+                workArrangement: WorkArrangement.WFH,
+              },
+              _count: { _all: true },
+            }),
         // Approved leave overlapping the chosen month, to say how much of each type was taken in it.
         periodStart && periodEnd
           ? this.scopedPrisma.leave.findMany({
@@ -399,21 +575,154 @@ export class LeaveTrackerService {
                 startDate: true,
                 endDate: true,
                 isHalfDay: true,
-                leaveType: { select: { code: true, name: true } },
+                totalDays: true,
+                leaveType: {
+                  select: {
+                    code: true,
+                    name: true,
+                    rules: true,
+                    allocationType: true,
+                    eventGrant: true,
+                  },
+                },
               },
             })
           : Promise.resolve([]),
+        // Approved Leave Without Pay overlapping the leave year (the type has no balance, so it is summed here).
+        query.lite
+          ? Promise.resolve([])
+          : this.scopedPrisma.leave.findMany({
+              where: {
+                organizationId,
+                employeeId: { in: balanceEmployeeIds },
+                status: LeaveStatus.APPROVED,
+                leaveType: { code: LWP_CODE },
+                startDate: { lte: yearEnd },
+                endDate: { gte: yearStart },
+              },
+              select: {
+                employeeId: true,
+                startDate: true,
+                endDate: true,
+                isHalfDay: true,
+                totalDays: true,
+                leaveType: {
+                  select: {
+                    rules: true,
+                    allocationType: true,
+                    eventGrant: true,
+                  },
+                },
+              },
+            }),
       ]);
+
+    // Days are counted the way each leave was charged (holidays and weekly offs only when its type's sandwich rule takes them
+    // in), not as every calendar day between its dates. Only a leave running across the edge of the month / year being shown
+    // needs the calendar and the shift to be re-counted; most never do, so those are loaded only when one exists.
+    type TypeForRules = {
+      rules: unknown;
+      allocationType: string;
+      eventGrant: unknown;
+    };
+    const periodFrom = periodStart ?? yearStart;
+    const periodTo = periodEnd ?? yearEnd;
+    const crossing = [...monthLeaves, ...lwpLeaves].some(
+      (l) =>
+        crossesWindow(l, periodStart ?? yearStart, periodEnd ?? yearEnd) ||
+        crossesWindow(l, yearStart, yearEnd),
+    );
+    let calendar: {
+      holidays: {
+        date: string;
+        departmentId: string | null;
+        isOptional: boolean;
+      }[];
+      orgPrefs: OrganizationAttendancePrefs | null;
+      timeZone: string;
+    } | null = null;
+    if (crossing) {
+      const [orgRow, holidayRows] = await Promise.all([
+        this.scopedPrisma.organization.findFirst({
+          where: { id: organizationId },
+          select: { timezone: true, attendancePayrollPrefs: true },
+        }),
+        this.scopedPrisma.holiday.findMany({
+          where: {
+            organizationId,
+            AND: [holidayInEffect],
+            date: {
+              gte: yearStart < periodFrom ? yearStart : periodFrom,
+              lte: yearEnd > periodTo ? yearEnd : periodTo,
+            },
+          },
+          select: { date: true, departmentId: true, isOptional: true },
+        }),
+      ]);
+      calendar = {
+        holidays: holidayRows,
+        orgPrefs:
+          (orgRow?.attendancePayrollPrefs as OrganizationAttendancePrefs | null) ??
+          null,
+        timeZone: orgRow?.timezone ?? 'Asia/Kolkata',
+      };
+    }
+    const employeeById = new Map(employees.map((e) => [e.id, e]));
+    const daysInWindow = (
+      l: {
+        employeeId: string;
+        startDate: string;
+        endDate: string;
+        isHalfDay: boolean;
+        totalDays: number | null;
+        leaveType: TypeForRules;
+      },
+      from: string,
+      to: string,
+    ): number =>
+      chargedDaysInWindow(l, from, to, (): WindowRules => {
+        const employee = employeeById.get(l.employeeId);
+        const { weeklyOffs } = resolveShiftConfig(
+          employee?.department ?? null,
+          calendar?.orgPrefs ?? null,
+          calendar?.timeZone,
+        );
+        return {
+          holidayDates: new Set(
+            (calendar?.holidays ?? [])
+              .filter(
+                (h) =>
+                  !h.isOptional &&
+                  (h.departmentId === null ||
+                    h.departmentId === employee?.departmentId),
+              )
+              .map((h) => h.date),
+          ),
+          weeklyOffs,
+          kinds: chargedKindsOf(
+            effectiveLeaveRules(
+              l.leaveType.rules as unknown as LeaveRules,
+              l.leaveType,
+            ),
+          ),
+        };
+      });
+    const lwpDaysByEmployee = new Map<string, number>();
+    for (const l of lwpLeaves) {
+      lwpDaysByEmployee.set(
+        l.employeeId,
+        (lwpDaysByEmployee.get(l.employeeId) ?? 0) +
+          daysInWindow(l, yearStart, yearEnd),
+      );
+    }
     // employeeId -> leaveTypeCode -> { name, days } for the chosen month.
     const takenInPeriod = new Map<
       string,
       Map<string, { name: string; days: number }>
     >();
     if (periodStart) {
-      const m = Number(periodStart.slice(5, 7));
-      const y = Number(periodStart.slice(0, 4));
       for (const l of monthLeaves) {
-        const days = clampLeaveDaysToMonth(l, m, y);
+        const days = daysInWindow(l, periodStart, periodEnd as string);
         if (days <= 0) continue;
         const byType = takenInPeriod.get(l.employeeId) ?? new Map();
         const cur = byType.get(l.leaveType.code) ?? {
@@ -428,6 +737,26 @@ export class LeaveTrackerService {
     const wfhDaysUsedByEmployee = new Map(
       wfhCounts.map((c) => [c.employeeId, c._count._all]),
     );
+    // WFH days count only from the joining date: for anyone who joined after the range starts, a record dated before
+    // they joined (an import or a manual entry) is not counted. Only those few are re-counted individually.
+    const wfhFrom = periodStart ?? yearStart;
+    const wfhTo = periodEnd ?? yearEnd;
+    if (!query.lite) {
+      const lateJoiners = employees.filter((e) => joinedOn(e) > wfhFrom);
+      await Promise.all(
+        lateJoiners.map(async (e) => {
+          const count = await this.scopedPrisma.attendance.count({
+            where: {
+              organizationId,
+              employeeId: e.id,
+              date: { gte: joinedOn(e), lte: wfhTo },
+              workArrangement: WorkArrangement.WFH,
+            },
+          });
+          wfhDaysUsedByEmployee.set(e.id, count);
+        }),
+      );
+    }
 
     // A small `for` loop of internal service calls across the scoped list
     // (never N HTTP-style round trips) — this mirrors, per employee,
@@ -437,15 +766,27 @@ export class LeaveTrackerService {
       // Display code (e.g. "DP-00001"); `employeeId` above is the User.id join key.
       employeeCode: string;
       name: string;
+      department: string | null;
+      designation: string;
+      isActive: boolean;
       leaveBalances: {
         leaveTypeCode: string;
         leaveTypeName: string;
+        // Carried in from the previous leave year, and HR corrections / encashed days - together with `credited`
+        // they make up the total the employee had this year.
+        opening: number;
         credited: number;
+        adjusted: number;
         availed: number;
+        encashed: number;
+        // Applied for but not yet decided.
+        pending: number;
         closing: number;
       }[];
       compOffAvailable: number;
       wfhDaysUsed: number;
+      // Days of approved Leave Without Pay in the leave year (not in the lite response).
+      leaveWithoutPayDays: number;
       // Only when a month was asked for: leave taken in that month, by type.
       leaveTakenInPeriod?: {
         leaveTypeCode: string;
@@ -515,8 +856,12 @@ export class LeaveTrackerService {
             {
               leaveTypeCode: leaveType.code,
               leaveTypeName: leaveType.name,
+              opening: row.opening,
               credited: row.credited,
+              adjusted: row.adjusted,
               availed: row.availed,
+              encashed: row.encashed,
+              pending: row.pending,
               closing:
                 Math.round(
                   (row.closing - (lapsedByRow.get(row.id) ?? 0)) * 100,
@@ -536,9 +881,14 @@ export class LeaveTrackerService {
         employeeId: employee.id,
         employeeCode: employee.employeeId,
         name: employee.name,
+        department: employee.department?.name ?? null,
+        designation: employee.designation,
+        isActive: employee.isActive,
         leaveBalances,
         compOffAvailable,
         wfhDaysUsed,
+        leaveWithoutPayDays:
+          Math.round((lwpDaysByEmployee.get(employee.id) ?? 0) * 100) / 100,
         ...(periodStart && {
           leaveTakenInPeriod: [
             ...(takenInPeriod.get(employee.id) ?? new Map()).entries(),
@@ -653,6 +1003,7 @@ export class LeaveTrackerService {
           ]
         : []),
       { header: 'Comp-Off Available', key: 'compOffAvailable', width: 16 },
+      { header: 'Leave Without Pay', key: 'leaveWithoutPayDays', width: 16 },
       {
         header: query.period ? `WFH Days (${query.period})` : 'WFH Days Used',
         key: 'wfhDaysUsed',
@@ -665,6 +1016,7 @@ export class LeaveTrackerService {
         employeeId: codeByUserId.get(entry.employeeId) ?? '',
         name: entry.name,
         compOffAvailable: entry.compOffAvailable,
+        leaveWithoutPayDays: entry.leaveWithoutPayDays,
         wfhDaysUsed: entry.wfhDaysUsed,
         leaveTakenInPeriod: (entry.leaveTakenInPeriod ?? [])
           .map((t) => `${t.leaveTypeCode} ${t.days}`)

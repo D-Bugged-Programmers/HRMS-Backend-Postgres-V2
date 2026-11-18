@@ -125,6 +125,13 @@ describe('Comp-Offs (e2e)', () => {
       generatedPassword: string;
     };
     outsideDeptEmployeeId = outsideBody.employee.id;
+
+    // Joined before the sample dates used below: a claim / comp-off / record is not accepted for a day before the
+    // person joined.
+    await prisma.user.updateMany({
+      where: { email: { startsWith: 'compoffs-e2e-' } },
+      data: { joiningDate: new Date('2020-01-01T00:00:00.000Z') },
+    });
   });
 
   afterAll(async () => {
@@ -237,11 +244,16 @@ describe('Comp-Offs (e2e)', () => {
     const res = await request(app.getHttpServer())
       .patch(`/comp-offs/${compOffId}/review`)
       .set('Authorization', `Bearer ${managerToken}`)
-      .send({ decision: 'APPROVED', comments: '  Approved - worked the full day  ' })
+      .send({
+        decision: 'APPROVED',
+        comments: '  Approved - worked the full day  ',
+      })
       .expect(200);
     expect((res.body as CompOffBody).status).toBe('APPROVED');
     // The reviewer's note is stored (trimmed) so the employee can see why.
-    expect((res.body as { decisionNote: string | null }).decisionNote).toBe('Approved - worked the full day');
+    expect((res.body as { decisionNote: string | null }).decisionNote).toBe(
+      'Approved - worked the full day',
+    );
   });
 
   it('rejects reviewing an already-reviewed comp-off', async () => {
@@ -274,6 +286,40 @@ describe('Comp-Offs (e2e)', () => {
       })
       .expect(201);
     expect((res.body as CompOffBody).employeeId).toBe(employeeId);
+  });
+
+  it('comp-off cannot be earned for a date before the employee joined', async () => {
+    const created = await request(app.getHttpServer())
+      .post('/employees')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        name: 'New Joiner',
+        email: 'compoffs-e2e-newjoiner@example.test',
+        joiningDate: pastDate(2),
+      })
+      .expect(201);
+    const newJoinerId = (created.body as { employee: { id: string } }).employee
+      .id;
+    const res = await request(app.getHttpServer())
+      .post('/comp-offs')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        earnedForDate: pastDate(5),
+        employeeId: newJoinerId,
+        reason: 'Before joining',
+      })
+      .expect(400);
+    expect(JSON.stringify(res.body)).toMatch(/before the joining date/);
+    // On or after the joining date it works.
+    await request(app.getHttpServer())
+      .post('/comp-offs')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        earnedForDate: pastDate(2),
+        employeeId: newJoinerId,
+        reason: 'On joining day',
+      })
+      .expect(201);
   });
 
   // Duplicate-claim guard — earn() previously had no check at all for
@@ -351,6 +397,7 @@ describe('Comp-Offs (e2e)', () => {
         .send({
           name: 'Sales Manager',
           email: 'compoffs-e2e-manager2@example.test',
+          joiningDate: '2020-01-01',
           role: 'MANAGER',
           departmentId: dept2Id,
         });
@@ -373,6 +420,7 @@ describe('Comp-Offs (e2e)', () => {
         .send({
           name: 'Delegation Test Employee',
           email: 'compoffs-e2e-emp2@example.test',
+          joiningDate: '2020-01-01',
           reportingManagerId: managerId,
         });
       const emp2Login = await request(app.getHttpServer())
@@ -434,14 +482,69 @@ describe('Comp-Offs (e2e)', () => {
     });
   });
 
-  it('accepts a regular working day: the approver decides, the date is not refused up front', async () => {
-    // pastDate() is a Sunday (the weekly off); one day before it is an ordinary Saturday-or-weekday the old rule refused.
+  it('refuses a regular working day: comp-off is only for work on a weekly off or a holiday', async () => {
+    // pastDate() is a Sunday (the weekly off); the Tuesday after it is an ordinary working day, already paid through
+    // attendance.
     const d = new Date(`${pastDate(5)}T00:00:00.000Z`);
-    d.setUTCDate(d.getUTCDate() + 2); // the Tuesday after that Sunday
-    await request(app.getHttpServer())
+    d.setUTCDate(d.getUTCDate() + 2);
+    const res = await request(app.getHttpServer())
       .post('/comp-offs')
       .set('Authorization', `Bearer ${employeeToken}`)
-      .send({ earnedForDate: d.toISOString().slice(0, 10), reason: 'Covered a release on a working day' })
+      .send({
+        earnedForDate: d.toISOString().slice(0, 10),
+        reason: 'Covered a release on a working day',
+      })
+      .expect(400);
+    expect(String((res.body as { message: unknown }).message)).toContain(
+      'regular working day',
+    );
+  });
+
+  it('HR/Admin can withdraw an approved, unused comp-off with a reason; the employee is told', async () => {
+    const created = await request(app.getHttpServer())
+      .post('/comp-offs')
+      .set('Authorization', `Bearer ${employeeToken}`)
+      .send({ earnedForDate: pastDate(7), reason: 'Sunday release' })
       .expect(201);
+    const id = (created.body as { id: string }).id;
+    // Not before it is approved.
+    await request(app.getHttpServer())
+      .patch(`/comp-offs/${id}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'Mistake' })
+      .expect(400);
+    await request(app.getHttpServer())
+      .patch(`/comp-offs/${id}/review`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ decision: 'APPROVED' })
+      .expect(200);
+    // A manager cannot, and a reason is required.
+    await request(app.getHttpServer())
+      .patch(`/comp-offs/${id}/cancel`)
+      .set('Authorization', `Bearer ${managerToken}`)
+      .send({ reason: 'Mistake' })
+      .expect(403);
+    await request(app.getHttpServer())
+      .patch(`/comp-offs/${id}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: '' })
+      .expect(400);
+    const res = await request(app.getHttpServer())
+      .patch(`/comp-offs/${id}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'Approved by mistake' })
+      .expect(200);
+    expect((res.body as { status: string }).status).toBe('REJECTED');
+    expect(
+      await prisma.notification.count({
+        where: { userId: employeeId, title: 'Comp-Off Withdrawn' },
+      }),
+    ).toBe(1);
+    // Withdrawn once is enough.
+    await request(app.getHttpServer())
+      .patch(`/comp-offs/${id}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'Again' })
+      .expect(400);
   });
 });

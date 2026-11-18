@@ -58,9 +58,20 @@ enum ProbationStatus {
 }
 
 model Organization {
+  // Control Center billing (plans, subscriptions, invoices, payments, flag overrides) owned by this organization.
+  ccSubscriptions CcSubscription[]
+  ccInvoices      CcInvoice[]
+  ccPayments      CcPayment[]
+  ccFlagOverrides CcFlagOverride[]
+  ccTickets       CcTicket[]
+  ccOrgProfile    CcOrgProfile?
+  ccAlerts        CcAlert[]
+
   id             String   @id @default(uuid())
   name           String
   timezone       String   @default("Asia/Kolkata")
+  // Live tracking: { intervalSeconds, minDistanceMeters, retentionDays }; null = the built-in defaults.
+  fieldTrackingSettings Json?
   isActive       Boolean  @default(true)
   // The platform (Control Center) status: ACTIVE | PENDING | SUSPENDED | ARCHIVED. isActive is what the app enforces and
   // is false for SUSPENDED and ARCHIVED - nobody in the organisation can sign in or use a session while it is.
@@ -105,6 +116,11 @@ model Organization {
   regularizationAutoApproveHours      Int     @default(24)
   // How many days back an employee may ask to regularize a day (1-31). Was a fixed 7.
   regularizationWindowDays            Int     @default(7)
+  // Caps an Admin/HR can set on regularization requests; null (blank) = no limit, the default. Per employee, per month of
+  // the date being regularized: every request submitted counts except a withdrawn one. And per date: how many times a
+  // rejected request may be sent again.
+  regularizationMonthlyLimit          Int?
+  regularizationResubmitLimit         Int?
   // The month the leave year starts (1 = January = the calendar year, the default). Changing it from January is a
   // one-off transition that EXTENDS the calendar year in progress; leaveYearAnchorYear is the first year that starts
   // in that month. See leave-balances/leave-year.ts.
@@ -173,12 +189,12 @@ model Organization {
   emailDomainStatus            String  @default("not_started")
 
   // Step 4 — Branding (companyLogoUrl doubles as the Step 1 company logo)
-  companyLogoUrl String?
-  faviconUrl     String?
-  reportLogoUrl  String?
-  emailLogoUrl   String?
-  primaryColor   String  @default("#5546e0")
-  secondaryColor String  @default("#14161d")
+  companyLogoUrl  String?
+  faviconUrl      String?
+  reportLogoUrl   String?
+  emailLogoUrl    String?
+  primaryColor    String  @default("#5546e0")
+  secondaryColor  String  @default("#14161d")
   // Large, faded, centered copy of the org's logo behind every page of a
   // generated document — Letters & Certificates (companyLogoUrl),
   // Payslips (each PayrollTemplate's own companyLogoUrl — see
@@ -186,12 +202,17 @@ model Organization {
   // Organization for branding fields; this toggle is a behavior switch,
   // not a branding value, so it's the one exception), and Report exports
   // (reportLogoUrl). See common/pdf-watermark.ts for the actual drawing.
-  watermarkLogo  Boolean @default(false)
+  watermarkLogo   Boolean @default(false)
+  // Optional full-width header and footer strips for generated Letters & Certificates (A4 width). When a header is set
+  // it replaces the built-in logo / name / address block at the top of every page; the footer is drawn at the bottom
+  // of every page. Both null = the built-in header, no footer strip. See letters/letter-pdf.service.ts.
+  letterHeaderUrl String?
+  letterFooterUrl String?
   // Original filename/size per uploaded image, keyed by upload field name
   // (logo/favicon/reportLogo/emailLogo/signature/seal) — the URL columns
   // point at a generated relativeKey, so this is the only place the real
   // uploaded filename survives, for display in Organization Settings.
-  assetMeta      Json    @default("{}")
+  assetMeta       Json    @default("{}")
 
   // Superseded by emailSignatures below (named, multiple) — not every org
   // has one team sending all mail (HR vs Payroll vs IT, say), so a single
@@ -218,7 +239,7 @@ model Organization {
 
   // Step 8 — Payroll & Attendance Preferences (admin-facing, much broader
   // than attendancePayrollPrefs above — see that field's comment).
-  orgPayrollAttendancePrefs Json @default("{\"attendanceMethod\":[\"manual\"],\"defaultShiftStartTime\":\"09:30\",\"defaultShiftEndTime\":\"18:30\",\"defaultLateInThresholdMinutes\":15,\"defaultEarlyOutThresholdMinutes\":15,\"defaultMinHoursForPresent\":8,\"defaultMinHoursForHalfDay\":4,\"defaultWorkWeek\":\"monday-friday\",\"weekendDays\":[0,6],\"defaultWorkingHoursPerDay\":8,\"enableAttendanceImport\":true,\"enableAttendanceRegularization\":true,\"enableOvertime\":false,\"enableCompOff\":true,\"payrollCycle\":\"monthly\",\"salaryPaymentDay\":1,\"payrollFreezeDay\":25,\"enableLeaveEncashment\":true,\"enableTaxRegimeSelection\":true,\"defaultTaxRegime\":\"new\",\"defaultLeavePolicy\":\"\",\"enableHalfDayLeave\":true,\"enableSandwichLeave\":false,\"enableNegativeLeaveBalance\":false,\"carryForwardLeave\":true,\"maxCarryForwardLimit\":15}")
+  orgPayrollAttendancePrefs Json @default("{\"defaultShiftStartTime\":\"09:30\",\"defaultShiftEndTime\":\"18:30\",\"defaultLateInThresholdMinutes\":15,\"defaultEarlyOutThresholdMinutes\":15,\"defaultMinHoursForPresent\":8,\"defaultMinHoursForHalfDay\":4,\"defaultWorkWeek\":\"monday-friday\",\"weekendDays\":[0,6],\"defaultWorkingHoursPerDay\":8}")
 
   // Step 9 — Document Numbering: { [type]: { label, format, resetRule,
   // counter, lastPeriodKey } }. employeeId here is descriptive only — the
@@ -247,6 +268,10 @@ model Organization {
   holidays                         Holiday[]
   workLocations                    WorkLocation[]
   workSchedules                    WorkSchedule[]
+  shiftRules                       ShiftRule[]
+  overtimeRuleSets                 OvertimeRuleSet[]
+  locationPings                    LocationPing[]
+  fieldVisits                      FieldVisit[]
   leaveTypes                       LeaveType[]
   leaveBalances                    LeaveBalance[]
   leaves                           Leave[]
@@ -263,6 +288,9 @@ model Organization {
   attendances                      Attendance[]
   attendanceImportBatches          AttendanceImportBatch[]
   overtimeRecords                  OvertimeRecord[]
+  scheduledReports                 ScheduledReport[]
+  statutoryFilings                 StatutoryFiling[]
+  customFieldDefinitions           CustomFieldDefinition[]
   performanceRatings               PerformanceRating[]
   selfReviews                      SelfReview[]
   companyPerformance               CompanyPerformance[]
@@ -279,6 +307,8 @@ model Organization {
   loanRepayments                   LoanRepayment[]
   settlements                      Settlement[]
   offboardingCases                 OffboardingCase[]
+  joiningChecklists                JoiningChecklist[]
+  companyBrands                    CompanyBrand[]
   resignations                     Resignation[]
   employeeMovements                EmployeeMovement[]
   auditLogs                        AuditLog[]
@@ -304,6 +334,7 @@ model Organization {
   privacySettings                  PrivacySettings?
   privacyNoticeVersions            PrivacyNoticeVersion[]
   consentRecords                   ConsentRecord[]
+  privacyNominees                  PrivacyNominee[]
   dataRequests                     DataRequest[]
   dataProcessors                   DataProcessor[]
   dataSharingRecords               DataSharingRecord[]
@@ -344,6 +375,8 @@ model Department {
   // department's shift fields directly afterward doesn't clear it.
   workScheduleId String?
   workSchedule   WorkSchedule? @relation(fields: [workScheduleId], references: [id])
+  // Monthly overtime hours this department plans to use (Overtime report); null = no budget set.
+  overtimeBudgetHours Float?
 
   // Per-department shift/attendance policy, read by
   // AttendanceService.recalculateAttendanceForDay. Falls back to
@@ -482,6 +515,8 @@ model User {
 
   probationEndDate String?
   probationStatus  ProbationStatus?
+  // YYYY-MM-DD the employee was confirmed from (set when probation is confirmed, or the status is moved to Confirmed).
+  confirmationDate String?
 
   // Profile photo — a relativeKey through the existing generic files
   // module (POST /files/upload/profile-photos), not raw personalData.
@@ -522,9 +557,17 @@ model User {
   // NOT_NEEDED override it. See common/location-requirement.ts.
   locationRequirement         LocationRequirement @default(DEFAULT)
 
-  reportingManagerId String?
-  reportingManager   User?   @relation("ReportingManager", fields: [reportingManagerId], references: [id])
-  subordinates       User[]  @relation("ReportingManager")
+  reportingManagerId            String?
+  reportingManager              User?    @relation("ReportingManager", fields: [reportingManagerId], references: [id])
+  // Further managers beyond the primary one above (a matrix / dotted-line reporting). They can approve and are told about
+  // requests exactly like the primary manager. Plain ids (no FK): they are cleaned up when a manager leaves
+  // (common/manager-reassignment.ts) and validated as active people of the organisation when set.
+  additionalReportingManagerIds String[] @default([])
+  // The last working day once an exit is planned (YYYY-MM-DD), kept in step with the resignation / offboarding case.
+  // Trackers, absence marking and headcounts stop counting the person after this day, even though the account stays
+  // active until Offboarding is completed. Null = no exit planned.
+  exitDate                      String?
+  subordinates                  User[]   @relation("ReportingManager")
 
   managedDepartments Department[] @relation("DepartmentHead")
 
@@ -535,6 +578,9 @@ model User {
   // emails (leave/attendance/payroll decisions) always fire regardless,
   // same as the old system.
   notificationPreferences Json @default("{\"mutedCategories\":[],\"emailEnabled\":true}")
+
+  // Values of the company's own extra profile fields (CustomFieldDefinition), keyed by the field's key.
+  customFields Json @default("{}")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -564,6 +610,9 @@ model User {
   validatedAttendanceImportBatches AttendanceImportBatch[]           @relation("AttendanceImportValidatedBy")
   executedAttendanceImportBatches  AttendanceImportBatch[]           @relation("AttendanceImportExecutedBy")
   overtimeRecords                  OvertimeRecord[]                  @relation("OvertimeEmployee")
+  locationPings                    LocationPing[]                    @relation("LocationPingEmployee")
+  fieldVisits                      FieldVisit[]                      @relation("FieldVisitEmployee")
+  fieldVisitsCreated               FieldVisit[]                      @relation("FieldVisitCreator")
   overtimeRecordsApproved          OvertimeRecord[]                  @relation("OvertimeApprovedBy")
   performanceRatings               PerformanceRating[]               @relation("PerformanceRatingEmployee")
   selfReviews                      SelfReview[]                      @relation("SelfReviewEmployee")
@@ -594,6 +643,19 @@ model User {
   settlements                      Settlement[]                      @relation("SettlementEmployee")
   settlementsProcessed             Settlement[]                      @relation("SettlementProcessedBy")
   offboardingCases                 OffboardingCase[]                 @relation("OffboardingCaseEmployee")
+  joiningChecklists                JoiningChecklist[]                @relation("JoiningChecklistEmployee")
+  // Marked present on every working day without punching: the nightly sweep writes a Present day for the person's own shift timings
+  // (never absent, even on unpaid leave), from alwaysPresentFrom (YYYY-MM-DD) up to their last working day. Payroll counts the days as normal.
+  alwaysPresent                    Boolean                           @default(false)
+  // Live tracking for field staff: set by Admin / HR. While true (and the company has the feature on) the app shares
+  // the person's location during their shift, after they have consented (fieldTrackingConsentAt).
+  fieldTrackingEnabled             Boolean                           @default(false)
+  fieldTrackingConsentAt           DateTime?
+  alwaysPresentFrom                String?
+  // The company name this person's payslips, letters and emails carry (a sister company's name and logo). Null = the company's
+  // own branding. Changing it never changes the employee ID.
+  brandId                          String?
+  brand                            CompanyBrand?                     @relation("UserBrand", fields: [brandId], references: [id])
   offboardingCasesInitiated        OffboardingCase[]                 @relation("OffboardingCaseInitiatedBy")
   offboardingCasesCompleted        OffboardingCase[]                 @relation("OffboardingCaseCompletedBy")
   resignations                     Resignation[]                     @relation("ResignationEmployee")
@@ -821,6 +883,9 @@ model LetterTemplate {
   bodyText String @db.Text
 
   isActive Boolean @default(true)
+  // The stage of the employee's journey a CUSTOM template belongs to (HIRING | PROBATION | EMPLOYMENT | DISCIPLINARY | EXIT); null = not part of the
+  // flow. Built-in templates ignore it - their stage is fixed in letters/letter-stages.ts.
+  journeyStage String?
   // False only for the 7 seeded built-in keys — can't be deleted (Document
   // Numbering and this app's own onboarding/exit flows point at those
   // exact keys), only disabled/re-edited. A custom template can be
@@ -1013,6 +1078,154 @@ model WorkSchedule {
   @@unique([organizationId, name])
   @@index([organizationId])
   @@map("work_schedules")
+}
+
+// A timing that applies to one gender instead of the department's shift (e.g. women 09:30-17:30, everyone else on the
+// department shift). departmentIds empty = the whole company; otherwise only people in those departments. A rule for a
+// department wins over a company-wide one. Read through shift-rules.ts (shiftDepartmentFor), so attendance, lateness,
+// overtime and the check-in reminder all see the same effective shift.
+model ShiftRule {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name         String
+  // Null = no gender condition (a rule for named people only).
+  gender       Gender?
+  startTime    String
+  endTime      String
+  breakMinutes Int?
+  // Empty = every department. Ignored for a rule that names people.
+  departmentIds String[] @default([])
+  // A per-person override: when set, the rule applies to exactly these people (any gender, any department) and wins over
+  // gender and department rules.
+  employeeIds   String[] @default([])
+  isActive      Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+  @@map("shift_rules")
+}
+
+// A named set of overtime rules ("Factory floor", "Office staff"). policy holds the same keys as the company overtime
+// policy (minMinutes, rounding, caps, claim window, creation mode) and any key left out falls back to the company
+// policy. rates optionally overrides the pay multipliers per overtime type. A rule set applies to the people matched by
+// employeeIds, departmentIds or employeeTypes (that order of precedence); anyone it does not match keeps the company
+// policy. effectiveFrom (YYYY-MM-DD) keeps earlier dates on the previous rules.
+model OvertimeRuleSet {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name          String
+  description   String   @default("")
+  policy        Json     @default("{}")
+  rates         Json?
+  employeeIds   String[] @default([])
+  departmentIds String[] @default([])
+  employeeTypes String[] @default([])
+  // Designations (free text on the employee) the set applies to; after people and departments, before employee types.
+  designations  String[] @default([])
+  effectiveFrom String
+  isActive      Boolean  @default(true)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+  @@map("overtime_rule_sets")
+}
+
+// One location sample from a field employee's phone, sent only during a shift by a person Admin / HR switched live
+// tracking on for and who consented. kind LOCATION_OFF is a marker ("location was switched off on the phone") with no
+// coordinates. Purged after the retention period (FieldTrackingService.purgeOld).
+model LocationPing {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  employeeId String
+  employee   User   @relation("LocationPingEmployee", fields: [employeeId], references: [id])
+
+  recordedAt     DateTime
+  latitude       Float?
+  longitude      Float?
+  accuracyMeters Float?
+  speedMps       Float?
+  batteryPercent Int?
+  // The phone reported a mock / spoofed location; the point is kept but flagged.
+  isMock Boolean @default(false)
+  // POINT | LOCATION_OFF
+  kind   String  @default("POINT")
+
+  createdAt DateTime @default(now())
+
+  @@unique([employeeId, recordedAt, kind])
+  @@index([organizationId, employeeId, recordedAt])
+  @@index([organizationId, recordedAt])
+  @@map("location_pings")
+}
+
+enum FieldVisitStatus {
+  PLANNED
+  CHECKED_IN
+  COMPLETED
+  MISSED
+  CANCELLED
+}
+
+// A client visit for a field employee: planned by a manager / HR (or by the employee), then checked in and out from the
+// app at the client's location. The check-in records how far from the client the phone was (checkInDistanceMeters) and
+// whether that is inside the allowed radius, so a manager can see visits made from somewhere else.
+model FieldVisit {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  employeeId String
+  employee   User   @relation("FieldVisitEmployee", fields: [employeeId], references: [id])
+  createdById String
+  createdBy   User   @relation("FieldVisitCreator", fields: [createdById], references: [id])
+
+  clientName String
+  address    String  @default("")
+  // The client's location; null = no location given, so a check-in cannot be measured against it.
+  latitude     Float?
+  longitude    Float?
+  radiusMeters Int    @default(150)
+  purpose      String @default("")
+
+  // YYYY-MM-DD in the company's time zone.
+  scheduledFor String
+  status       FieldVisitStatus @default(PLANNED)
+
+  checkInAt             DateTime?
+  checkInLatitude       Float?
+  checkInLongitude      Float?
+  checkInAccuracyMeters Float?
+  checkInDistanceMeters Float?
+  // null = the client had no location, so it could not be judged.
+  checkInWithinRange    Boolean?
+
+  checkOutAt        DateTime?
+  checkOutLatitude  Float?
+  checkOutLongitude Float?
+  outcome           String    @default("")
+  durationMinutes   Int?
+  // Closed by the nightly job because the employee never checked out.
+  autoClosed Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId, scheduledFor])
+  @@index([organizationId, employeeId, scheduledFor])
+  @@map("field_visits")
 }
 
 enum AllocationType {
@@ -1295,6 +1508,13 @@ model Leave {
   level1ApprovedBy   User?     @relation("LeaveLevel1ApprovedBy", fields: [level1ApprovedById], references: [id])
   level1ApprovedAt   DateTime?
   level1Comments     String    @default("")
+
+  // An approved leave that has already started cannot be cancelled by the employee directly; they ask instead, and a
+  // manager / HR / Admin decides. cancelRequestedAt is set while a request is waiting; a declined one is cleared and
+  // the approver's reason is kept in cancelRequestDeclinedComments so the employee can see it.
+  cancelRequestedAt             DateTime?
+  cancelRequestReason           String    @default("")
+  cancelRequestDeclinedComments String    @default("")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1772,6 +1992,10 @@ model EmployeeTaxDeclaration {
 
   status TaxDeclarationStatus @default(DRAFT)
 
+  // Investment proofs the employee uploaded for HR to check before verifying: [{ section, fileUrl, fileName,
+  // uploadedAt }]. fileUrl is the stored file key (signed on read). Editable until the declaration is VERIFIED.
+  proofs Json @default("[]")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1986,7 +2210,8 @@ model Attendance {
   workArrangementReviewedById   String?
   workArrangementReviewedAt     DateTime?
   workArrangementReviewComments String?
-  // Why the employee asked for Work From Home (set on a WFH request, cleared when the day goes back to the office).
+  // The employee's own reason for a Work From Home request (workArrangementReviewComments is the reviewer's comment).
+  // Every day of a multi-day request carries the same text; cleared when the request is withdrawn.
   workArrangementReason         String?
   // Rows requested together as one multi-day Work From Home request share this id (see wfh-request-days.ts).
   wfhRequestId                  String?
@@ -2393,6 +2618,10 @@ model PayrollRun {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id])
 
+  // The company brand (sister-company name and logo) the employee had when this run was calculated; the payslip shows it. Kept while the
+  // run is editable and frozen once locked, so an old payslip never changes when someone later moves company. Null = the organization's own.
+  brandId String?
+
   employeeId String
   employee   User   @relation("PayrollRunEmployee", fields: [employeeId], references: [id])
 
@@ -2618,6 +2847,8 @@ model Loan {
 
   approvedById String?
   approvedBy   User?   @relation("LoanApprovedBy", fields: [approvedById], references: [id])
+  // The approver's optional note on the decision (shown to the employee).
+  decisionNote String?
 
   closureReason String    @default("")
   closedAt      DateTime?
@@ -2792,6 +3023,65 @@ enum OffboardingStatus {
 // One row per employee exit — tracks the checklist that has to complete
 // before the account is deactivated, mirroring the old system's
 // OffboardingCase.
+// A sister company's face inside one organization: the name, logo and address its employees' payslips, letters and emails carry, and
+// optionally its own employee ID series. Everything else (payroll, leave, statutory, HR) stays shared. An employee with no brand uses
+// the organization's own branding and ID series, so a company that never adds a brand is unaffected.
+model CompanyBrand {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name         String
+  legalName    String?
+  // Stored file keys, like Organization.companyLogoUrl / emailLogoUrl.
+  logoUrl      String?
+  emailLogoUrl String?
+  address      String?
+  contactEmail String?
+  phone        String?
+  website      String?
+
+  // This brand's own employee ID series: the format is a literal prefix plus one counter token (e.g. 'SA-{00000}') and the counter
+  // holds the last number issued. Null format = people in this brand take their ID from the company's series.
+  employeeIdFormat  String?
+  employeeIdCounter Int     @default(0)
+
+  isActive  Boolean @default(true)
+  isDefault Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users User[] @relation("UserBrand")
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+  @@map("company_brands")
+}
+
+
+// The joining checklist of one new joiner: who owns each step (laptop, work email, ID card, team introduction...) and by when.
+// Steps the system can see for itself (assets allocated, documents uploaded, profile completed) are worked out on read, not stored.
+// Created automatically for people who joined recently or are about to (see JoiningChecklistService).
+model JoiningChecklist {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  employeeId String
+  employee   User   @relation("JoiningChecklistEmployee", fields: [employeeId], references: [id])
+
+  // { [itemKey]: { ownerId: string | null, dueDate: 'YYYY-MM-DD' | null, doneAt: ISO string | null, doneById: string | null } }
+  items Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, employeeId])
+  @@index([organizationId])
+  @@map("joining_checklists")
+}
+
 model OffboardingCase {
   id             String       @id @default(uuid())
   organizationId String
@@ -2831,6 +3121,21 @@ model OffboardingCase {
   previousEmploymentStatus EmploymentStatus?
   // HR's explicit note when completing with company assets still unreturned.
   assetOverrideNote        String?
+
+  // Who owns each checklist item and by when: { assets: { ownerId, dueDate }, access: {...}, handover: {...}, interview: {...} }.
+  // Set when the exit starts (defaults), editable by HR; drives the owner's reminders.
+  checklistMeta Json @default("{}")
+  // Items the system ticked by itself (e.g. no assets left allocated): { assets: true, ... }, shown as "done automatically".
+  autoTicked    Json @default("{}")
+  // When the final settlement draft was prepared automatically, and when the case first became ready to complete.
+  fnfPreparedAt     DateTime?
+  readyToCompleteAt DateTime?
+  // When the relieving / experience letters were emailed on completion.
+  lettersSentAt     DateTime?
+  // When the leaver's pending requests were closed automatically after the last working day, and when the final-documents pack
+  // (last six payslips) was emailed to their personal address.
+  pendingClearedAt  DateTime?
+  exitPackSentAt    DateTime?
 
   completedById String?
   completedBy   User?     @relation("OffboardingCaseCompletedBy", fields: [completedById], references: [id])
@@ -2890,10 +3195,17 @@ model AuditLog {
 
   createdAt DateTime @default(now())
 
+  // Tamper evidence: each row stores the hash of the one before it (per organization), so an edited or removed row breaks the chain.
+  // Rows written before this was added have an empty hash and sit outside the chain.
+  seq      Int    @default(autoincrement())
+  prevHash String @default("")
+  hash     String @default("")
+
   @@index([organizationId, module])
   @@index([organizationId, actorId])
   @@index([organizationId, module, createdAt])
   @@index([organizationId, targetId])
+  @@index([organizationId, seq])
   @@map("audit_logs")
 }
 
@@ -3008,12 +3320,20 @@ model PolicyDocument {
   fileUrl  String
   fileName String
 
+  // Text read from the PDF the first time Ask HR searches it (null = not read yet, '' = nothing readable, e.g. a scanned PDF).
+  contentText String?
+  // Generated by the database from contentText (word index for Ask HR's search); never written by the app.
+  contentSearch Unsupported("tsvector")?
+
   isPublished Boolean @default(true)
 
   // Only documents HR flags (compliance policies — Code of Conduct, POSH, IT
   // Acceptable Use, ...) ask employees to e-acknowledge; everything else is
   // view/download only. Carried over to each new version.
   requiresAcknowledgment Boolean @default(false)
+
+  // When this document is next due for a look; past it, the library marks it "Due for review".
+  reviewDate DateTime?
 
   uploadedById String?
   uploadedBy   User?   @relation("PolicyDocumentUploadedBy", fields: [uploadedById], references: [id])
@@ -3035,6 +3355,7 @@ model PolicyDocument {
   updatedAt DateTime @updatedAt
 
   @@index([organizationId, createdAt])
+  @@index([contentSearch], type: Gin, map: "policy_documents_contentSearch_idx")
   @@map("policy_documents")
 }
 
@@ -3139,6 +3460,8 @@ model OrgListItem {
   // that depends on a specific one of those existing. A built-in
   // category's name is locked and it can't be deleted; isActive still is.
   isSystemDefault Boolean @default(false)
+  // Position within its list (lower first); 0 for every list nobody has reordered.
+  sortOrder Int @default(0)
 
   // Only ever populated for type=ASSET_CATEGORY — the Asset Inventory
   // master is the one OrgListType consumer holding a real FK back here
@@ -3159,10 +3482,6 @@ enum NotificationCategory {
   PAYROLL
   ATTENDANCE
   GENERAL
-  // Defined for parity with the old system's enum, but nothing creates one
-  // — no controller old-side ever fires an ONBOARDING-category
-  // notification. Kept for schema fidelity, not because it's used.
-  ONBOARDING
 }
 
 model Notification {
@@ -3485,6 +3804,25 @@ model PrivacyNoticeVersion {
 }
 
 // Append-only: a withdrawal is a new row, never an update of the grant.
+// The person an employee names to exercise their privacy rights for them if they die or cannot act (DPDP right to nominate).
+model PrivacyNominee {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  userId       String
+  name         String
+  relationship String @default("")
+  email        String @default("")
+  phone        String @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, userId])
+  @@map("privacy_nominees")
+}
+
 model ConsentRecord {
   id             String       @id @default(uuid())
   organizationId String
@@ -3544,6 +3882,9 @@ model DataProcessor {
   status           PrivacyRecordStatus @default(ACTIVE)
   isSystemDetected Boolean             @default(false)
   notes            String              @default("")
+  // Whether the data leaves India (DPDP cross-border transfer), and to which country.
+  crossBorder        Boolean @default(false)
+  crossBorderCountry String  @default("")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -3563,6 +3904,8 @@ model DataSharingRecord {
   integration    String              @default("")
   status         PrivacyRecordStatus @default(ACTIVE)
   isAutoRecorded Boolean             @default(false)
+  crossBorder        Boolean @default(false)
+  crossBorderCountry String  @default("")
   sharedAt       DateTime            @default(now())
   recordedById   String?
 
@@ -3593,6 +3936,13 @@ model BreachIncident {
   investigation      String                   @default("")
   actionsTaken       String                   @default("")
   notificationStatus BreachNotificationStatus @default(NOT_ASSESSED)
+  // DPDP: the Data Protection Board gets a detailed report within 72 hours of detection, and the affected people are told
+  // without delay. These record when each was done; the due time is detectedAt + 72 hours (worked out, not stored).
+  boardReportedAt      DateTime?
+  principalsNotifiedAt DateTime?
+  // When the Admins were last reminded about the Board report (24 hours left, then overdue), so each reminder goes once.
+  dueSoonRemindedAt    DateTime?
+  overdueRemindedAt    DateTime?
   resolution         String                   @default("")
   status             BreachStatus             @default(OPEN)
   closedAt           DateTime?
@@ -4047,4 +4397,445 @@ model PushDevice {
   @@unique([token])
   @@index([organizationId, userId])
   @@map("push_devices")
+}
+
+// A report the Admin/HR asked to have emailed on a schedule (Reports > Scheduled). The period each run covers follows the
+// frequency (yesterday / the last 7 days / last month), so nothing about dates is stored here.
+model ScheduledReport {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name         String
+  // One of the keys in reports/scheduled-report-catalog.ts.
+  reportKey    String
+  // xlsx | csv | pdf
+  format       String   @default("xlsx")
+  // DAILY | WEEKLY | MONTHLY
+  frequency    String
+  // WEEKLY: 0 (Sunday) - 6. MONTHLY: 1 - 28. Unused for DAILY.
+  dayOfWeek    Int?
+  dayOfMonth   Int?
+  // Hour of the day (0-23) in the organization's own timezone the email goes out.
+  sendHour     Int      @default(8)
+  recipients   String[]
+  // Optional department filter for the reports that take one.
+  departmentId String?
+  enabled      Boolean  @default(true)
+
+  // Whoever created it: the reports run with their access, and the schedule stops if they are no longer an active Admin/HR.
+  createdById String
+
+  // The organization's own calendar day of the last run - what keeps a run from going out twice in one day.
+  lastRunDate   String?
+  lastRunAt     DateTime?
+  lastRunStatus String?
+  lastRunError  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@map("scheduled_reports")
+}
+
+// One statutory return / payment HR has confirmed as filed (Statutory Compliance > Filing tracker). The due date and kind come from the
+// calendar in scheduled-reminders/reminder-dates.ts, so nothing about the schedule is stored - only that this one was done.
+model StatutoryFiling {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // PF | ESI | PT | TDS | 24Q | LWF
+  key      String
+  // The due date it was for (YYYY-MM-DD) - with the key, identifies the filing.
+  dueDate  String
+  filedAt  DateTime @default(now())
+  filedById String
+
+  @@unique([organizationId, key, dueDate])
+  @@index([organizationId])
+  @@map("statutory_filings")
+}
+
+enum CustomFieldType {
+  TEXT
+  LONG_TEXT
+  NUMBER
+  DATE
+  DROPDOWN
+  CHECKBOX
+}
+
+// An extra field a company adds to every employee profile (Organization > Custom Fields) - blood group, vehicle number,
+// T-shirt size - so the data does not need a code change per company. The values live on User.customFields keyed by
+// `key`. A field is switched off (isActive false) rather than deleted, so values already entered are kept.
+model CustomFieldDefinition {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Stable id of the field, made from the label when it is created and never changed (the values are stored under it).
+  key              String
+  label            String
+  type             CustomFieldType
+  // The choices of a DROPDOWN, as a list of strings.
+  options          Json?
+  required         Boolean         @default(false)
+  helpText         String          @default("")
+  // The heading it is shown under on the profile.
+  section          String          @default("Additional information")
+  // Whether the employee may fill in / change their own value (otherwise only HR and Admin).
+  employeeEditable Boolean         @default(false)
+  isActive         Boolean         @default(true)
+  displayOrder     Int             @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, key])
+  @@index([organizationId])
+  @@map("custom_field_definitions")
+}
+
+// -- Control Center (platform) Super Admins ---------------------------------------------------------------------------
+// Accounts for the vendor's Control Panel. They belong to no company (no organizationId), have their own login, token
+// secret and session table, and can never be used on the HRMS itself - and an HRMS user can never be one of these.
+enum SuperAdminRole {
+  OWNER
+  ADMIN
+  SUPPORT
+  BILLING
+  READ_ONLY
+}
+
+enum SuperAdminStatus {
+  ACTIVE
+  INVITED
+  DEACTIVATED
+}
+
+model SuperAdmin {
+  id           String           @id @default(uuid())
+  // Stored lower-case.
+  email        String           @unique
+  name         String
+  // Null until an invited admin sets a password.
+  passwordHash String?
+  role         SuperAdminRole   @default(READ_ONLY)
+  status       SuperAdminStatus @default(ACTIVE)
+  // Two-factor sign-in is not built yet; the flag is carried so the panel's account screen has something to show.
+  mfaEnabled   Boolean          @default(false)
+  lastLoginAt  DateTime?
+
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
+  // SHA-256 of the emailed reset token (never the token itself) and when it stops working.
+  passwordResetTokenHash String?
+  passwordResetExpires   DateTime?
+
+  sessions SuperAdminSession[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("super_admins")
+}
+
+model SuperAdminSession {
+  id           String     @id @default(uuid())
+  superAdminId String
+  superAdmin   SuperAdmin @relation(fields: [superAdminId], references: [id], onDelete: Cascade)
+
+  // SHA-256 of the refresh token held in the browser's httpOnly cookie.
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now())
+
+  @@index([superAdminId])
+  @@map("super_admin_sessions")
+}
+
+// ---- Control Center: plans, subscriptions, billing, coupons, feature flags ----
+// Status/type columns are plain strings (the values are validated in cc-*.service.ts) so a new status never needs a migration.
+// Every table that belongs to a customer carries organizationId, which is how "delete organization" finds and removes it.
+
+model CcPlan {
+  id                   String           @id @default(uuid())
+  name                 String
+  code                 String           @unique
+  billingModel         String           @default("PER_EMPLOYEE") // PER_EMPLOYEE | FIXED_TERM
+  currency             String           @default("INR")
+  trialDays            Int              @default(0)
+  perEmployeeRate      Decimal?         @db.Decimal(12, 2)
+  termMonths           Int?
+  basePrice            Decimal?         @db.Decimal(12, 2)
+  includedEmployees    Int?
+  perExtraEmployeeRate Decimal?         @db.Decimal(12, 2)
+  seatLimit            Int?
+  gstApplicable        Boolean          @default(true)
+  whiteLabelEligible   Boolean          @default(false)
+  features             Json             @default("[]")
+  limits               Json             @default("{}")
+  isPublic             Boolean          @default(true)
+  status               String           @default("ACTIVE") // ACTIVE | DEPRECATED | DRAFT
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+  subscriptions        CcSubscription[]
+
+  @@map("cc_plans")
+}
+
+model CcSubscription {
+  id                    String       @id @default(uuid())
+  organizationId        String
+  organization          Organization @relation(fields: [organizationId], references: [id])
+  planId                String
+  plan                  CcPlan       @relation(fields: [planId], references: [id])
+  term                  String       @default("MONTHLY") // MONTHLY | YEARLY | FIVE_YEAR | TEN_YEAR
+  termMonths            Int          @default(1)
+  includedEmployeesSnap Int?
+  // Negotiated per-employee monthly rate (Enterprise, or any special deal). Null = use the plan's own rate.
+  customPerEmployeeRate Decimal?     @db.Decimal(12, 2)
+  // Hard limit: HRMS refuses to add or reactivate an employee once this many are active. Null = no limit (billing still
+  // charges for extra employees at the plan's extra rate, and the panel raises an over-limit alert).
+  maxEmployees          Int?
+  status                String       @default("TRIALING") // TRIALING | ACTIVE | PAST_DUE | CANCELED | EXPIRED
+  trialEndsAt           DateTime?
+  currentPeriodEnd      DateTime?
+  cancelAtPeriodEnd     Boolean      @default(false)
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+
+  @@index([organizationId])
+  @@map("cc_subscriptions")
+}
+
+model CcInvoice {
+  id             String       @id @default(uuid())
+  number         String       @unique
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  status         String       @default("OPEN") // DRAFT | OPEN | PAID | VOID | UNCOLLECTIBLE
+  subtotal       Decimal      @db.Decimal(12, 2)
+  discount       Decimal      @default(0) @db.Decimal(12, 2)
+  tax            Decimal      @default(0) @db.Decimal(12, 2)
+  total          Decimal      @db.Decimal(12, 2)
+  currency       String       @default("INR")
+  dueDate        DateTime?
+  lineItems      Json         @default("[]")
+  couponCode     String?
+  paidAt         DateTime?
+  paymentRef     String?
+  // The subscription period this invoice pays for, so paying it can extend the subscription.
+  subscriptionId String?
+  periodMonths   Int?
+  source         String       @default("MANUAL") // MANUAL | GENERATED | AUTO
+  lastReminderAt DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  payments       CcPayment[]
+
+  @@index([organizationId])
+  @@map("cc_invoices")
+}
+
+model CcPayment {
+  id             String       @id @default(uuid())
+  invoiceId      String
+  invoice        CcInvoice    @relation(fields: [invoiceId], references: [id])
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  amount         Decimal      @db.Decimal(12, 2)
+  currency       String       @default("INR")
+  provider       String
+  providerRef    String
+  last4          String?
+  status         String       @default("SUCCEEDED") // PENDING | SUCCEEDED | FAILED | REFUNDED | PARTIALLY_REFUNDED
+  refundedAmount Decimal      @default(0) @db.Decimal(12, 2)
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId])
+  @@map("cc_payments")
+}
+
+model CcCoupon {
+  id               String    @id @default(uuid())
+  code             String    @unique
+  type             String // PERCENT | FIXED
+  value            Decimal   @db.Decimal(12, 2)
+  currency         String?
+  maxRedemptions   Int?
+  redeemedCount    Int       @default(0)
+  perOrgLimit      Int?
+  validFrom        DateTime?
+  validUntil       DateTime?
+  appliesToPlanIds Json      @default("[]")
+  status           String    @default("ACTIVE") // ACTIVE | INACTIVE | EXPIRED
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@map("cc_coupons")
+}
+
+model CcFeatureFlag {
+  key          String           @id
+  description  String           @default("")
+  defaultValue Json             @default("false")
+  status       String           @default("ACTIVE") // ACTIVE | INACTIVE
+  updatedAt    DateTime         @updatedAt
+  overrides    CcFlagOverride[]
+
+  @@map("cc_feature_flags")
+}
+
+model CcFlagOverride {
+  id             String        @id @default(uuid())
+  flagKey        String
+  flag           CcFeatureFlag @relation(fields: [flagKey], references: [key], onDelete: Cascade)
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  value          Json
+  updatedAt      DateTime      @updatedAt
+
+  @@unique([flagKey, organizationId])
+  @@index([organizationId])
+  @@map("cc_flag_overrides")
+}
+
+// ---- Control Center: support tickets, announcements, audit trail, platform settings ----
+model CcTicket {
+  id             String            @id @default(uuid())
+  organizationId String?
+  organization   Organization?     @relation(fields: [organizationId], references: [id])
+  subject        String
+  body           String
+  status         String            @default("OPEN") // OPEN | PENDING | RESOLVED | CLOSED
+  priority       String            @default("NORMAL") // LOW | NORMAL | HIGH | URGENT
+  assigneeId     String? // a super_admins.id
+  createdById    String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  comments       CcTicketComment[]
+
+  @@index([organizationId])
+  @@map("cc_tickets")
+}
+
+model CcTicketComment {
+  id             String   @id @default(uuid())
+  ticketId       String
+  ticket         CcTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  // Copied from the ticket so deleting an organization also clears its ticket comments.
+  organizationId String?
+  authorId       String
+  authorName     String
+  body           String
+  internal       Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@index([ticketId])
+  @@map("cc_ticket_comments")
+}
+
+model CcAnnouncement {
+  id          String    @id @default(uuid())
+  title       String
+  body        String
+  audience    String    @default("ALL") // ALL | PLAN | ORG
+  audienceRef String? // plan id or organization id
+  startsAt    DateTime?
+  endsAt      DateTime?
+  severity    String    @default("INFO") // INFO | WARNING | CRITICAL
+  published   Boolean   @default(false) // status (DRAFT/SCHEDULED/LIVE/ENDED) is derived from this and the dates
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@map("cc_announcements")
+}
+
+// Append-only record of what Super Admins did in the panel. Not tied to an organization on purpose: it must survive
+// deleting one.
+model CcAuditLog {
+  id         String   @id @default(uuid())
+  at         DateTime @default(now())
+  actorId    String
+  actorEmail String
+  ip         String   @default("")
+  userAgent  String   @default("")
+  action     String
+  entityType String   @default("")
+  entityId   String   @default("")
+  before     Json?
+  after      Json?
+  context    Json?
+  requestId  String   @default("")
+
+  @@index([at])
+  @@index([actorId])
+  @@map("cc_audit_log")
+}
+
+model CcSetting {
+  key         String   @id
+  value       Json
+  type        String   @default("string") // string | number | bool | json
+  restricted  Boolean  @default(false) // restricted settings are shown read-only in the panel
+  description String   @default("")
+  updatedAt   DateTime @updatedAt
+
+  @@map("cc_settings")
+}
+
+// ---- Control Center: account notes and alerts ----
+// What the platform team knows about a customer (not the customer's own data): who looks after them, how to reach them, notes.
+model CcOrgProfile {
+  organizationId String       @id
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  accountManager String?
+  contactName    String?
+  contactPhone   String?
+  tags           Json         @default("[]")
+  notes          String       @default("")
+  churnReason    String?
+  updatedAt      DateTime     @updatedAt
+
+  @@map("cc_org_profiles")
+}
+
+// Things a Super Admin should know (new sign-up, overdue invoice, pilot ended, over the plan's employee limit).
+// dedupeKey makes each event raise one alert, however often the daily job looks.
+model CcAlert {
+  id             String        @id @default(uuid())
+  kind           String // SIGNUP | OVERDUE | PILOT_ENDED | OVER_LIMIT | TICKET | AUTO_SUSPENDED
+  title          String
+  body           String        @default("")
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  dedupeKey      String        @unique
+  readAt         DateTime?
+  createdAt      DateTime      @default(now())
+
+  @@index([createdAt])
+  @@map("cc_alerts")
+}
+
+// One row per Ask HR question: who asked, the words, which kinds of answer came back and whether anything was found.
+// Lets HR see the questions that found nothing (a missing policy). Plain ids, no relations; rows older than 90 days are
+// deleted nightly (AskHrService.purgeOld).
+model AskHrQuery {
+  id             String   @id @default(uuid())
+  organizationId String
+  userId         String
+  question       String
+  kinds          String[] @default([])
+  answered       Boolean
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, createdAt])
+  @@map("ask_hr_queries")
 }

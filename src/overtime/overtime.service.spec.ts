@@ -31,6 +31,7 @@ function build(
     rates?: Row | null;
     compOffClaimed?: boolean;
     workCompensation?: Row;
+    prefs?: Row;
   } = {},
 ) {
   const records: Row[] = (opts.records ?? []).map((r) => ({
@@ -55,6 +56,8 @@ function build(
       findFirst: async () =>
         opts.attendance === undefined ? null : opts.attendance,
     },
+    overtimeRuleSet: { findMany: jest.fn().mockResolvedValue([]) },
+    shiftRule: { findMany: async () => [] },
     payrollSettings: {
       findFirst: async () =>
         opts.rates === null
@@ -74,6 +77,7 @@ function build(
     organization: {
       findFirst: async () => ({
         policies: {},
+        orgPayrollAttendancePrefs: opts.prefs ?? null,
         attendancePayrollPrefs: null,
         timezone: 'Asia/Kolkata',
       }),
@@ -87,6 +91,8 @@ function build(
         return row;
       },
     },
+    // Which departments the reviewer heads (common/dept-scope.ts): none here.
+    department: { findMany: async () => [] },
     user: {
       findFirst: async () => ({
         id: 'e1',
@@ -96,6 +102,8 @@ function build(
       }),
     },
     overtimeRecord: {
+      // The Admin's monthly-cap usage lookup: nothing is capped in these tests, so it only has to answer.
+      findMany: async () => [],
       findFirst: async (a: Row) => {
         const r = records.find((x) => match(x, a?.where));
         return r ? { ...r } : null;
@@ -188,6 +196,16 @@ describe('overtime: logging', () => {
       'org',
     );
     expect(r).toMatchObject({ type: 'REGULAR', rateMultiplier: 2 });
+  });
+
+  it('records ordinary overtime that ends inside the night window as night overtime', async () => {
+    const { service } = build({
+      prefs: { overtimePolicy: { nightStart: '22:00', nightEnd: '06:00' } },
+      attendance: { status: 'PRESENT', workDurationMinutes: 600, outTime: new Date('2026-10-05T18:00:00Z') },
+    });
+    const r = await service.log({ date: '2026-10-05', hours: 1 } as never, emp, 'org');
+    // 18:00 UTC is 23:30 in Asia/Kolkata, inside 22:00-06:00.
+    expect(r).toMatchObject({ type: 'NIGHT', rateMultiplier: 2 });
   });
 
   it('is refused while the Overtime Pay component is off', async () => {
@@ -356,16 +374,16 @@ describe('overtime: review', () => {
       expect(compOffs).toHaveLength(0);
     });
 
-    it('comp-off + 1 day pay: stores both and adds an approved comp-off with an expiry', async () => {
+    it('comp-off: adds an approved comp-off with an expiry and no pay days', async () => {
       const { service, records, compOffs } = build({ records: [weekend()] });
       await service.review(
         'ot1',
-        { status: 'APPROVED', compensationKey: 'COMP_OFF_PAY_1' } as never,
+        { status: 'APPROVED', compensationKey: 'COMP_OFF' } as never,
         hr,
         'org',
       );
       expect(records[0]).toMatchObject({
-        payDays: 1,
+        payDays: 0,
         compOffDays: 1,
         compOffId: 'co1',
       });
@@ -376,6 +394,20 @@ describe('overtime: review', () => {
         status: 'APPROVED',
         expiryDate: '2027-01-09',
       });
+    });
+
+    it('one day, one benefit: a saved "comp-off + pay" option is never offered and cannot be chosen', async () => {
+      const { service, records, compOffs } = build({ records: [weekend()] });
+      await expect(
+        service.review(
+          'ot1',
+          { status: 'APPROVED', compensationKey: 'COMP_OFF_PAY_2' } as never,
+          hr,
+          'org',
+        ),
+      ).rejects.toThrow(/not available/);
+      expect(records[0].status).toBe('PENDING');
+      expect(compOffs).toHaveLength(0);
     });
 
     it('uses the organisation default when the approver picks nothing', async () => {

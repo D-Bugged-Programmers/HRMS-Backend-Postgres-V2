@@ -103,9 +103,11 @@ export class PayslipEmailWorker implements OnModuleInit, OnModuleDestroy {
         subject: title,
         html: `Your salary for ${run.month}/${run.year} has been paid. Net pay: ${run.netPay}.`,
       },
+      { brandId: run.brandId },
     );
     await this.emailService.send({
       organizationId,
+      allowInactive: true, // addressed to a leaver on purpose
       to: employee.email,
       subject: rendered.subject,
       html: rendered.html,

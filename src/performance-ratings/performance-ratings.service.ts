@@ -7,6 +7,9 @@
 // write directly through upsert() (publishing instantly, status APPROVED) for an employee who has no
 // reportingManagerId at all — once a manager is assigned, ADMIN/HR's role narrows to approve()/reject()
 // only, no override.
+import { deptScopedEmployeeIds, inReviewerScope, isScopedReviewer } from '../common/dept-scope';
+import { payoutForRating } from './rating-payout';
+import { markPayrollStaleForFinancialYear } from '../payroll/payroll-period-guard';
 import { EMPLOYEE_RELATION_ORDER_BY } from '../common/employee-order';
 import {
   BadRequestException,
@@ -69,24 +72,11 @@ export class PerformanceRatingsService {
       // other self-service list endpoint in this codebase.
       where.employeeId = actor.id;
       where.status = PerformanceRatingStatus.APPROVED;
-    } else if (actor.role === Role.MANAGER) {
-      // Own department OR direct reports (a reportee may sit in another department).
-      const deptEmployees = await this.scopedPrisma.user.findMany({
-        where: {
-          organizationId,
-          // A departmentless manager only gets direct reports — a
-          // `departmentId: null` branch would match every unassigned
-          // employee in the org (same guard as deptScopedEmployeeIds).
-          OR: [
-            ...(actor.departmentId !== null
-              ? [{ departmentId: actor.departmentId }]
-              : []),
-            { reportingManagerId: actor.id },
-          ],
-        },
-        select: { id: true },
-      });
-      const deptEmployeeIds = new Set(deptEmployees.map((e) => e.id));
+    } else if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
+      // The departments they head and their reporting line (see reviewerScope).
+      const deptEmployeeIds = new Set(
+        await deptScopedEmployeeIds(this.scopedPrisma, actor, organizationId),
+      );
       where.employeeId =
         query.employeeId && deptEmployeeIds.has(query.employeeId)
           ? query.employeeId
@@ -106,6 +96,8 @@ export class PerformanceRatingsService {
           where,
           include: {
             employee: { select: { id: true, name: true, employeeId: true } },
+            // Who gave the rating, so a self-rating (an Admin may rate themselves) is visible as such.
+            ratedBy: { select: { id: true, name: true } },
           },
           orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { financialYear: 'desc' }],
           skip: skip(query.page, query.limit),
@@ -129,6 +121,8 @@ export class PerformanceRatingsService {
       | 'PERFORMANCE_RATING_UPDATED'
       | 'PERFORMANCE_RATING_APPROVED',
   ): Promise<void> {
+    // The published payout percentage scales this employee's variable pay: their calculated payrolls for the year are out of date.
+    await markPayrollStaleForFinancialYear(this.scopedPrisma, organizationId, rating.financialYear, { employeeId: rating.employeeId });
     await this.auditLogService.log({
       actorId,
       action: actionLabel,
@@ -216,16 +210,22 @@ export class PerformanceRatingsService {
       if (employee.id === actor.id) {
         throw new ForbiddenException('You cannot rate yourself.');
       }
-      if (
-        // null === null must not count as "same department".
-        (actor.departmentId === null ||
-          employee.departmentId !== actor.departmentId) &&
-        employee.reportingManagerId !== actor.id
-      ) {
+      if (!(await inReviewerScope(this.scopedPrisma, actor, organizationId, employee.id))) {
         throw new ForbiddenException(
-          'You may only rate employees in your own department or who report to you.',
+          'You may only rate employees in the departments you head or who report to you.',
         );
       }
+    } else if (employee.id === actor.id && actor.role !== Role.ADMIN) {
+      // HR rating themselves would publish the rating (and its variable-pay percentage) with nobody else involved; the
+      // same rule as approving your own request. An Admin has nobody above them, so may.
+      throw new ForbiddenException('You cannot rate yourself. Ask an Admin or another HR user.');
+    } else if (
+      actor.role === Role.HR &&
+      !(await inReviewerScope(this.scopedPrisma, actor, organizationId, employee.id))
+    ) {
+      throw new ForbiddenException(
+        'You may only rate employees in the departments you head or who report to you.',
+      );
     } else if (employee.reportingManager?.role === Role.MANAGER) {
       // No override: once an employee has a genuine MANAGER-role reviewer
       // assigned, ADMIN/HR can no longer originate a rating for them
@@ -285,7 +285,8 @@ export class PerformanceRatingsService {
 
     const data = {
       rating: dto.rating,
-      payoutPercentage: dto.payoutPercentage ?? 100,
+      // Follows the rating (rating-payout.ts); a payout sent with it is not used.
+      payoutPercentage: payoutForRating(dto.rating),
       notes: dto.notes ?? '',
       ratedById: actor.id,
       status,
@@ -366,7 +367,7 @@ export class PerformanceRatingsService {
       },
       data: {
         rating: dto.rating ?? existing.rating,
-        payoutPercentage: dto.payoutPercentage ?? existing.payoutPercentage,
+        payoutPercentage: payoutForRating(dto.rating ?? existing.rating),
         status: PerformanceRatingStatus.APPROVED,
         approvedById: actor.id,
         approvedAt: new Date(),

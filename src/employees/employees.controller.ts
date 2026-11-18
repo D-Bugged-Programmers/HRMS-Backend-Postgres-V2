@@ -19,6 +19,12 @@ import { EmployeeProfileService } from './employee-profile.service';
 import { CreateEmployeeDto } from './dto/create-employee.dto';
 import { BulkCreateEmployeesDto } from './dto/bulk-create-employees.dto';
 import { UpdateEmployeeDto } from './dto/update-employee.dto';
+import { BulkSetAlwaysPresentDto } from './dto/bulk-set-always-present.dto';
+import { BulkResetPasswordsDto, CredentialsExportLogDto } from './dto/bulk-reset-passwords.dto';
+import { BulkSetCompanyDto } from './dto/bulk-set-company.dto';
+import { BulkUpdateEmployeesDto } from './dto/bulk-update-employees.dto';
+import { SendProfileRemindersDto } from './dto/send-profile-reminders.dto';
+import { ReassignReportsDto } from './dto/reassign-reports.dto';
 import { DeactivateEmployeeDto } from './dto/deactivate-employee.dto';
 import { ListEmployeesQueryDto } from './dto/list-employees-query.dto';
 import { UpdatePersonalDataDto } from './dto/update-personal-data.dto';
@@ -81,23 +87,81 @@ export class EmployeesController {
     return this.employeesService.findAll(query, caller, caller.organizationId);
   }
 
-  // Everyone can see who reports to whom (name, designation, department only). Before the :id routes.
-  @Get('org-chart')
-  @Roles(Role.ADMIN, Role.HR, Role.MANAGER, Role.EMPLOYEE)
-  @UseGuards(RolesGuard)
-  orgChart(@CurrentUser() caller: Caller) {
-    return this.employeeProfileService.orgChart(caller.organizationId);
-  }
-
-  // Declared before the :id routes so "probation-tracker" is not read as an id.
+  // Who is on probation and when it ends, most urgent first. ADMIN/HR: everyone; MANAGER: their department.
   @Get('probation-tracker')
   @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
   @UseGuards(RolesGuard)
   probationTracker(@CurrentUser() caller: Caller) {
-    return this.employeeProfileService.probationTracker(
+    return this.employeesService.probationTracker(
       caller,
       caller.organizationId,
     );
+  }
+
+  // The reporting tree for the Org Chart. Open to every role (name, designation, department only); declared before the
+  // :id routes so "org-chart" is not read as an id.
+  @Get('org-chart')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER, Role.EMPLOYEE)
+  @UseGuards(RolesGuard)
+  orgChart(@CurrentUser() caller: Caller) {
+    return this.employeesService.orgChart(caller.organizationId);
+  }
+
+  // Gives several employees the same company (sister-company name), or none. Before the :id routes so "bulk-company" is not an id.
+  @Post('bulk-company')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  bulkSetCompany(@Body() dto: BulkSetCompanyDto, @CurrentUser() caller: Caller) {
+    return this.employeesService.bulkSetCompany(dto.employeeIds, dto.brandId, caller, caller.organizationId);
+  }
+
+  // New one-time passwords for the chosen people, returned once for the credentials sheet. Before the :id routes.
+  @Post('bulk-reset-passwords')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  bulkResetPasswords(@Body() dto: BulkResetPasswordsDto, @CurrentUser() caller: Caller) {
+    return this.employeesService.bulkResetPasswords(dto.employeeIds, caller, caller.organizationId);
+  }
+
+  // Records that a credentials sheet was downloaded (audit trail).
+  @Post('credentials-export-log')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  credentialsExportLog(@Body() dto: CredentialsExportLogDto, @CurrentUser() caller: Caller) {
+    return this.employeesService.logCredentialsExport(dto.count, dto.source, caller, caller.organizationId);
+  }
+
+  // Marks several employees present on every working day (or back to normal). Before the :id routes so the path is not read as an id.
+  @Post('bulk-always-present')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  bulkSetAlwaysPresent(@Body() dto: BulkSetAlwaysPresentDto, @CurrentUser() caller: Caller) {
+    return this.employeesService.bulkSetAlwaysPresent(dto.employeeIds, dto.alwaysPresent, dto.from, caller, caller.organizationId);
+  }
+
+  // Moves several employees to the same department / reporting manager / work location / designation in one step. Each one goes
+  // through the normal single-employee update, so every rule (and the history entry) still applies; failures are listed, not fatal.
+  @Post('bulk-update')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  bulkUpdate(@Body() dto: BulkUpdateEmployeesDto, @CurrentUser() caller: Caller) {
+    return this.employeesService.bulkUpdate(dto, caller, caller.organizationId);
+  }
+
+  // Sends the "finish your profile" reminder to the chosen employees, or to everyone below 100%. Before the :id routes.
+  @Post('profile-reminders')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  sendProfileReminders(@Body() dto: SendProfileRemindersDto, @CurrentUser() caller: Caller) {
+    return this.employeeProfileService.sendProfileReminders(dto.employeeIds, caller, caller.organizationId);
+  }
+
+  // How complete every active employee's profile is, lowest first (HR/Admin). Before the :id routes so "profile-scores" is not read as an id.
+  @Get('profile-scores')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  profileScores(@CurrentUser() caller: Caller) {
+    return this.employeeProfileService.profileScores(caller, caller.organizationId);
   }
 
   // Mandatory-document progress for everyone still onboarding - feeds the Pending Onboarding list. Declared before
@@ -164,11 +228,43 @@ export class EmployeesController {
     );
   }
 
+  // Moves everyone who reports to this manager (primary or additional) to a replacement in one step - used when a manager
+  // resigns, before their offboarding completes.
+  @Post(':id/reassign-reports')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  reassignReports(
+    @Param('id') id: string,
+    @Body() dto: ReassignReportsDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.employeesService.reassignAllReports(id, dto.newManagerId, caller, caller.organizationId);
+  }
+
+  // A one-time password for someone with no email to receive a link, shown once to HR / Admin.
+  @Post(':id/reset-password')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  resetPassword(@Param('id') id: string, @CurrentUser() caller: Caller) {
+    return this.employeesService.resetPassword(id, caller, caller.organizationId);
+  }
+
   @Post(':id/resend-credentials')
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
   resendCredentials(@Param('id') id: string, @CurrentUser() caller: Caller) {
     return this.employeesService.resendCredentials(id, caller.organizationId);
+  }
+
+  // The full PAN / Aadhaar / UAN / bank account number (masked everywhere else), for the eye button. Self or HR/Admin;
+  // audited.
+  @Get(':id/personal-data/sensitive')
+  revealSensitive(@Param('id') id: string, @CurrentUser() caller: Caller) {
+    return this.employeeProfileService.revealSensitive(
+      id,
+      caller,
+      caller.organizationId,
+    );
   }
 
   @Patch(':id/personal-data')
@@ -183,6 +279,12 @@ export class EmployeesController {
       caller,
       caller.organizationId,
     );
+  }
+
+  // One employee's profile completeness and what is missing (the employee themselves, or HR/Admin).
+  @Get(':id/profile-score')
+  profileScore(@Param('id') id: string, @CurrentUser() caller: Caller) {
+    return this.employeeProfileService.profileScore(id, caller, caller.organizationId);
   }
 
   @Get(':id/full-profile')

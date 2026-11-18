@@ -157,7 +157,7 @@ describe('Employee Rich Profile (e2e)', () => {
       );
     });
 
-    it("HR/Admin cannot change an employee's bank details or government IDs (view-only), but the employee can - and HR/Admin can update the address", async () => {
+    it('HR/Admin can fill in and correct bank details, government IDs and the address, and so can the employee', async () => {
       const send = (token: string, personalData: object) =>
         request(app.getHttpServer())
           .patch(`/employees/${empId}/personal-data`)
@@ -168,9 +168,24 @@ describe('Employee Rich Profile (e2e)', () => {
         panNumber: 'ABCDE1234F',
         currentAddress: '12 Main Street, Mumbai, Maharashtra 400001',
       }).expect(200);
-      await send(hrToken, { bankName: 'Other Bank' }).expect(403);
-      await send(adminToken, { panNumber: 'ZZZZZ9999Z' }).expect(403);
-      // The address is the one thing HR/Admin may correct on an employee's record.
+      // HR/Admin may set and correct bank details and identifiers on an employee's record (audited, see 67be87f).
+      const bank = await send(hrToken, { bankName: 'Other Bank' }).expect(200);
+      expect((bank.body as PersonalDataBody).personalData.bankName).toBe(
+        'Other Bank',
+      );
+      const pan = await send(adminToken, { panNumber: 'ZZZZZ9999Z' }).expect(
+        200,
+      );
+      // Responses mask it; saving the masked value back keeps the real number.
+      expect((pan.body as PersonalDataBody).personalData.panNumber).toBe(
+        '******999Z',
+      );
+      await send(adminToken, { panNumber: '******999Z' }).expect(200);
+      const full = await request(app.getHttpServer())
+        .get(`/employees/${empId}/personal-data/sensitive`)
+        .set('Authorization', `Bearer ${empToken}`)
+        .expect(200);
+      expect((full.body as { panNumber: string }).panNumber).toBe('ZZZZZ9999Z');
       const fixed = await send(hrToken, {
         currentAddress: '99 Elsewhere Road, Pune, Maharashtra 411001',
       }).expect(200);
@@ -191,6 +206,20 @@ describe('Employee Rich Profile (e2e)', () => {
       expect((res.body as PersonalDataBody).personalData.bankName).toBe(
         'Employee Changed Bank',
       );
+    });
+
+    it('PAN is required: once given it can be corrected but not removed', async () => {
+      const send = (personalData: object) =>
+        request(app.getHttpServer())
+          .patch(`/employees/${empId}/personal-data`)
+          .set('Authorization', `Bearer ${empToken}`)
+          .send({ personalData });
+      await send({ panNumber: 'ABCDE1234F' }).expect(200);
+      const res = await send({ panNumber: '' }).expect(400);
+      expect((res.body as { message: string }).message).toMatch(
+        /PAN is required/,
+      );
+      await send({ panNumber: 'PQRST6789K' }).expect(200);
     });
 
     it('EMPLOYEE cannot change their own personalEmail (silently dropped, no error)', async () => {
@@ -339,6 +368,32 @@ describe('Employee Rich Profile (e2e)', () => {
     });
   });
 
+  describe('cancelled cheque replacement', () => {
+    it("an Admin can replace an employee's cancelled cheque at any time, and it is logged", async () => {
+      const send = (key: string) =>
+        request(app.getHttpServer())
+          .patch(`/employees/${empId}/personal-data`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ personalData: { cancelledChequeUrl: key } });
+      const before = await prisma.auditLog.count({
+        where: { action: 'CANCELLED_CHEQUE_REPLACED', targetId: empId },
+      });
+      await send('cheque-e2e-one.pdf').expect(200);
+      await send('cheque-e2e-two.pdf').expect(200);
+      const after = await prisma.auditLog.count({
+        where: { action: 'CANCELLED_CHEQUE_REPLACED', targetId: empId },
+      });
+      expect(after).toBe(before + 2);
+      // Re-sending the same key is a no-op: not logged again.
+      await send('cheque-e2e-two.pdf').expect(200);
+      expect(
+        await prisma.auditLog.count({
+          where: { action: 'CANCELLED_CHEQUE_REPLACED', targetId: empId },
+        }),
+      ).toBe(after);
+    });
+  });
+
   describe('full-profile / role-history / employment-status-history (HR/Admin only)', () => {
     it('HR can view an employee full profile including documents/assets arrays', async () => {
       const res = await request(app.getHttpServer())
@@ -349,6 +404,44 @@ describe('Employee Rich Profile (e2e)', () => {
       expect(body.id).toBe(empId);
       expect(Array.isArray(body.documents)).toBe(true);
       expect(Array.isArray(body.assets)).toBe(true);
+    });
+
+    it('asks for a UAN only while PF is on for the company (the employee is permanent)', async () => {
+      const flags = async () => {
+        const full = await request(app.getHttpServer())
+          .get(`/employees/${empId}/full-profile`)
+          .set('Authorization', `Bearer ${hrToken}`)
+          .expect(200);
+        const me = await request(app.getHttpServer())
+          .get('/auth/me')
+          .set('Authorization', `Bearer ${empToken}`)
+          .expect(200);
+        return [
+          (full.body as { uanRequired: boolean }).uanRequired,
+          (me.body as { uanRequired: boolean }).uanRequired,
+        ];
+      };
+      const emp = await prisma.user.findUniqueOrThrow({ where: { id: empId } });
+      // A new organisation has no payroll settings row until first used.
+      await prisma.payrollSettings.upsert({
+        where: { organizationId: emp.organizationId },
+        create: { organizationId: emp.organizationId },
+        update: {},
+      });
+      await prisma.payrollSettings.updateMany({
+        where: { organizationId: emp.organizationId },
+        data: { pfEnabled: false },
+      });
+      expect(await flags()).toEqual([false, false]);
+      await prisma.payrollSettings.updateMany({
+        where: { organizationId: emp.organizationId },
+        data: { pfEnabled: true },
+      });
+      expect(await flags()).toEqual([true, true]);
+      await prisma.payrollSettings.updateMany({
+        where: { organizationId: emp.organizationId },
+        data: { pfEnabled: false },
+      });
     });
 
     it('EMPLOYEE is forbidden from full-profile, role-history, and employment-status-history', async () => {

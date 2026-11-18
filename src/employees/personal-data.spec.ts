@@ -1,10 +1,13 @@
+process.env.JWT_ACCESS_SECRET ??= 'test-secret-for-file-tokens';
 import {
+  assertContactNumbersDistinct,
   areMandatoryDocumentsUploaded,
   assertValidAddress,
   assertValidDates,
   latestAllowedDateOfBirth,
   assertValidIdentifiers,
   isProfileComplete,
+  uanRequiredFor,
   signPersonalDataFileUrls,
   mergePersonalData,
 } from './personal-data';
@@ -31,6 +34,9 @@ const COMPLETE_FIELDS = {
   bankName: 'HDFC',
   bankAccountNo: '123456789',
   bankIFSC: 'HDFC0001234',
+  panNumber: 'ABCDE1234F',
+  aadharNumber: '123412341234',
+  cancelledChequeUrl: 'orgs/o/cheque.png',
 };
 
 describe('isProfileComplete', () => {
@@ -350,5 +356,97 @@ describe('minimum age of 18', () => {
     expect(() => assertValidDates({ dateOfBirth: '2016-05-01' })).toThrow(
       'at least 18',
     );
+  });
+});
+
+describe('assertContactNumbersDistinct', () => {
+  it("refuses the employee's own number as a family or emergency contact, however it is written", () => {
+    expect(() =>
+      assertContactNumbersDistinct(
+        { emergencyContact1Number: '9876543210' },
+        '+91 98765 43210',
+      ),
+    ).toThrow(/Emergency contact 1 number cannot be your own/);
+    expect(() =>
+      assertContactNumbersDistinct(
+        { fatherContact: '+919876543210' },
+        '9876543210',
+      ),
+    ).toThrow(/Father's contact number/);
+  });
+
+  it('refuses the same number for both emergency contacts', () => {
+    expect(() =>
+      assertContactNumbersDistinct(
+        {
+          emergencyContact1Number: '9404162245',
+          emergencyContact2Number: '+91 94041 62245',
+        },
+        '7718035688',
+      ),
+    ).toThrow(/same number/);
+  });
+
+  it('allows father, mother and one emergency contact to share a number, and blanks', () => {
+    expect(() =>
+      assertContactNumbersDistinct(
+        {
+          fatherContact: '9404162245',
+          motherContact: '9404162245',
+          emergencyContact1Number: '9404162245',
+          emergencyContact2Number: '',
+        },
+        '7718035688',
+      ),
+    ).not.toThrow();
+    expect(() => assertContactNumbersDistinct({}, '')).not.toThrow();
+  });
+});
+
+describe('UAN on the profile', () => {
+  it('is asked for only where PF applies: company PF on and an employment type PF covers', () => {
+    expect(uanRequiredFor({ pfEnabled: true, employeeType: 'permanent' })).toBe(
+      true,
+    );
+    expect(uanRequiredFor({ pfEnabled: true, employeeType: 'intern' })).toBe(
+      false,
+    );
+    expect(
+      uanRequiredFor({ pfEnabled: true, employeeType: 'consultant' }),
+    ).toBe(false);
+    expect(
+      uanRequiredFor({ pfEnabled: false, employeeType: 'permanent' }),
+    ).toBe(false);
+  });
+
+  it('a profile needs it then, unless the person has none yet (first PF job)', () => {
+    const noUan: Record<string, unknown> = { ...COMPLETE_FIELDS };
+    delete noUan.uanNumber;
+    expect(isProfileComplete(noUan)).toBe(true);
+    expect(isProfileComplete(noUan, { uanRequired: true })).toBe(false);
+    expect(
+      isProfileComplete({ ...noUan, noUanYet: true }, { uanRequired: true }),
+    ).toBe(true);
+    expect(
+      isProfileComplete(
+        { ...noUan, uanNumber: '100123456789' },
+        { uanRequired: true },
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('profile complete needs a contact number and a photo', () => {
+  it('is not complete without either, when told', () => {
+    expect(isProfileComplete(COMPLETE_FIELDS, { hasContactNumber: true, hasProfilePhoto: true })).toBe(true);
+    expect(isProfileComplete(COMPLETE_FIELDS, { hasContactNumber: false, hasProfilePhoto: true })).toBe(false);
+    expect(isProfileComplete(COMPLETE_FIELDS, { hasContactNumber: true, hasProfilePhoto: false })).toBe(false);
+    expect(isProfileComplete(COMPLETE_FIELDS)).toBe(true);
+  });
+  it('downgrades a stored "complete" flag when the record has no photo or number', () => {
+    const stored = { ...COMPLETE_FIELDS, profileCompleted: true };
+    expect(signPersonalDataFileUrls(stored, 'o', { contactNumber: '+91 98765 43210', profileImage: 'p.png' }).profileCompleted).toBe(true);
+    expect(signPersonalDataFileUrls(stored, 'o', { contactNumber: '+91 98765 43210', profileImage: '' }).profileCompleted).toBe(false);
+    expect(signPersonalDataFileUrls(stored, 'o', { contactNumber: '', profileImage: 'p.png' }).profileCompleted).toBe(false);
   });
 });

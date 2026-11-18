@@ -1,4 +1,5 @@
 import { isValidIndianMobile } from '../common/indian-mobile';
+import { statutoryDefaultsForType } from '../payroll/employee-type-statutory';
 import { BadRequestException } from '@nestjs/common';
 import { isKeyAllowedForOrg, signFileToken } from '../files/file-token';
 import { isValidCalendarDateString } from '../common/is-valid-calendar-date.validator';
@@ -81,12 +82,14 @@ const IDENTIFIER_PATTERNS: Record<
   },
 };
 
-const PHONE_KEYS = new Set([
+// The family and emergency phone numbers kept in personalData.
+export const CONTACT_NUMBER_KEYS = [
   'fatherContact',
   'motherContact',
   'emergencyContact1Number',
   'emergencyContact2Number',
-]);
+] as const;
+const PHONE_KEYS = new Set<string>(CONTACT_NUMBER_KEYS);
 
 // Throws on the first invalid identifier found in `patch` — called before
 // merging a personalData patch onto the stored blob. Only checks fields
@@ -143,6 +146,8 @@ export const KNOWN_PERSONAL_DATA_KEYS = new Set([
   'motherContact',
   'motherName',
   'motherOccupation',
+  // Ticked by someone in their first PF-covered job: no UAN yet (the employer gets one from EPFO), so it is not asked for.
+  'noUanYet',
   'panNumber',
   'passportNumber',
   'personalEmail',
@@ -240,6 +245,35 @@ export function assertValidIdentifiers(patch: Record<string, unknown>): void {
   }
 }
 
+// The last 10 digits of a phone number, so "+91 98765 43210" and "9876543210" compare equal.
+const phoneDigits = (v: unknown) =>
+  typeof v === 'string' ? v.replace(/\D/g, '').slice(-10) : '';
+
+// Family and emergency numbers are for reaching someone else: never the employee's own Contact Number, and the two
+// emergency contacts must be different numbers. Father's and mother's may share one (a family landline). Checked on the
+// record as it will be saved (stored values merged with this patch), so editing either side is caught.
+export function assertContactNumbersDistinct(
+  merged: Record<string, unknown>,
+  ownContactNumber: string | null | undefined,
+): void {
+  const own = phoneDigits(ownContactNumber);
+  if (own) {
+    for (const key of PHONE_KEYS) {
+      if (phoneDigits(merged[key]) === own) {
+        throw new BadRequestException(
+          `${IDENTIFIER_PATTERNS[key].label} cannot be your own contact number. Enter the number of the person to reach.`,
+        );
+      }
+    }
+  }
+  const e1 = phoneDigits(merged.emergencyContact1Number);
+  if (e1 && e1 === phoneDigits(merged.emergencyContact2Number)) {
+    throw new BadRequestException(
+      'Emergency contact 1 and 2 have the same number. Enter a different number for the second contact, or leave it blank.',
+    );
+  }
+}
+
 interface PreviousEmploymentEntry {
   documentUrl?: string;
   [key: string]: unknown;
@@ -274,7 +308,7 @@ export function assertValidDates(patch: Record<string, unknown>): void {
     if (typeof value === 'string' && value.trim() !== '') {
       if (!isValidCalendarDateString(value)) {
         throw new BadRequestException(
-          'Invalid date of birth — must be a real calendar date (YYYY-MM-DD).',
+          'Invalid date of birth — must be a real calendar date (DD-MM-YYYY).',
         );
       }
       if (value > new Date().toISOString().slice(0, 10)) {
@@ -297,7 +331,7 @@ export function assertValidDates(patch: Record<string, unknown>): void {
           !isValidCalendarDateString(value)
         ) {
           throw new BadRequestException(
-            `Invalid previous employment ${key === 'startDate' ? 'start' : 'end'} date — must be a real calendar date (YYYY-MM-DD).`,
+            `Invalid previous employment ${key === 'startDate' ? 'start' : 'end'} date — must be a real calendar date (DD-MM-YYYY).`,
           );
         }
       }
@@ -324,11 +358,16 @@ export function assertValidDates(patch: Record<string, unknown>): void {
 export function signPersonalDataFileUrls(
   personalData: Record<string, unknown>,
   organizationId: string,
+  // The employee's contact number and photo (on the record, not in the personal data): without them the profile is not complete.
+  account?: { contactNumber?: string | null; profileImage?: string | null },
 ): Record<string, unknown> {
   const signed = { ...personalData };
   // A stored "complete" flag can be stale (saved before the required-field list grew, or a field was cleared since):
   // what is shown must reflect the data as it is now.
-  if (signed.profileCompleted === true && !isProfileComplete(signed)) {
+  if (
+    signed.profileCompleted === true &&
+    !isProfileComplete(signed, account ? { hasContactNumber: !!account.contactNumber, hasProfilePhoto: !!account.profileImage } : {})
+  ) {
     signed.profileCompleted = false;
   }
   if (
@@ -386,15 +425,38 @@ const REQUIRED_FOR_COMPLETION = [
   'bankName',
   'bankAccountNo',
   'bankIFSC',
+  // Needed for TDS: without a PAN the tax is deducted at the higher rate (if the company switches that on).
+  'panNumber',
+  // The Aadhaar number and the cancelled cheque (the bank proof) are asked for as well.
+  'aadharNumber',
+  'cancelledChequeUrl',
 ] as const;
 
 export function isProfileComplete(
   personalData: Record<string, unknown>,
+  // hasContactNumber / hasProfilePhoto: facts about the employee record (not the personal data). When given and false, the
+  // profile is not complete - the same two things the completeness percentage counts.
+  opts: { uanRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
 ): boolean {
-  return REQUIRED_FOR_COMPLETION.every((field) => {
+  if (opts.hasContactNumber === false || opts.hasProfilePhoto === false) return false;
+  const filled = (field: string) => {
     const value = personalData[field];
     return typeof value === 'string' && value.trim().length > 0;
-  });
+  };
+  if (!REQUIRED_FOR_COMPLETION.every(filled)) return false;
+  // UAN only where PF applies, and not from someone who said they have none yet (first PF job).
+  return (
+    !opts.uanRequired || personalData.noUanYet === true || filled('uanNumber')
+  );
+}
+
+// PF applies to this person: the company has PF on and their employment type is covered by it (an intern, trainee or
+// consultant is not - see statutoryDefaultsForType). Then a UAN is asked for on the profile.
+export function uanRequiredFor(input: {
+  pfEnabled: boolean;
+  employeeType?: string | null;
+}): boolean {
+  return input.pfEnabled && statutoryDefaultsForType(input.employeeType).pf;
 }
 
 // A mandatory DocumentRequirement is satisfied by any uploaded
@@ -471,9 +533,11 @@ export function mergePersonalData(
   current: Record<string, unknown>,
   patch: Record<string, unknown>,
   mandatoryDocumentsUploaded: boolean,
+  opts: { uanRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
 ): Record<string, unknown> {
   const merged = { ...current, ...dropReSignedFileUrls(current, patch) };
-  const completed = isProfileComplete(merged) && mandatoryDocumentsUploaded;
+  const completed =
+    isProfileComplete(merged, opts) && mandatoryDocumentsUploaded;
   return {
     ...merged,
     profileCompleted: completed,

@@ -3,6 +3,7 @@
 // Important: dedupes on (user, title) within a window so a job that runs again (restart, manual trigger) never
 // double-notifies; respects the recipient's "email notifications" preference; and, unlike the generic fallback
 // elsewhere, sends NO email when the org has switched the template off (the in-app notice still goes out).
+import { channelAllowed } from '../notifications/notification-preferences';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { NotificationCategory, Role } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
@@ -17,6 +18,7 @@ export interface ReminderUser {
   email: string;
   role: Role;
   reportingManagerId: string | null;
+  additionalReportingManagerIds?: string[] | null;
   notificationPreferences: unknown;
 }
 
@@ -30,10 +32,10 @@ export interface ReminderInput {
   category: NotificationCategory;
   // Skip when this user already has a notification with the same title newer than this. Default: 60 days.
   dedupeWithinHours?: number;
+  // Only the in-app notification, no email (for a reminder the email template's wording does not fit).
+  inAppOnly?: boolean;
 }
 
-const emailEnabled = (prefs: unknown): boolean =>
-  (prefs as { emailEnabled?: boolean } | null)?.emailEnabled !== false;
 
 @Injectable()
 export class ReminderNotifier {
@@ -49,13 +51,16 @@ export class ReminderNotifier {
   /** Every active user of the org, with just the fields reminders need. */
   activeUsers(organizationId: string): Promise<ReminderUser[]> {
     return this.scopedPrisma.user.findMany({
-      where: { organizationId, isActive: true },
+      // People past their last working day are not reminded of anything (their account stays open until the exit is
+      // completed).
+      where: { organizationId, isActive: true, OR: [{ exitDate: null }, { exitDate: { gte: new Date().toISOString().slice(0, 10) } }] },
       select: {
         id: true,
         name: true,
         email: true,
         role: true,
         reportingManagerId: true,
+        additionalReportingManagerIds: true,
         notificationPreferences: true,
       },
     });
@@ -86,8 +91,10 @@ export class ReminderNotifier {
       category: input.category,
     });
 
+    if (input.inAppOnly) return true;
     try {
-      if (!emailEnabled(user.notificationPreferences)) return true;
+      // The person's own choice for email, for this kind of notification.
+      if (!channelAllowed(user.notificationPreferences, input.category, 'email')) return true;
       const template = await this.scopedPrisma.emailTemplate.findFirst({
         where: { organizationId, occasionKey },
         select: { isActive: true },

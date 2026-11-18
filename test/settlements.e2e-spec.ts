@@ -244,7 +244,12 @@ describe('Settlements (e2e)', () => {
       .send({ gratuityEnabled: true })
       .expect(200);
 
-    // An active, interest-free loan -> fully recovered on settlement.
+    // An active, interest-free loan -> fully recovered on settlement. Only a confirmed, permanent employee may take
+    // one (loan-eligibility.ts); a new hire starts out Onboarding.
+    await prisma.user.updateMany({
+      where: { id: employeeId },
+      data: { employmentStatus: 'CONFIRMED', employeeType: 'permanent' },
+    });
     await request(app.getHttpServer())
       .post('/loans')
       .set('Authorization', `Bearer ${adminToken}`)
@@ -275,6 +280,30 @@ describe('Settlements (e2e)', () => {
   let settlementId: string;
   let expectedGratuity: number;
   let expectedNet: number;
+
+  it('refuses an entered amount with more than 2 decimals or above Rs 1 crore', async () => {
+    const calc = (extra: object) =>
+      request(app.getHttpServer())
+        .post('/settlements/calculate')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ employeeId, lastWorkingDay: LAST_WORKING_DAY, ...extra });
+    const msg = async (extra: object) =>
+      JSON.stringify(
+        ((await calc(extra).expect(400)).body as { message: unknown }).message,
+      );
+    expect(await msg({ bonusAmount: 100.555 })).toMatch(
+      /Bonus must be an amount with at most 2 decimals/,
+    );
+    expect(await msg({ bonusAmount: 10_000_001 })).toMatch(
+      /Bonus cannot be more than/,
+    );
+    expect(
+      await msg({ recoveriesAmount: 20_000_000, recoveriesReason: 'Laptop' }),
+    ).toMatch(/Recoveries cannot be more than/);
+    expect(await msg({ noticePeriodRecovery: 1.234 })).toMatch(
+      /Notice period recovery must be an amount/,
+    );
+  });
 
   it('ADMIN computes a full breakdown as a DRAFT', async () => {
     const yearsOfService =
@@ -639,6 +668,10 @@ describe('Settlements (e2e)', () => {
         BASIC_MONTHLY,
       );
       await markPresent(loanEmpId, M2.month, 31, M2.year);
+      await prisma.user.updateMany({
+        where: { id: loanEmpId },
+        data: { employmentStatus: 'CONFIRMED', employeeType: 'permanent' },
+      });
       const loanRes = await request(app.getHttpServer())
         .post('/loans')
         .set('Authorization', `Bearer ${adminToken}`)

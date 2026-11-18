@@ -16,12 +16,19 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Role, User } from '@prisma/client';
 import { LeavesService } from './leaves.service';
+import { LeaveStampRepairService } from './leave-stamp-repair.service';
 import { PreviewLeaveDaysQueryDto } from './dto/preview-leave-days-query.dto';
+import { ManualLeaveDto } from './dto/manual-leave.dto';
 import { ApplyLeaveDto } from './dto/apply-leave.dto';
+import { ImportLeavesDto } from './dto/import-leaves.dto';
 import { UpdateLeaveDto } from './dto/update-leave.dto';
 import { ReviewLeaveDto } from './dto/review-leave.dto';
 import { ListLeavesQueryDto } from './dto/list-leaves-query.dto';
 import { TeamCalendarQueryDto } from './dto/team-calendar-query.dto';
+import {
+  DecideLeaveCancelDto,
+  RequestLeaveCancelDto,
+} from './dto/leave-cancel-request.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -32,7 +39,44 @@ type Caller = Omit<User, 'password'>;
 @ApiBearerAuth('access-token')
 @Controller('leaves')
 export class LeavesController {
-  constructor(private readonly leavesService: LeavesService) {}
+  constructor(
+    private readonly leavesService: LeavesService,
+    private readonly stampRepair: LeaveStampRepairService,
+  ) {}
+
+  // Admin: puts back the holidays / weekly offs that older leave approvals wrongly marked as On Leave. dryRun (the default) only
+  // reports what it would change; send { "dryRun": false } to apply. Declared before the parameterised routes.
+  @Post('repair-stamps')
+  @Roles(Role.ADMIN)
+  @UseGuards(RolesGuard)
+  repairStamps(
+    @Body() body: { dryRun?: boolean } | undefined,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.stampRepair.run(
+      caller,
+      caller.organizationId,
+      body?.dryRun !== false,
+    );
+  }
+
+  // Migration of past, already-approved leave from a spreadsheet (Admin/HR). dryRun (the default) only checks every row.
+  // Declared before the parameterised routes.
+  @Post('import')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  importLeaves(@Body() dto: ImportLeavesDto, @CurrentUser() caller: Caller) {
+    return this.leavesService.importLeaves(dto, caller, caller.organizationId);
+  }
+
+  // An Admin/HR records and approves a leave for one or more employees who could not apply themselves. Declared before
+  // the parameterised routes.
+  @Post('manual')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  manualLeave(@Body() dto: ManualLeaveDto, @CurrentUser() caller: Caller) {
+    return this.leavesService.manualLeave(dto, caller, caller.organizationId);
+  }
 
   @Post()
   apply(@Body() dto: ApplyLeaveDto, @CurrentUser() caller: Caller) {
@@ -115,8 +159,11 @@ export class LeavesController {
     );
   }
 
-  // No @Roles(): every employee may see who is away (approved leave only, no type or remarks - see the service).
+  // Admin, HR and Manager only: employees do not see who else is away. Approved leave only, no type or remarks (see the
+  // service); HR/Admin get the whole organisation, a manager their own department.
   @Get('whos-out')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
   whosOut(@Query() query: TeamCalendarQueryDto, @CurrentUser() caller: Caller) {
     return this.leavesService.getWhosOut(query, caller, caller.organizationId);
   }
@@ -163,5 +210,37 @@ export class LeavesController {
   @Patch(':id/cancel')
   cancel(@Param('id') id: string, @CurrentUser() caller: Caller) {
     return this.leavesService.cancel(id, caller, caller.organizationId);
+  }
+
+  // The owner asks for an approved, already-started leave to be cancelled.
+  @Post(':id/cancel-request')
+  requestCancel(
+    @Param('id') id: string,
+    @Body() dto: RequestLeaveCancelDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.leavesService.requestCancel(
+      id,
+      dto,
+      caller,
+      caller.organizationId,
+    );
+  }
+
+  // A manager / HR / Admin approves or declines that request.
+  @Patch(':id/cancel-request')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
+  decideCancelRequest(
+    @Param('id') id: string,
+    @Body() dto: DecideLeaveCancelDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.leavesService.decideCancelRequest(
+      id,
+      dto,
+      caller,
+      caller.organizationId,
+    );
   }
 }

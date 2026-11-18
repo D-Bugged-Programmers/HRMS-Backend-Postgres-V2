@@ -18,8 +18,11 @@ import {
   BadRequestException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
+import { FieldTrackingService } from '../field-tracking/field-tracking.service';
 import {
   AssetStatus,
   EmploymentStatus,
@@ -40,8 +43,28 @@ import { SubmitExitInterviewDto } from './dto/submit-exit-interview.dto';
 import { LinkSettlementDto } from './dto/link-settlement.dto';
 import { UpdateLastWorkingDayDto } from './dto/update-last-working-day.dto';
 import { todayInOrgTz } from '../common/org-date';
+import { isCleanDraft } from '../settlements/settlement-clean';
+import { markPayrollInputsChanged, monthsBetween } from '../payroll/payroll-period-guard';
 import { CompleteOffboardingDto } from './dto/complete-offboarding.dto';
 import { reassignDirectReportsBeforeDeactivation } from '../common/manager-reassignment';
+import { assertAccountCanLeave } from '../common/account-guard';
+import { reportsToWhere, managerIdsOf } from '../common/managers';
+import { LettersService } from '../letters/letters.service';
+import { UpdateChecklistOwnerDto } from './dto/update-checklist-owner.dto';
+import {
+  CHECKLIST_ITEM_KEYS,
+  CHECKLIST_ITEM_LABELS,
+  defaultChecklistMeta,
+  defaultDueDate,
+  isOverdue,
+  itemsDone,
+  readExitAutomation,
+  readyToComplete,
+  waitingFor,
+  type CaseState,
+  type ChecklistItemKey,
+  type ChecklistMeta,
+} from './offboarding-checklist';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
 import { ListOffboardingQueryDto } from './dto/list-offboarding-query.dto';
@@ -52,6 +75,7 @@ import { EmailTemplatesService } from '../email-templates/email-templates.servic
 import {
   formatDateDisplay,
   resolveOrgDateTimeFormat,
+  dmyText,
 } from '../payroll/format-date';
 
 type Actor = Omit<User, 'password'>;
@@ -67,6 +91,8 @@ const CLOSED_STATUSES: OffboardingStatus[] = [
 
 @Injectable()
 export class OffboardingService {
+  private readonly logger = new Logger(OffboardingService.name);
+
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly auditLogService: AuditLogService,
@@ -74,6 +100,9 @@ export class OffboardingService {
     private readonly notificationsService: NotificationsService,
     private readonly emailService: EmailService,
     private readonly emailTemplatesService: EmailTemplatesService,
+    private readonly lettersService: LettersService,
+    // Optional so existing unit tests that build this service by hand keep working.
+    @Optional() private readonly fieldTracking?: FieldTrackingService,
   ) {}
 
   async findAll(query: ListOffboardingQueryDto, organizationId: string) {
@@ -94,6 +123,79 @@ export class OffboardingService {
       query.page,
       query.limit,
     );
+  }
+
+  // After a leaver's team is moved, the new manager is told how many of those people's requests are waiting for a decision,
+  // so nothing sits unnoticed with a manager who has gone. Best-effort: the exit must not fail on a notice.
+  private async tellNewManagerOfPending(leaverId: string, newManagerId: string | undefined, organizationId: string) {
+    if (!newManagerId) return;
+    try {
+      const reports = await this.scopedPrisma.user.findMany({
+        where: { organizationId, isActive: true, ...reportsToWhere(newManagerId) },
+        select: { id: true },
+      });
+      const ids = reports.map((r) => r.id);
+      if (ids.length === 0) return;
+      const [leaves, loans] = await Promise.all([
+        this.scopedPrisma.leave.count({ where: { organizationId, employeeId: { in: ids }, status: 'PENDING' } }),
+        this.scopedPrisma.loan.count({ where: { organizationId, employeeId: { in: ids }, status: 'PENDING' } }),
+      ]);
+      if (leaves + loans === 0) return;
+      const leaver = await this.scopedPrisma.user.findFirst({ where: { id: leaverId, organizationId }, select: { name: true } });
+      await this.notifyOnce(
+        organizationId,
+        [newManagerId],
+        `Team taken over from ${leaver?.name ?? 'a leaver'}: requests waiting`,
+        `Your team now includes people who reported to ${leaver?.name ?? 'the manager who left'}. ${leaves} leave request(s) and ${loans} loan request(s) from your team are waiting for a decision.`,
+      );
+    } catch {
+      // best-effort notice
+    }
+  }
+
+  // The exit tracker for HR: every open exit with days left, each checklist item's owner and due date, what it is waiting for,
+  // and the state of the final settlement - overdue exits first, then the ones leaving soonest.
+  async overview(organizationId: string) {
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } });
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const cases = await this.scopedPrisma.offboardingCase.findMany({
+      where: { organizationId, status: { in: OPEN_STATUSES } },
+      include: { employee: { select: { id: true, name: true, employeeId: true } }, settlement: true },
+    });
+    const rows = await Promise.all(
+      cases.map(async (c) => {
+        const view = await this.buildView(c as never, organizationId);
+        const dayNo = (ymd: string) => Math.round(Date.parse(`${ymd.slice(0, 10)}T00:00:00Z`) / 86400000);
+        const overdueItems = view.checklist.filter((i) => i.overdue);
+        return {
+          id: c.id,
+          employee: c.employee,
+          lastWorkingDay: c.lastWorkingDay,
+          // Negative once the last working day has passed.
+          daysLeft: dayNo(c.lastWorkingDay) - dayNo(today),
+          checklist: view.checklist,
+          overdueCount: overdueItems.length,
+          waitingFor: view.waitingFor,
+          readyToComplete: view.readyToComplete,
+          settlementStage: !c.settlement ? 'NOT_STARTED' : c.settlement.status,
+          cleanDraft: !!c.settlement && isCleanDraft(c.settlement),
+          pendingClearedAt: c.pendingClearedAt,
+          exitPackSentAt: c.exitPackSentAt,
+        };
+      }),
+    );
+    rows.sort((a, b) => b.overdueCount - a.overdueCount || a.daysLeft - b.daysLeft);
+    return {
+      today,
+      summary: {
+        open: rows.length,
+        withOverdueItems: rows.filter((r) => r.overdueCount > 0).length,
+        pastLastWorkingDay: rows.filter((r) => r.daysLeft < 0).length,
+        readyToComplete: rows.filter((r) => r.readyToComplete).length,
+        cleanDrafts: rows.filter((r) => r.cleanDraft).length,
+      },
+      cases: rows,
+    };
   }
 
   // The employee's own exit progress, for the mobile/web "Exit status" card. Deliberately narrow: the last working
@@ -120,24 +222,186 @@ export class OffboardingService {
     const interviewRequired =
       record.exitStatus !== EmploymentStatus.TERMINATED &&
       record.exitStatus !== EmploymentStatus.ABSCONDED;
+    // The choices for the exit interview form, offered only while it is still to be filled.
+    const reasonsForLeaving =
+      interviewRequired && !record.exitInterviewDone && record.status !== OffboardingStatus.COMPLETED
+        ? (
+            await this.scopedPrisma.orgListItem.findMany({
+              where: { organizationId: actor.organizationId, type: OrgListType.REASON_FOR_LEAVING, isActive: true },
+              orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+              select: { name: true },
+            })
+          ).map((r) => r.name)
+        : [];
     return {
       status: record.status,
       lastWorkingDay: record.lastWorkingDay,
+      reasonsForLeaving,
+      // Sign-in ends the day after the last working day; the last payslips are then emailed to the personal address.
       assetsReturned: record.assetsReturned,
       accessRevoked: record.accessRevoked,
       interviewRequired,
       exitInterviewDone: record.exitInterviewDone,
       settlementStage,
+      // Whether the relieving / experience letters have been emailed (on completion, for resignations and releases).
+      lettersSent: !!record.lettersSentAt,
       documentsGoToPersonalEmail: personalEmailOf(actor.personalData) !== null,
     };
   }
 
   async findOne(id: string, organizationId: string) {
+    // Bringing the case up to date first ticks what the system can tick by itself and flags it ready to complete.
+    await this.reconcile(id, organizationId).catch(() => undefined);
     const record = await this.findCase(id, organizationId);
+    const [openAssets, view] = await Promise.all([
+      this.findOpenAssets(record.employeeId, organizationId),
+      this.buildView(record, organizationId),
+    ]);
+    return { ...record, openAssets, ...view };
+  }
+
+  // The checklist as the screen reads it: each item with its owner, due date and whether the system ticked it, plus whether the
+  // team is handed over, whether the case is ready to complete, and what it is still waiting for.
+  private async buildView(record: Awaited<ReturnType<OffboardingService['findCase']>>, organizationId: string) {
+    const [state, org] = await Promise.all([
+      this.caseState(record, organizationId),
+      this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true, policies: true } }),
+    ]);
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const meta = (record.checklistMeta ?? {}) as ChecklistMeta;
+    const auto = (record.autoTicked ?? {}) as Partial<Record<ChecklistItemKey, boolean>>;
+    const ownerIds = [...new Set(CHECKLIST_ITEM_KEYS.map((k) => meta[k]?.ownerId).filter((x): x is string => !!x))];
+    const owners = ownerIds.length
+      ? await this.scopedPrisma.user.findMany({ where: { id: { in: ownerIds }, organizationId }, select: { id: true, name: true } })
+      : [];
+    const nameOf = new Map(owners.map((o) => [o.id, o.name]));
+    const done = itemsDone(state.state);
     return {
-      ...record,
-      openAssets: await this.findOpenAssets(record.employeeId, organizationId),
+      checklist: CHECKLIST_ITEM_KEYS.map((key) => ({
+        key,
+        label: CHECKLIST_ITEM_LABELS[key],
+        done: done[key],
+        // Not asked for at all (a termination has no exit interview).
+        notNeeded: key === 'interview' && !state.state.interviewNeeded,
+        autoTicked: !!auto[key] && done[key],
+        ownerId: meta[key]?.ownerId ?? null,
+        ownerName: meta[key]?.ownerId ? (nameOf.get(meta[key]!.ownerId!) ?? null) : null,
+        dueDate: meta[key]?.dueDate ?? null,
+        overdue: isOverdue(meta[key]?.dueDate, today, done[key]),
+      })),
+      teamHandedOver: state.state.teamHandedOver,
+      activeReportsCount: state.activeReportsCount,
+      settlementPaid: state.state.settlementPaid,
+      readyToComplete: readyToComplete(state.state),
+      waitingFor: waitingFor(state.state),
+      automation: readExitAutomation(org?.policies),
     };
+  }
+
+  // Everything the checklist rules need, read from the database for one case.
+  private async caseState(record: Awaited<ReturnType<OffboardingService['findCase']>>, organizationId: string) {
+    const activeReportsCount = await this.scopedPrisma.user.count({
+      where: { organizationId, isActive: true, id: { not: record.employeeId }, ...reportsToWhere(record.employeeId) },
+    });
+    const interviewNeeded = record.exitStatus !== EmploymentStatus.TERMINATED && record.exitStatus !== EmploymentStatus.ABSCONDED;
+    const state: CaseState = {
+      assetsReturned: record.assetsReturned,
+      accessRevoked: record.accessRevoked,
+      interviewNeeded,
+      exitInterviewDone: record.exitInterviewDone,
+      teamHandedOver: activeReportsCount === 0,
+      settlementPaid: record.settlement?.status === SettlementStatus.PAID,
+      settlementMatchesLastWorkingDay: !!record.settlement && record.settlement.lastWorkingDay.slice(0, 10) === record.lastWorkingDay.slice(0, 10),
+    };
+    return { state, activeReportsCount };
+  }
+
+  // Brings an open case up to date by itself: ticks "assets returned" once nothing is allocated, and keeps the "ready to complete"
+  // marker true only while every item is done and the settlement is paid. The first time a case becomes ready, HR and Admin are
+  // told (once). Returns whether it is ready and whether that just changed. A closed case is left as it is.
+  async reconcile(id: string, organizationId: string): Promise<{ ready: boolean; becameReady: boolean }> {
+    let record = await this.findCase(id, organizationId);
+    if (CLOSED_STATUSES.includes(record.status)) return { ready: false, becameReady: false };
+    if (!record.assetsReturned) {
+      const open = await this.findOpenAssets(record.employeeId, organizationId);
+      if (open.length === 0) {
+        const auto = { ...((record.autoTicked ?? {}) as Record<string, boolean>), assets: true };
+        await this.scopedPrisma.offboardingCase.updateMany({ where: { id, organizationId }, data: { assetsReturned: true, autoTicked: auto } });
+        record = await this.findCase(id, organizationId);
+      }
+    }
+    const { state } = await this.caseState(record, organizationId);
+    const ready = readyToComplete(state);
+    if (ready && !record.readyToCompleteAt) {
+      await this.scopedPrisma.offboardingCase.updateMany({ where: { id, organizationId }, data: { readyToCompleteAt: new Date() } });
+      await this.notifyHr(
+        organizationId,
+        [record.initiatedById],
+        `Exit ready to complete: ${record.employee.name}`,
+        `${record.employee.name} (${record.employee.employeeId}) has finished clearance and the final settlement is paid. Open Offboarding and confirm to close the account.`,
+      );
+      return { ready, becameReady: true };
+    }
+    if (!ready && record.readyToCompleteAt) {
+      await this.scopedPrisma.offboardingCase.updateMany({ where: { id, organizationId }, data: { readyToCompleteAt: null } });
+    }
+    return { ready, becameReady: false };
+  }
+
+  // A notice to every active HR / Admin (and the extra people given), skipping anyone who already has this exact one in the last day.
+  async notifyHr(organizationId: string, alsoIds: string[], title: string, message: string) {
+    const hr = await this.scopedPrisma.user.findMany({
+      where: { organizationId, isActive: true, role: { in: ['HR', 'ADMIN'] } },
+      select: { id: true },
+    });
+    const ids = [...new Set([...hr.map((u) => u.id), ...alsoIds])];
+    await this.notifyOnce(organizationId, ids, title, message);
+  }
+
+  async notifyOnce(organizationId: string, userIds: string[], title: string, message: string) {
+    const since = new Date(Date.now() - 20 * 60 * 60 * 1000);
+    const already = await this.scopedPrisma.notification.findMany({
+      where: { organizationId, userId: { in: userIds }, title, createdAt: { gte: since } },
+      select: { userId: true },
+    });
+    const have = new Set(already.map((n) => n.userId));
+    await this.notificationsService.createMany(
+      userIds
+        .filter((u) => !have.has(u))
+        .map((userId) => ({ organizationId, userId, title, message, category: NotificationCategory.GENERAL })),
+    );
+  }
+
+  // HR / Admin change who owns one checklist item and by when. The owner is told about it; a finished item cannot be re-assigned.
+  async updateChecklistOwner(id: string, dto: UpdateChecklistOwnerDto, organizationId: string) {
+    const record = await this.assertOpenCase(id, organizationId);
+    const meta = { ...((record.checklistMeta ?? {}) as ChecklistMeta) };
+    const current = meta[dto.item] ?? { ownerId: null, dueDate: null };
+    let ownerId = current.ownerId;
+    if (dto.ownerId !== undefined) {
+      if (dto.ownerId === '') ownerId = null;
+      else {
+        const owner = await this.scopedPrisma.user.findFirst({
+          where: { id: dto.ownerId, organizationId, isActive: true },
+          select: { id: true, role: true },
+        });
+        if (!owner || owner.id === record.employeeId) throw new BadRequestException('Pick an active colleague (not the person leaving) as the owner.');
+        ownerId = owner.id;
+      }
+    }
+    const dueDate = dto.dueDate !== undefined ? dto.dueDate : current.dueDate;
+    meta[dto.item] = { ownerId, dueDate };
+    await this.scopedPrisma.offboardingCase.updateMany({ where: { id, organizationId }, data: { checklistMeta: meta as unknown as Prisma.InputJsonValue } });
+    if (ownerId && ownerId !== current.ownerId) {
+      await this.notificationsService.create({
+        organizationId,
+        userId: ownerId,
+        title: `Exit task assigned: ${CHECKLIST_ITEM_LABELS[dto.item]}`,
+        message: `${record.employee.name} (${record.employee.employeeId}) is leaving on ${dmyText(record.lastWorkingDay)}. You own "${CHECKLIST_ITEM_LABELS[dto.item]}"${dueDate ? `, due ${dmyText(dueDate)}` : ''}.`,
+        category: NotificationCategory.GENERAL,
+      });
+    }
+    return this.findOne(id, organizationId);
   }
 
   private async findCase(id: string, organizationId: string) {
@@ -186,6 +450,7 @@ export class OffboardingService {
       where: { id: dto.employeeId, organizationId },
     });
     if (!employee) throw new NotFoundException('Employee not found.');
+    await assertAccountCanLeave(this.scopedPrisma, dto.employeeId, organizationId);
 
     const existing = await this.scopedPrisma.offboardingCase.findFirst({
       where: {
@@ -267,6 +532,12 @@ export class OffboardingService {
           previousEmploymentStatus: employee.employmentStatus,
         },
       });
+      // Last working day drives who still shows on trackers/lists after leaving (account stays active until completion).
+      await tx.user.updateMany({
+        where: { id: dto.employeeId, organizationId },
+        data: { exitDate: dto.lastWorkingDay },
+      });
+      await this.markPayrollStale(tx, organizationId, dto.employeeId, dto.lastWorkingDay);
       if (entersNotice && !alreadyInNotice) {
         await tx.user.updateMany({
           where: { id: dto.employeeId, organizationId },
@@ -286,10 +557,53 @@ export class OffboardingService {
       return created;
     });
 
+    // The checklist starts with owners and due dates, so nothing waits on someone remembering to assign it.
+    const orgForToday = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } });
+    const meta = defaultChecklistMeta({
+      initiatorId: actor.id,
+      managerId: managerIdsOf(employee).find((m) => m !== employee.id) ?? null,
+      lastWorkingDay: dto.lastWorkingDay,
+      today: todayInOrgTz(orgForToday?.timezone ?? 'Asia/Kolkata'),
+    });
+    await this.scopedPrisma.offboardingCase.updateMany({
+      where: { id: offboardingCase.id, organizationId },
+      data: { checklistMeta: meta as unknown as Prisma.InputJsonValue },
+    });
+    // Someone who manages people needs a replacement named early, not as a blocker on the last day.
+    const reportsCount = await this.scopedPrisma.user.count({
+      where: { organizationId, isActive: true, id: { not: employee.id }, ...reportsToWhere(employee.id) },
+    });
+    if (reportsCount > 0) {
+      await this.notifyOnce(
+        organizationId,
+        [...new Set([actor.id, ...managerIdsOf(employee)])].filter((u) => u !== employee.id),
+        `Choose a new manager for ${employee.name}'s team`,
+        `${employee.name} manages ${reportsCount} ${reportsCount === 1 ? 'person' : 'people'} and is leaving on ${dmyText(dto.lastWorkingDay)}. Open Offboarding and use "Reassign all" to name the replacement manager.`,
+      );
+    }
+
     const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(
       this.scopedPrisma,
       organizationId,
     );
+    // The asset recovery list: what the leaver still holds, told to them and to HR so nothing is chased by memory.
+    const heldAssets = await this.findOpenAssets(employee.id, organizationId);
+    if (heldAssets.length > 0) {
+      const list = heldAssets.map((x) => `${x.assetName}${x.assetTag ? ` (${x.assetTag})` : ''}`).join(', ');
+      await this.notificationsService.create({
+        organizationId,
+        userId: employee.id,
+        title: `Return your company assets before ${dmyText(dto.lastWorkingDay)}`,
+        message: `Please return: ${list}.`,
+        category: NotificationCategory.GENERAL,
+      });
+      await this.notifyHr(
+        organizationId,
+        [],
+        `Asset recovery list: ${employee.name}`,
+        `${employee.name} leaves on ${dmyText(dto.lastWorkingDay)} and still holds ${heldAssets.length} asset${heldAssets.length === 1 ? '' : 's'}: ${list}. Collect them and mark each returned in Employee Assets.`,
+      );
+    }
     const title = 'Offboarding Process Initiated';
     const message = `Your offboarding has been initiated with a last working day of ${formatDateDisplay(dto.lastWorkingDay, '', dateFormat, timeZone)}. HR will reach out with the exit checklist.`;
     await this.notificationsService.create({
@@ -315,6 +629,7 @@ export class OffboardingService {
     );
     await this.emailService.send({
       organizationId,
+      allowInactive: true, // addressed to the leaver on purpose
       to: employee.email,
       subject: rendered.subject,
       html: rendered.html,
@@ -331,6 +646,19 @@ export class OffboardingService {
     });
 
     return offboardingCase;
+  }
+
+  // A change of last working day changes what a regular run for that month (and later ones) should pay, so any run already
+  // calculated from that date on is marked out of date and has to be recalculated before it can be signed off.
+  private markPayrollStale(
+    tx: Prisma.TransactionClient,
+    organizationId: string,
+    employeeId: string,
+    fromDate: string,
+  ) {
+    const to = new Date(`${fromDate}T00:00:00.000Z`);
+    to.setUTCDate(to.getUTCDate() + 366);
+    return markPayrollInputsChanged(tx, organizationId, employeeId, monthsBetween(fromDate, to.toISOString().slice(0, 10)));
   }
 
   async updateChecklist(
@@ -371,7 +699,32 @@ export class OffboardingService {
     organizationId: string,
   ) {
     const record = await this.assertOpenCase(id, organizationId);
+    return this.saveExitInterview(record, dto, actor, organizationId);
+  }
 
+  // The leaver fills in their own exit interview. This ticks the checklist item itself, so HR no longer has to key it in.
+  async submitMyExitInterview(dto: SubmitExitInterviewDto, actor: Actor) {
+    const mine = await this.scopedPrisma.offboardingCase.findFirst({
+      where: { organizationId: actor.organizationId, employeeId: actor.id, status: { in: OPEN_STATUSES } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    if (!mine) throw new NotFoundException('You have no exit under way.');
+    const record = await this.assertOpenCase(mine.id, actor.organizationId);
+    if (record.exitStatus === EmploymentStatus.TERMINATED || record.exitStatus === EmploymentStatus.ABSCONDED) {
+      throw new BadRequestException('An exit interview is not asked for in your case.');
+    }
+    await this.saveExitInterview(record, dto, actor, actor.organizationId);
+    return this.findMine(actor);
+  }
+
+  private async saveExitInterview(
+    record: Awaited<ReturnType<OffboardingService['assertOpenCase']>>,
+    dto: SubmitExitInterviewDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    const id = record.id;
     // Reasons are org-configurable (Organization → Reasons for Leaving).
     const reason = await this.scopedPrisma.orgListItem.findFirst({
       where: {
@@ -395,7 +748,10 @@ export class OffboardingService {
         wouldRecommend: !!dto.wouldRecommend,
         likedMost: dto.likedMost ?? '',
         improvementAreas: dto.improvementAreas ?? '',
-        additionalComments: dto.additionalComments ?? '',
+        additionalComments:
+          dto.reasonForLeaving.toLowerCase() === 'other' && dto.reasonOther?.trim()
+            ? `Other reason: ${dto.reasonOther.trim()}${dto.additionalComments ? `\n${dto.additionalComments}` : ''}`
+            : (dto.additionalComments ?? ''),
       } satisfies Prisma.InputJsonValue,
       exitInterviewDone: true,
     };
@@ -427,7 +783,7 @@ export class OffboardingService {
     const joined = joiningDate.toISOString().slice(0, 10);
     if (lastWorkingDay < joined) {
       throw new BadRequestException(
-        `The last working day (${lastWorkingDay}) cannot be before the joining date (${joined}).`,
+        `The last working day (${dmyText(lastWorkingDay)}) cannot be before the joining date (${dmyText(joined)}).`,
       );
     }
     const org = await this.scopedPrisma.organization.findFirst({
@@ -488,6 +844,16 @@ export class OffboardingService {
           ...(record.settlementId ? { settlementId: null } : {}),
         },
       });
+      await tx.user.updateMany({
+        where: { id: record.employeeId, organizationId },
+        data: { exitDate: dto.lastWorkingDay },
+      });
+      await this.markPayrollStale(
+        tx,
+        organizationId,
+        record.employeeId,
+        dto.lastWorkingDay < record.lastWorkingDay ? dto.lastWorkingDay : record.lastWorkingDay,
+      );
       await tx.resignation.updateMany({
         where: {
           organizationId,
@@ -497,6 +863,23 @@ export class OffboardingService {
         data: { approvedLwd: dto.lastWorkingDay },
       });
     });
+    // Checklist due dates that were still the automatic ones (two days before the old last working day) move with the new date;
+    // a date HR set by hand is left alone.
+    {
+      const orgTz = (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata';
+      const today = todayInOrgTz(orgTz);
+      const oldDefault = defaultDueDate(record.lastWorkingDay, today);
+      const newDefault = defaultDueDate(dto.lastWorkingDay, today);
+      const meta = { ...((record.checklistMeta ?? {}) as ChecklistMeta) };
+      let changed = false;
+      for (const key of CHECKLIST_ITEM_KEYS) {
+        if (meta[key]?.dueDate === oldDefault) {
+          meta[key] = { ownerId: meta[key]!.ownerId, dueDate: newDefault };
+          changed = true;
+        }
+      }
+      if (changed) await this.scopedPrisma.offboardingCase.updateMany({ where: { id, organizationId }, data: { checklistMeta: meta as unknown as Prisma.InputJsonValue } });
+    }
     await this.auditLogService.log({
       actorId: actor.id,
       action: 'OFFBOARDING_LWD_CHANGED',
@@ -515,7 +898,7 @@ export class OffboardingService {
       organizationId,
       userId: record.employeeId,
       title: 'Last Working Day Updated',
-      message: `Your last working day is now ${dto.lastWorkingDay} (was ${record.lastWorkingDay}).`,
+      message: `Your last working day is now ${dmyText(dto.lastWorkingDay)} (was ${dmyText(record.lastWorkingDay)}).`,
       category: NotificationCategory.GENERAL,
     });
     return this.findOne(id, organizationId);
@@ -540,7 +923,7 @@ export class OffboardingService {
       record.lastWorkingDay.slice(0, 10)
     ) {
       throw new BadRequestException(
-        `This settlement is for last working day ${settlement.lastWorkingDay.slice(0, 10)}, but the exit's is ${record.lastWorkingDay.slice(0, 10)} - recalculate the settlement for the exit's date.`,
+        `This settlement is for last working day ${dmyText(settlement.lastWorkingDay.slice(0, 10))}, but the exit's is ${dmyText(record.lastWorkingDay.slice(0, 10))} - recalculate the settlement for the exit's date.`,
       );
     }
     await this.scopedPrisma.offboardingCase.updateMany({
@@ -572,6 +955,7 @@ export class OffboardingService {
     // `settlement` relation, so its current status is available here
     // without a second query.
     const record = await this.assertOpenCase(id, organizationId);
+    await assertAccountCanLeave(this.scopedPrisma, record.employeeId, organizationId);
 
     const leaver = await this.scopedPrisma.user.findFirst({
       where: { id: record.employeeId, organizationId },
@@ -597,6 +981,9 @@ export class OffboardingService {
       missing.push(
         'settlement processing (still DRAFT — run POST /settlements/:id/process first)',
       );
+    // The final settlement must actually be paid before the account is closed (processed is not enough).
+    else if (record.settlement?.status !== SettlementStatus.PAID)
+      missing.push('settlement payment (mark the settlement as paid first)');
     if (
       record.settlement &&
       record.settlement.lastWorkingDay.slice(0, 10) !==
@@ -628,6 +1015,7 @@ export class OffboardingService {
       organizationId,
       actor.id,
     );
+    await this.tellNewManagerOfPending(record.employeeId, dto.reassignManagerId, organizationId);
 
     // A case still carrying the old RESIGNED exit type ends as RELEASED (RESIGNED is the notice stage now).
     const finalStatus =
@@ -678,6 +1066,20 @@ export class OffboardingService {
       targetId: record.employeeId,
       details: { reason: 'offboarding_completed' },
     });
+    // A leaver is no longer tracked, and visits planned for them are cancelled. Never undoes the completed exit.
+    try {
+      await this.fieldTracking?.stopForChange(
+        organizationId,
+        record.employeeId,
+        'left_company',
+        actor.id,
+        { closeVisits: true },
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Stopping live tracking for ${record.employeeId} failed: ${(err as Error).message}`,
+      );
+    }
     await this.timelineService.logEvent({
       organizationId,
       employeeId: record.employeeId,
@@ -690,7 +1092,38 @@ export class OffboardingService {
       record.lastWorkingDay,
       organizationId,
     );
+    // Resignations and releases get the relieving letter and experience certificate by email straight away; a termination or an
+    // abscondment is left to HR. A letter that cannot be sent never undoes the completed exit.
+    if (finalStatus === EmploymentStatus.RELEASED) await this.sendExitLetters(id, record.employeeId, actor, organizationId);
     return this.findOne(id, organizationId);
+  }
+
+  private async sendExitLetters(caseId: string, employeeId: string, actor: Actor, organizationId: string) {
+    const sent: string[] = [];
+    const failed: string[] = [];
+    for (const key of ['relievingLetter', 'experienceCertificate']) {
+      try {
+        await this.lettersService.send(employeeId, key, actor, organizationId);
+        sent.push(key);
+      } catch (err) {
+        failed.push(`${key}: ${err instanceof Error ? err.message : 'not sent'}`);
+      }
+    }
+    if (sent.length > 0) {
+      await this.scopedPrisma.offboardingCase.updateMany({ where: { id: caseId, organizationId }, data: { lettersSentAt: new Date() } });
+    }
+    await this.timelineService.logEvent({
+      organizationId,
+      employeeId,
+      eventKey: 'LETTER_EMAILED',
+      performedById: actor.id,
+      description: sent.length > 0
+        ? `Exit letters emailed on completion (${sent.join(', ')}).${failed.length ? ` Not sent: ${failed.join('; ')}.` : ''}`
+        : `Exit letters could not be emailed: ${failed.join('; ')}. Send them from the Letters tab.`,
+    });
+    if (failed.length > 0) {
+      await this.notifyHr(organizationId, [actor.id], 'Exit letters not sent', `Some exit letters could not be emailed (${failed.join('; ')}). Send them from the employee's Letters tab.`);
+    }
   }
 
   // Goes to the employee's PERSONAL email only — completing the exit deactivates the work account,
@@ -704,7 +1137,7 @@ export class OffboardingService {
     try {
       const employee = await this.scopedPrisma.user.findFirst({
         where: { id: employeeId, organizationId },
-        select: { name: true, personalData: true },
+        select: { name: true, personalData: true, brandId: true },
       });
       const personalData = (employee?.personalData ?? {}) as Record<
         string,
@@ -733,9 +1166,11 @@ export class OffboardingService {
         'EXIT_COMPLETED',
         variables,
         this.emailTemplatesService.defaultFor('EXIT_COMPLETED', variables),
+        { brandId: employee.brandId },
       );
       await this.emailService.send({
         organizationId,
+        allowInactive: true, // addressed to the leaver on purpose
         to: personalEmail,
         subject: rendered.subject,
         html: rendered.html,
@@ -776,6 +1211,14 @@ export class OffboardingService {
         },
         data: { status: OffboardingStatus.CANCELLED },
       });
+      // Cancelled exit: they are staying, so the last working day no longer applies.
+      if (count > 0) {
+        await tx.user.updateMany({
+          where: { id: record.employeeId, organizationId },
+          data: { exitDate: null },
+        });
+        await this.markPayrollStale(tx, organizationId, record.employeeId, record.lastWorkingDay);
+      }
       // Restore the pre-notice status only on the first cancel of an open case, and only if the
       // employee is still RESIGNED (HR may have changed it manually since).
       const wasOpen = OPEN_STATUSES.includes(record.status);

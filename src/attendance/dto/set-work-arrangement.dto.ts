@@ -1,4 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
 import { IsEnum, IsOptional, IsString, MaxLength } from 'class-validator';
 import { WorkArrangement } from '@prisma/client';
 import { IsValidCalendarDateString } from '../../common/is-valid-calendar-date.validator';
@@ -23,10 +24,18 @@ export class SetWorkArrangementDto {
 
   @ApiPropertyOptional({
     description:
-      'Why Work From Home is needed (up to 500 characters). Kept with the request for the approver; ignored for any other arrangement.',
+      "The employee's reason for a Work From Home request, shown to the approver. Up to 500 characters after trimming; empty counts as no reason. On a multi-day request every day gets the same reason. Ignored for any other arrangement.",
+    maxLength: 500,
+    type: String,
+    nullable: true,
   })
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim() || null : value,
+  )
   @IsOptional()
+  // Listed in this order on purpose: the rule nearest the property runs first, and the app-wide pipe shows only the
+  // first rule broken, so a value that is not text is told that rather than that it is too long.
+  @MaxLength(500, { message: 'Reason must be at most 500 characters.' })
   @IsString()
-  @MaxLength(500)
-  reason?: string;
+  reason?: string | null;
 }

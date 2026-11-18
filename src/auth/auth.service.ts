@@ -9,6 +9,8 @@
 // rotate on every use (revoke-and-reissue) to limit replay of a leaked token. forgotPassword() and
 // findRefreshTokenByHash() deliberately return the same response/bypass tenant scoping for tenant-unknown
 // lookups by design, not by oversight.
+import { isPlaceholderEmail, loginRefusal, readLoginPolicy } from '../common/no-email';
+import { EXIT_ACCESS_ENDED_MESSAGE, exitAccessEnded } from '../common/exit-access';
 import {
   BadRequestException,
   ConflictException,
@@ -28,12 +30,19 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
-import { EmploymentStatus, Role } from '@prisma/client';
+import { EmploymentStatus, Prisma, Role, User } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
-import { signPersonalDataFileUrls } from '../employees/personal-data';
+import { maskRevealable } from '../employees/personal-data-mask';
+import {
+  signPersonalDataFileUrls,
+  uanRequiredFor,
+} from '../employees/personal-data';
 import { UsersService } from '../users/users.service';
+import { sisterCompaniesOn } from '../module-access/module-gate';
+import { companyInitials, uniqueEmployeeIdPrefix } from '../common/employee-id-prefix';
+import { takenEmployeeIdPrefixes } from '../common/employee-id-prefixes';
 import { EmployeeIdService } from '../employees/employee-id.service';
 import { StatutoryConfigService } from '../statutory-config/statutory-config.service';
 import { LeaveTypesService } from '../leave-types/leave-types.service';
@@ -193,6 +202,16 @@ export class AuthService {
             ],
           },
         });
+        // The company's employee IDs start with its own initials (Demo Company -> DC-00001) instead of a shared default, so an ID is unique
+        // across companies and the employee can sign in with it. A clash with another company's prefix gets a number added (DC2-).
+        {
+          const prefix = uniqueEmployeeIdPrefix(companyInitials(dto.organizationName), await takenEmployeeIdPrefixes(tx));
+          const numbering = (organization.documentNumbering ?? {}) as Record<string, Record<string, unknown>>;
+          await tx.organization.update({
+            where: { id: organization.id },
+            data: { documentNumbering: { ...numbering, employeeId: { ...(numbering.employeeId ?? {}), format: `${prefix}{00000}` } } as unknown as Prisma.InputJsonValue },
+          });
+        }
         // Every new org gets all 9 statutory modules pre-seeded (most
         // disabled, payroll_calendar/rounding always enabled) so the
         // future payroll engine's period-aware resolution has a row to
@@ -348,7 +367,18 @@ export class AuthService {
     dto: LoginDto,
     meta: { ip?: string; userAgent?: string },
   ): Promise<IssuedTokens & { user: AuthUserDto }> {
-    const user = await this.usersService.findByEmail(dto.email);
+    // Sign in with an email, or with an employee ID (company ID prefixes are unique, so an ID names one person). An ID that two older
+    // companies still share cannot be told apart, and the person is asked to use their email.
+    let user: User | null;
+    if (dto.email.includes('@')) {
+      user = await this.usersService.findByEmail(dto.email);
+    } else {
+      const matches = await this.usersService.findByEmployeeId(dto.email);
+      if (matches.length > 1) {
+        throw new BadRequestException('This employee ID is shared by more than one company. Please sign in with your email address.');
+      }
+      user = matches[0] ?? null;
+    }
     // Exited employees are refused even if isActive was somehow left true.
     if (
       !user ||
@@ -416,10 +446,19 @@ export class AuthService {
     if (!stillUnlocked) {
       throw new UnauthorizedException('Invalid email or password.');
     }
+    // Only someone who proved the password learns that their access has ended with their last working day.
+    if (user.exitDate && exitAccessEnded(user.exitDate, await this.usersService.organizationToday(user.organizationId))) {
+      throw new UnauthorizedException(EXIT_ACCESS_ENDED_MESSAGE);
+    }
     // Only someone who proved the password learns the organisation is switched off.
     if (!(await this.usersService.isOrganizationActive(user.organizationId))) {
       throw new UnauthorizedException(ORG_SUSPENDED_MESSAGE);
     }
+    // The company's sign-in method (Policies > Sign-in): only someone who proved the password is told which way to sign in.
+    const orgRow = await this.scopedPrisma.organization.findFirst({ where: { id: user.organizationId }, select: { policies: true } });
+    const loginPolicy = readLoginPolicy(orgRow?.policies);
+    const refusal = loginRefusal(loginPolicy, dto.email.includes('@'), !isPlaceholderEmail(user.email));
+    if (refusal) throw new UnauthorizedException(refusal);
     // Only someone who proved the password learns that the address is still unconfirmed.
     if (!user.emailVerified) {
       throw new UnauthorizedException(
@@ -451,6 +490,7 @@ export class AuthService {
         role: user.role,
         organizationId: user.organizationId,
         mustChangePassword: user.mustChangePassword,
+        loginMethod: loginPolicy.method,
       },
     };
   }
@@ -512,6 +552,10 @@ export class AuthService {
       LOGIN_BLOCKED_STATUSES.includes(user.employmentStatus)
     ) {
       throw new UnauthorizedException('Refresh token is invalid or expired.');
+    }
+
+    if (user.exitDate && exitAccessEnded(user.exitDate, await this.usersService.organizationToday(user.organizationId))) {
+      throw new UnauthorizedException(EXIT_ACCESS_ENDED_MESSAGE);
     }
 
     // Rotation: revoke the presented token and mint a brand-new one, rather
@@ -621,18 +665,23 @@ export class AuthService {
           select: { id: true, name: true, employeeId: true },
         },
         workLocation: { select: { id: true, name: true } },
+        // The sister-company name shown on the profile (null for a company with none).
+        brand: { select: { id: true, name: true } },
       },
     });
     if (!user) throw new UnauthorizedException();
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- discarding the hash + reset-token fields deliberately
     const { password, resetPasswordToken, resetPasswordExpires, ...safe } =
       user;
+    // Sister companies switched off: the company name is not shown, whatever tag the person carries.
+    if (safe.brand && !(await sisterCompaniesOn(organizationId))) safe.brand = null;
     // Whether this user must take a selfie to check in/out (their own
     // setting, else the org's) — the mobile app uses it to skip the camera.
     const org = await this.scopedPrisma.organization.findFirst({
       where: { id: organizationId },
-      select: { orgPayrollAttendancePrefs: true },
+      select: { orgPayrollAttendancePrefs: true, policies: true },
     });
+    (safe as Record<string, unknown>).loginMethod = readLoginPolicy(org?.policies).method;
     const selfieRequired = isSelfieRequired(
       user.selfieRequirement,
       org?.orgPayrollAttendancePrefs,
@@ -643,6 +692,7 @@ export class AuthService {
       user.locationRequirement,
       org?.orgPayrollAttendancePrefs,
     );
+    (safe as Record<string, unknown>).hasEmail = !isPlaceholderEmail(safe.email);
     // profileImage is a durable relativeKey (never a signed URL — see
     // file-token.ts), so it's signed fresh on every read. This is what
     // AuthContext's `user` (and so the header avatar) holds for the whole
@@ -652,12 +702,36 @@ export class AuthService {
       safe.profileImage = `/files/${signFileToken(safe.organizationId, safe.profileImage, SESSION_ASSET_TTL_SECONDS)}`;
     }
     if (safe.personalData && typeof safe.personalData === 'object') {
+      // PAN / Aadhaar / UAN / bank account masked, as in every other response (see REVEALABLE_KEYS).
       safe.personalData = signPersonalDataFileUrls(
-        safe.personalData as Record<string, unknown>,
+        maskRevealable(safe.personalData as Record<string, unknown>),
         safe.organizationId,
+        { contactNumber: safe.contactNumber, profileImage: safe.profileImage },
       ) as unknown as typeof safe.personalData;
     }
-    return { ...safe, selfieRequired, locationMode };
+    // The extra reporting managers' names, for the profile screens (the primary is `reportingManager`).
+    const additionalReportingManagers = user.additionalReportingManagerIds.length
+      ? await this.scopedPrisma.user.findMany({
+          where: { id: { in: user.additionalReportingManagerIds }, organizationId },
+          select: { id: true, name: true, employeeId: true },
+        })
+      : [];
+    // The profile form marks UAN required when PF applies to this person (company PF on, employment type covered).
+    const payrollSettings = await this.scopedPrisma.payrollSettings.findFirst({
+      where: { organizationId },
+      select: { pfEnabled: true },
+    });
+    const uanRequired = uanRequiredFor({
+      pfEnabled: payrollSettings?.pfEnabled ?? false,
+      employeeType: user.employeeType,
+    });
+    return {
+      ...safe,
+      selfieRequired,
+      locationMode,
+      additionalReportingManagers,
+      uanRequired,
+    };
   }
 
   // Never reveals whether the email exists — same response either way.

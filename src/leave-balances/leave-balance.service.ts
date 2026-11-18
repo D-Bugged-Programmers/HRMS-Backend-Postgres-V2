@@ -344,10 +344,16 @@ export class LeaveBalanceService {
     updated: LeaveType,
     organizationId: string,
     // `year` reconciles that leave year instead of the one in progress (the transition tops up the extended year).
+    // `employeeIds` limits it to those people (an employee's joining date was corrected).
     options: {
       dryRun?: boolean;
       year?: number;
       cfg?: LeaveYearConfig;
+      employeeIds?: string[];
+      // Set the credit to exactly what the joining date earns, even when that is less than the leave already used or
+      // booked (the balance then shows what is owed). Used when an employee's joining date is corrected: without it
+      // the credit never fell below the leave taken, so someone moved to a later date kept days the new date did not earn.
+      exact?: boolean;
     } = {},
   ): Promise<{
     rowsUpdated: number;
@@ -380,7 +386,12 @@ export class LeaveBalanceService {
     if (isPeriodicForYear(updated, year))
       return { rowsUpdated: 0, changes: [] };
     const rows = await tx.leaveBalance.findMany({
-      where: { organizationId, leaveTypeId: updated.id, year },
+      where: {
+        organizationId,
+        leaveTypeId: updated.id,
+        year,
+        ...(options.employeeIds && { employeeId: { in: options.employeeIds } }),
+      },
     });
     if (rows.length === 0) return { rowsUpdated: 0, changes: [] };
 
@@ -409,7 +420,7 @@ export class LeaveBalanceService {
         0,
         row.availed + row.encashed + row.pending - row.opening - row.adjusted,
       );
-      const credited = Math.round(Math.max(upfront, floor) * 100) / 100;
+      const credited = Math.round((options.exact ? upfront : Math.max(upfront, floor)) * 100) / 100;
       if (credited === row.credited && row.lastAccrualPeriod === null) continue;
       changes.push({
         employeeId: row.employeeId,

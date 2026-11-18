@@ -90,12 +90,22 @@ describe('payroll engine: attendance, leave and proration', () => {
     expect(r.grossSalary).toBe(37800);
   });
 
-  it('a half day counts as half a day of pay', async () => {
+  it('a half-day attendance row is paid as a full day: pay is cut only for LWP and Absent days', async () => {
     const r = await run({
       attendance: monthRows(2026, 9, { '2026-09-02': S.HALF_DAY }),
     });
-    expect(r.attendanceSummary.payableDays).toBe(29.5);
-    expect(r.grossSalary).toBe(Math.round((42000 * 29.5) / 30));
+    expect(r.attendanceSummary.payableDays).toBe(30);
+    expect(r.attendanceSummary.lopDays).toBe(0);
+    expect(r.grossSalary).toBe(42000);
+  });
+
+  it('an Absent day still cuts a full day of pay', async () => {
+    const r = await run({
+      attendance: monthRows(2026, 9, { '2026-09-02': S.ABSENT }),
+    });
+    expect(r.attendanceSummary.payableDays).toBe(29);
+    expect(r.attendanceSummary.lopDays).toBe(1);
+    expect(r.grossSalary).toBe(Math.round((42000 * 29) / 30));
   });
 
   it('weekly offs and holidays are paid even with no attendance row for them', async () => {
@@ -199,6 +209,33 @@ describe('payroll engine: attendance, leave and proration', () => {
     expect(r.attendanceSummary.lopDays).toBe(5);
     expect(r.attendanceSummary.payableDays).toBe(25);
     expect(r.grossSalary).toBe(Math.round((42000 * 25) / 30));
+  });
+
+  it('a manual LWP correction replaces the unpaid-leave days and the pay follows', async () => {
+    const r = await run({}, SEP.m, SEP.y, '2026-10-10', {
+      lwpDaysOverride: 2,
+    });
+    expect(r.attendanceSummary.unpaidLeaveDays).toBe(2);
+    expect(r.attendanceSummary.lopDays).toBe(0);
+    expect(r.attendanceSummary.payableDays).toBe(28);
+    expect(r.grossSalary).toBe(Math.round((42000 * 28) / 30));
+  });
+
+  it('records what LWP and Absent days took out of the earnings, split by their days', async () => {
+    const r = await run({}, SEP.m, SEP.y, '2026-10-10', {
+      lopDaysOverride: 1,
+      lwpDaysOverride: 2,
+    });
+    // 3 days unpaid of 30: 42,000 x 3/30 = 4,200 taken out; two thirds LWP, one third LOP.
+    expect(r.attendanceSummary.lwpPayCut).toBe(2800);
+    expect(r.attendanceSummary.lopPayCut).toBe(1400);
+    expect(r.grossSalary).toBe(42000 - 4200);
+  });
+
+  it('a full-attendance month records no pay cut', async () => {
+    const r = await run({}, SEP.m, SEP.y, '2026-10-10');
+    expect(r.attendanceSummary.lwpPayCut).toBeUndefined();
+    expect(r.attendanceSummary.lopPayCut).toBeUndefined();
   });
 
   it('a month of nothing but absence pays nothing (not even the weekly offs) and never goes negative', async () => {

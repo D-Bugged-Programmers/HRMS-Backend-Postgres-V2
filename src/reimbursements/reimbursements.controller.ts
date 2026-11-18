@@ -9,14 +9,20 @@ import {
   Patch,
   Post,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Role, User } from '@prisma/client';
 import { ReimbursementsService } from './reimbursements.service';
-import { CreateReimbursementDto } from './dto/create-reimbursement.dto';
+import {
+  CreateReimbursementBatchDto,
+  CreateReimbursementDto,
+} from './dto/create-reimbursement.dto';
 import { ReviewReimbursementDto } from './dto/review-reimbursement.dto';
 import { BulkReviewReimbursementDto } from './dto/bulk-review-reimbursement.dto';
+import { ReimbursementFormQueryDto } from './dto/reimbursement-form-query.dto';
 import { QueryReimbursementDto } from './dto/query-reimbursement.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -29,6 +35,22 @@ type Caller = Omit<User, 'password'>;
 @Controller('reimbursements')
 export class ReimbursementsController {
   constructor(private readonly reimbursementsService: ReimbursementsService) {}
+
+  // The month's claims as the company's Expense Reimbursement Form (PDF by default, Excel with format=xlsx). Anyone gets their own; Admin/HR can name
+  // employees or take every employee with claims. Declared before the other GET routes.
+  @Get('form')
+  async monthlyForm(
+    @Query() query: ReimbursementFormQueryDto,
+    @CurrentUser() caller: Caller,
+    @Res() res: Response,
+  ) {
+    const { buffer, filename, contentType } = await this.reimbursementsService.monthlyForm(query, caller, caller.organizationId);
+    res.set({
+      'Content-Type': contentType,
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    });
+    res.send(buffer);
+  }
 
   // No @Roles() — any authenticated caller (self-scoped for EMPLOYEE,
   // service-side).
@@ -48,6 +70,19 @@ export class ReimbursementsController {
   @Post()
   create(@Body() dto: CreateReimbursementDto, @CurrentUser() caller: Caller) {
     return this.reimbursementsService.create(
+      dto,
+      caller,
+      caller.organizationId,
+    );
+  }
+
+  // One category and receipt on several dates: creates one claim per date, all or nothing.
+  @Post('batch')
+  createMany(
+    @Body() dto: CreateReimbursementBatchDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.reimbursementsService.createMany(
       dto,
       caller,
       caller.organizationId,

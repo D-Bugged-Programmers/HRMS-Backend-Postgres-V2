@@ -11,6 +11,11 @@ const LOCKED_FIELDS_FOR_EMPLOYEE: (keyof UpdateEmployeeDto)[] = [
   'role',
   'departmentId',
   'workLocationId',
+  'brandId',
+  'alwaysPresent',
+  'alwaysPresentFrom',
+  // Live tracking is switched on or off by Admin / HR, never by the employee for themselves.
+  'fieldTrackingEnabled',
   'requireWorkLocationForPunch',
   'selfieRequirement',
   'locationRequirement',
@@ -27,8 +32,11 @@ const LOCKED_FIELDS_FOR_EMPLOYEE: (keyof UpdateEmployeeDto)[] = [
   'epsExcludedUntil',
   'joiningDate',
   'reportingManagerId',
+  'additionalReportingManagerIds',
   'email',
   'employmentStatus',
+  'confirmationDate',
+  'probationEndDate',
   'employeeType',
 ];
 

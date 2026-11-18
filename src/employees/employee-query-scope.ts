@@ -7,59 +7,9 @@ export interface Actor {
 }
 
 /**
- * Data-scoping, not access-control — @Roles(ADMIN, HR, MANAGER) on the
- * list/get routes already answers "can this caller call the endpoint at
- * all." This answers a different question the guard can't express: which
- * rows should come back. Mirrors the original release's getEmployees, which
- * forced `filter.department = req.user.department` for department_head
- * callers regardless of any `department` query param they passed.
- *
- * Extracted as a pure function (same reasoning as evaluateTenantScope) so
- * it's unit-testable without spinning up a controller/service/Prisma call.
- */
-export function resolveDepartmentFilter(
-  actor: Actor,
-  requestedDepartmentId?: string,
-): string | undefined {
-  if (actor.role === Role.MANAGER) {
-    // Forced, ignoring whatever the query param says — a Manager can't
-    // widen their own view by passing a different department id.
-    return actor.departmentId ?? undefined;
-  }
-  return requestedDepartmentId;
-}
-
-/**
- * Used by GET /employees/:id — a MANAGER may only read employees in their
- * own department; ADMIN/HR/self are handled by the guard already.
- */
-export function canManagerAccessEmployee(
-  actor: Actor,
-  targetDepartmentId: string | null,
-): boolean {
-  if (actor.role !== Role.MANAGER) return true; // not this function's concern for other roles
-  return (
-    actor.departmentId !== null && actor.departmentId === targetDepartmentId
-  );
-}
-
-/**
- * A MANAGER with no department must NOT fall through to "unfiltered" (which
- * would list every employee) — they are limited to their own record plus
- * anyone who reports to them directly.
- */
-export function noDepartmentManagerScope(
-  actor: Actor & { id?: string },
-): { OR: Array<{ id: string } | { reportingManagerId: string }> } | undefined {
-  if (actor.role !== Role.MANAGER || actor.departmentId) return undefined;
-  const id = actor.id ?? '';
-  return { OR: [{ id }, { reportingManagerId: id }] };
-}
-
-/**
  * "My Team" scope — everyone in a MANAGER's reporting chain (direct
  * reports, and their reports, transitively), as opposed to the default
- * department-wide scope resolveDepartmentFilter applies everywhere else.
+ * department-head scope (common/dept-scope.ts reviewerScope) applied everywhere else.
  * Walked in-memory over one pair-only fetch rather than a recursive SQL
  * query — org sizes here don't warrant the extra complexity, and every
  * other in-memory graph walk in this codebase (e.g. department-tree
@@ -67,14 +17,17 @@ export function noDepartmentManagerScope(
  */
 export function collectReportingChain(
   managerId: string,
-  allPairs: Array<{ id: string; reportingManagerId: string | null }>,
+  allPairs: Array<{ id: string; reportingManagerId: string | null; additionalReportingManagerIds?: string[] | null }>,
 ): string[] {
   const reportsOf = new Map<string, string[]>();
-  for (const { id, reportingManagerId } of allPairs) {
-    if (!reportingManagerId) continue;
-    const list = reportsOf.get(reportingManagerId);
-    if (list) list.push(id);
-    else reportsOf.set(reportingManagerId, [id]);
+  for (const { id, reportingManagerId, additionalReportingManagerIds } of allPairs) {
+    // A person reports to their primary manager and to every additional one.
+    for (const managerId of [reportingManagerId, ...(additionalReportingManagerIds ?? [])]) {
+      if (!managerId) continue;
+      const list = reportsOf.get(managerId);
+      if (list) list.push(id);
+      else reportsOf.set(managerId, [id]);
+    }
   }
   const chain: string[] = [];
   const queue = [...(reportsOf.get(managerId) ?? [])];
@@ -90,4 +43,26 @@ export function collectReportingChain(
     }
   }
   return chain;
+}
+
+/**
+ * What an EMPLOYEE may see of a colleague in the directory list (it feeds the Reporting Structure org view): who they are and where
+ * they sit in the reporting line - never email, phone, gender, probation or anything else from their record. The caller's own row
+ * is not trimmed.
+ */
+const EMPLOYEE_VISIBLE_FIELDS = [
+  'id', 'organizationId', 'name', 'employeeId', 'role', 'departmentId', 'designation', 'profileImage',
+  'reportingManagerId', 'additionalReportingManagerIds', 'isActive', 'employmentStatus',
+] as const;
+
+export function slimForEmployeeViewer<T extends Record<string, unknown>>(row: T): Partial<T> {
+  const out: Record<string, unknown> = {};
+  for (const key of EMPLOYEE_VISIBLE_FIELDS) if (key in row) out[key] = row[key];
+  return out as Partial<T>;
+}
+
+/** An EMPLOYEE sees only people who still work here (plus their own record, whatever its state). */
+export function employeeDirectoryScope(actor: Actor & { id?: string }): { OR: Array<{ isActive: true } | { id: string }> } | undefined {
+  if (actor.role !== Role.EMPLOYEE) return undefined;
+  return { OR: [{ isActive: true }, { id: actor.id ?? '' }] };
 }

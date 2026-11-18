@@ -13,6 +13,7 @@ import { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { EmailService } from '../src/notifications/email.service';
+import { companyInitials } from '../src/common/employee-id-prefix';
 
 interface AuthBody {
   accessToken: string;
@@ -194,12 +195,18 @@ describe('Employees + Departments (e2e)', () => {
       })
       .expect(201);
     const managerBody = managerRes.body as EmployeeBody;
+    // What a manager sees is the departments they head (Organization > Departments > Department head).
+    await prisma.department.update({
+      where: { id: engDepartmentId },
+      data: { departmentHeadId: managerBody.employee.id },
+    });
     // Employee IDs are issued from the org's own documentNumbering.
-    // employeeId config (see EmployeeIdService/issueDocumentNumber), not a
-    // hardcoded "EMP-" prefix — a freshly-registered org's schema default
-    // for that entry is "DP-{00000}" (see Organization.documentNumbering's
-    // own default in schema.prisma).
-    expect(managerBody.employee.employeeId).toMatch(/^DP-\d{5}$/);
+    // employeeId config (see EmployeeIdService/issueDocumentNumber). At
+    // registration that format starts with the company's initials
+    // ("Employees E2E Org" -> EEO-{00000}), see AuthService.register.
+    expect(managerBody.employee.employeeId).toMatch(
+      new RegExp(`^${companyInitials('Employees E2E Org')}-\\d{5}$`),
+    );
 
     const managerLogin = await request(app.getHttpServer())
       .post('/auth/login')
@@ -381,10 +388,9 @@ describe('Employees + Departments (e2e)', () => {
     expect(codes).toEqual([...codes].sort(compareEmployeeId));
   });
 
-  it('MANAGER listing employees only sees their own department, regardless of what they ask for', async () => {
+  it('MANAGER listing employees only sees the department they head; asking for another department never widens it', async () => {
     const res = await request(app.getHttpServer())
       .get('/employees')
-      .query({ department: salesDepartmentId }) // deliberately requesting the OTHER department
       .set('Authorization', `Bearer ${engManagerToken}`)
       .expect(200);
     const body = res.body as ListEmployeesBody;
@@ -392,6 +398,12 @@ describe('Employees + Departments (e2e)', () => {
     expect(body.data.every((e) => e.departmentId === engDepartmentId)).toBe(
       true,
     );
+    const other = await request(app.getHttpServer())
+      .get('/employees')
+      .query({ department: salesDepartmentId }) // deliberately requesting the OTHER department
+      .set('Authorization', `Bearer ${engManagerToken}`)
+      .expect(200);
+    expect((other.body as ListEmployeesBody).data).toEqual([]);
   });
 
   it('ADMIN/HR listing employees can filter by any department', async () => {
@@ -1348,7 +1360,7 @@ describe('Employees + Departments (e2e)', () => {
       expect((check.body as EmployeeBody['employee']).role).toBe('MANAGER');
     });
 
-    it('refuses to assign an ADMIN/HR account as department head (already broader authority)', async () => {
+    it('an HR user can head a department and keeps the HR role; an Admin cannot (already sees everyone)', async () => {
       const hrList = await request(app.getHttpServer())
         .get('/employees')
         .query({ role: 'HR' })
@@ -1360,6 +1372,43 @@ describe('Employees + Departments (e2e)', () => {
         .post(`/departments/${salesDepartmentId}/assign-head`)
         .set('Authorization', `Bearer ${adminToken}`)
         .send({ userId: hrUserId })
+        .expect(201);
+      const hr = await prisma.user.findUniqueOrThrow({ where: { id: hrUserId } });
+      expect(hr.role).toBe('HR');
+
+      // Heading Sales, the HR user now sees only Sales people (and themself).
+      const seen = await request(app.getHttpServer())
+        .get('/employees')
+        .query({ limit: 100 })
+        .set('Authorization', `Bearer ${hrToken}`)
+        .expect(200);
+      const rows = (seen.body as ListEmployeesBody).data;
+      expect(rows.length).toBeGreaterThan(1);
+      expect(
+        rows.every((e) => e.departmentId === salesDepartmentId || e.id === hrUserId),
+      ).toBe(true);
+
+      // Back to heading nothing: everyone again.
+      await prisma.department.update({
+        where: { id: salesDepartmentId },
+        data: { departmentHeadId: null },
+      });
+      const all = await request(app.getHttpServer())
+        .get('/employees')
+        .query({ limit: 100 })
+        .set('Authorization', `Bearer ${hrToken}`)
+        .expect(200);
+      expect((all.body as ListEmployeesBody).data.length).toBeGreaterThan(rows.length);
+
+      const adminList = await request(app.getHttpServer())
+        .get('/employees')
+        .query({ role: 'ADMIN' })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`/departments/${salesDepartmentId}/assign-head`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ userId: (adminList.body as ListEmployeesBody).data[0].id })
         .expect(400);
     });
 
@@ -1454,8 +1503,9 @@ describe('Employees + Departments (e2e)', () => {
         .set('Authorization', `Bearer ${hrToken}`)
         .send({
           name: BULK_LOCATION,
-          latitude: 19.07,
-          longitude: 72.87,
+          // Not the e2e helper's default location (19.07, 72.87): the same fence twice is refused as a duplicate.
+          latitude: 19.11,
+          longitude: 72.91,
           radiusMeters: 200,
         })
         .expect(201);

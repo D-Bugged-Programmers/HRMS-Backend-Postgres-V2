@@ -3,6 +3,11 @@
 // DocumentsService.withSignedUrl) on every read, and department-scoped review authorization via
 // assertManagerDeptScope.
 import * as path from 'path';
+import {
+  findAutoApprover,
+  loadAutoApproval,
+  reimbursementQualifies,
+} from '../common/auto-approval';
 import { EMPLOYEE_RELATION_ORDER_BY } from '../common/employee-order';
 import {
   BadRequestException,
@@ -27,18 +32,32 @@ import { signFileToken } from '../files/file-token';
 import { NotificationsService } from '../notifications/notifications.service';
 import { EmailService } from '../notifications/email.service';
 import { EmailTemplatesService } from '../email-templates/email-templates.service';
-import { CreateReimbursementDto } from './dto/create-reimbursement.dto';
+import {
+  CreateReimbursementBatchDto,
+  CreateReimbursementDto,
+} from './dto/create-reimbursement.dto';
+import { ReimbursementFormQueryDto } from './dto/reimbursement-form-query.dto';
+import { renderReimbursementFormPdf } from './reimbursement-form-pdf';
+import { BrandingLookupService } from '../company-brands/branding-lookup.service';
+import { readStoredFile } from '../files/file-storage.config';
+import { detectRasterExtension } from '../reports/report-export';
+import {
+  buildReimbursementFormWorkbook,
+  type ReimbursementFormData,
+} from './reimbursement-form';
 import { ReviewReimbursementDto } from './dto/review-reimbursement.dto';
 import { QueryReimbursementDto } from './dto/query-reimbursement.dto';
 import { paginate, skip } from '../common/pagination';
 import {
   assertManagerDeptScope,
   deptScopedEmployeeIds,
+  isScopedReviewer,
 } from '../common/dept-scope';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
 import { todayInOrgTz } from '../common/org-date';
 
+import { dmyText } from '../payroll/format-date';
 type Actor = Omit<User, 'password'>;
 
 const EXTERNAL_URL_RE = /^https?:\/\//i;
@@ -55,6 +74,8 @@ export class ReimbursementsService {
     private readonly auditLogService: AuditLogService,
     private readonly timelineService: EmployeeTimelineService,
     private readonly emailTemplatesService: EmailTemplatesService,
+    // The company name, logo and address that go on a person's documents (their sister company's, else the organization's).
+    private readonly brandingLookup: BrandingLookupService,
   ) {}
 
   private async getOrgTimezone(organizationId: string): Promise<string> {
@@ -92,7 +113,7 @@ export class ReimbursementsService {
 
     if (actor.role === Role.EMPLOYEE) {
       where.employeeId = actor.id;
-    } else if (actor.role === Role.MANAGER) {
+    } else if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       const deptIds = await deptScopedEmployeeIds(
         this.scopedPrisma,
         actor,
@@ -145,27 +166,40 @@ export class ReimbursementsService {
     };
   }
 
-  async create(
-    dto: CreateReimbursementDto,
-    actor: Actor,
-    organizationId: string,
-  ) {
+  // The rules every claim date has to meet (a claim is for an expense that has already happened, is not older than a
+  // year, and is not from before the person joined).
+  private assertClaimDateAllowed(claimDate: string, actor: Actor) {
     // A claim is for an expense that has already happened. One day of slack covers timezones ahead of UTC.
     const latestAllowed = new Date(Date.now() + 86400000)
       .toISOString()
       .slice(0, 10);
-    if (dto.claimDate > latestAllowed) {
+    if (claimDate > latestAllowed) {
       throw new BadRequestException('The claim date cannot be in the future.');
     }
     // ...and not one from years ago: a claim older than a year is no longer something to reimburse.
     const earliestAllowed = new Date(Date.now() - MAX_CLAIM_AGE_DAYS * 86400000)
       .toISOString()
       .slice(0, 10);
-    if (dto.claimDate < earliestAllowed) {
+    if (claimDate < earliestAllowed) {
       throw new BadRequestException(
         `A claim cannot be older than ${MAX_CLAIM_AGE_DAYS} days. Raise it with HR if it is genuinely older.`,
       );
     }
+    // ...and not one from before the person joined (the same rule as punches, regularization, WFH, leave and comp-off).
+    const joinedOn = actor.joiningDate.toISOString().slice(0, 10);
+    if (claimDate < joinedOn) {
+      throw new BadRequestException(
+        `The claim date cannot be before your joining date (${dmyText(joinedOn)}).`,
+      );
+    }
+  }
+
+  async create(
+    dto: CreateReimbursementDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    this.assertClaimDateAllowed(dto.claimDate, actor);
     // A missing (or null) category is "Other", not an error.
     const category = dto.category ?? ReimbursementCategory.OTHER;
     // Application-level duplicate-submission guard — this had none at all
@@ -225,6 +259,10 @@ export class ReimbursementsService {
       performedById: actor.id,
       description: `Submitted a reimbursement claim of ${dto.amount} for ${dto.category}.`,
     });
+    // Companies that turned on automatic approval: a claim within the amount limit that carries a receipt is approved right
+    // away through the normal review path (paying it is still a separate step).
+    const autoApproved = await this.tryAutoApprove(claim.id, Number(dto.amount), !!dto.receiptUrl, actor, organizationId);
+    if (autoApproved) return autoApproved;
     // Reimbursements are reviewed by HR/Admin only, so they are told directly (no manager step).
     await this.notificationsService.notifyReviewers({
       organizationId,
@@ -235,6 +273,259 @@ export class ReimbursementsService {
     });
 
     return this.withSignedReceipt(claim);
+  }
+
+  // One submit for one category on several dates: each row (date + amount, optional note) becomes its own claim, so HR
+  // still approves, rejects and pays every date on its own. All-or-nothing: if any row is not allowed (bad date,
+  // already claimed) nothing is created and the message names the row.
+  async createMany(
+    dto: CreateReimbursementBatchDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    const category = dto.category ?? ReimbursementCategory.OTHER;
+    const seen = new Set<string>();
+    for (const item of dto.items) {
+      this.assertClaimDateAllowed(item.claimDate, actor);
+      const key = `${item.claimDate}|${item.amount}`;
+      if (seen.has(key)) {
+        throw new BadRequestException(
+          `${dmyText(item.claimDate)} is listed twice with the same amount. Remove the repeated row.`,
+        );
+      }
+      seen.add(key);
+      const duplicate = await this.scopedPrisma.reimbursement.findFirst({
+        where: {
+          organizationId,
+          employeeId: actor.id,
+          category,
+          amount: item.amount,
+          claimDate: item.claimDate,
+          status: { not: ReimbursementStatus.REJECTED },
+        },
+      });
+      if (duplicate) {
+        throw new ConflictException(
+          `A claim for this amount and category on ${dmyText(item.claimDate)} already exists. Remove that row, or resubmit only if the earlier claim was rejected.`,
+        );
+      }
+    }
+
+    const claims = await this.scopedPrisma.$transaction(async (tx) => {
+      const created: Reimbursement[] = [];
+      for (const item of dto.items) {
+        created.push(
+          await tx.reimbursement.create({
+            data: {
+              organizationId,
+              employeeId: actor.id,
+              category,
+              amount: item.amount,
+              claimDate: item.claimDate,
+              description: item.description ?? dto.description ?? '',
+              receiptUrl: dto.receiptUrl ?? '',
+            },
+          }),
+        );
+      }
+      return created;
+    });
+
+    for (const claim of claims) {
+      await this.auditLogService.log({
+        actorId: actor.id,
+        action: 'REIMBURSEMENT_SUBMITTED',
+        module: 'PAYROLL',
+        organizationId,
+        targetId: claim.id,
+        details: { employeeId: actor.id, category, amount: claim.amount },
+      });
+      await this.timelineService.logEvent({
+        organizationId,
+        employeeId: actor.id,
+        eventKey: 'REIMBURSEMENT_SUBMITTED',
+        performedById: actor.id,
+        description: `Submitted a reimbursement claim of ${claim.amount} for ${category}.`,
+      });
+    }
+    const total = claims.reduce((sum, c) => sum + c.amount, 0);
+    // One notification for the whole submit, not one per date.
+    await this.notificationsService.notifyReviewers({
+      organizationId,
+      requester: actor,
+      title: 'Reimbursement Claims Submitted',
+      message: `${actor.name} submitted ${claims.length} reimbursement claims for ${category} totalling ${Math.round(total * 100) / 100}, pending review.`,
+      category: NotificationCategory.PAYROLL,
+    });
+    return claims.map((c) => this.withSignedReceipt(c));
+  }
+
+  // The month's claims as the company's Expense Reimbursement Form (Excel): one sheet per employee, in claim-date order,
+  // rejected claims left out. Employees (and Managers) get their own form only; Admin/HR can name employees or get every
+  // employee who has claims that month.
+  async monthlyForm(
+    query: ReimbursementFormQueryDto,
+    actor: Actor,
+    organizationId: string,
+  ): Promise<{ buffer: Buffer; filename: string; contentType: string }> {
+    const mm = String(query.month).padStart(2, '0');
+    const from = `${query.year}-${mm}-01`;
+    const lastDay = new Date(Date.UTC(query.year, query.month, 0)).getUTCDate();
+    const to = `${query.year}-${mm}-${String(lastDay).padStart(2, '0')}`;
+    const isHr = actor.role === Role.ADMIN || actor.role === Role.HR;
+    const requested = (query.employeeIds ?? '')
+      .split(',')
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if (!isHr && requested.some((id) => id !== actor.id)) {
+      throw new ForbiddenException('You can only download your own reimbursement form.');
+    }
+    const claims = await this.scopedPrisma.reimbursement.findMany({
+      where: {
+        organizationId,
+        claimDate: { gte: from, lte: to },
+        status: { not: ReimbursementStatus.REJECTED },
+        ...(isHr
+          ? requested.length > 0
+            ? { employeeId: { in: requested } }
+            : {}
+          : { employeeId: actor.id }),
+      },
+      include: {
+        employee: {
+          select: {
+            id: true,
+            name: true,
+            employeeId: true,
+            designation: true,
+            email: true,
+            contactNumber: true,
+            brandId: true,
+            department: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: [{ claimDate: 'asc' }, { createdAt: 'asc' }],
+    });
+    const monthName = new Date(Date.UTC(query.year, query.month - 1, 1)).toLocaleString('en-US', { month: 'long', timeZone: 'UTC' });
+    if (claims.length === 0) {
+      throw new BadRequestException(`There are no reimbursement claims for ${monthName} ${query.year}.`);
+    }
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: {
+        name: true,
+        companyName: true,
+        legalName: true,
+        registeredAddress: true,
+        corporateAddress: true,
+        city: true,
+        state: true,
+        pincode: true,
+        contactEmail: true,
+        gstin: true,
+      },
+    });
+    const place = [org?.city, org?.state].filter(Boolean).join(', ');
+    const orgAddress = [org?.registeredAddress || org?.corporateAddress, [place, org?.pincode].filter(Boolean).join(' - ')]
+      .filter(Boolean)
+      .join('\n');
+    // The letterhead is the employee's own company (a sister company's name, logo and address when they have one), read
+    // from Organization Settings - nothing is typed into the form. One lookup per company, shared by its employees.
+    const companyCache = new Map<string, Promise<ReimbursementFormData['company']>>();
+    const companyFor = (brandId: string | null): Promise<ReimbursementFormData['company']> => {
+      const key = brandId ?? '';
+      let found = companyCache.get(key);
+      if (!found) {
+        found = (async () => {
+          const b = await this.brandingLookup.forBrand(organizationId, brandId);
+          const logoBytes = b.logoUrl ? await readStoredFile(b.logoUrl).catch(() => null) : null;
+          // PDF logos must be PNG or JPEG; anything else is left off rather than breaking the form.
+          const logo = logoBytes && ['png', 'jpeg'].includes(detectRasterExtension(logoBytes) ?? '') ? logoBytes : null;
+          return {
+            name: b.legalName || b.companyName,
+            address: b.brandId ? b.address ?? '' : b.address ? [b.address, [place, org?.pincode].filter(Boolean).join(' - ')].filter(Boolean).join('\n') : orgAddress,
+            contactLine: [b.contactEmail ? `Email: ${b.contactEmail}` : '', org?.gstin ? `GST: ${org.gstin}` : ''].filter(Boolean).join('                       '),
+            city: org?.city ?? '',
+            logo,
+            phone: b.phone ?? '',
+            email: b.contactEmail ?? '',
+            website: b.website ?? '',
+            gstin: org?.gstin ?? '',
+          };
+        })();
+        companyCache.set(key, found);
+      }
+      return found;
+    };
+    const categoryLabel = (c: ReimbursementCategory) => c.charAt(0) + c.slice(1).toLowerCase();
+
+    const byEmployee = new Map<string, typeof claims>();
+    for (const c of claims) {
+      const list = byEmployee.get(c.employeeId) ?? [];
+      list.push(c);
+      byEmployee.set(c.employeeId, list);
+    }
+    const forms: ReimbursementFormData[] = [];
+    const groups = [...byEmployee.values()].sort((a, b) => (a[0].employee.employeeId ?? '').localeCompare(b[0].employee.employeeId ?? ''));
+    for (const list of groups) {
+        const e = list[0].employee;
+        const decided = list.filter((c) => c.status === ReimbursementStatus.APPROVED || c.status === ReimbursementStatus.PAID);
+        const decision =
+          decided.length === list.length
+            ? 'Approved'
+            : decided.length === 0
+              ? 'Pending'
+              : `Partly approved (${decided.length} of ${list.length})`;
+        const remarks = [...new Set(list.map((c) => c.reviewComments.trim()).filter(Boolean))].join('; ');
+        const approvedOn = decided.map((c) => c.approvedDate ?? '').filter(Boolean).sort().pop() ?? '';
+        const allPaid = list.every((c) => c.status === ReimbursementStatus.PAID);
+        const paidOn = allPaid ? (list.map((c) => c.paidDate ?? '').filter(Boolean).sort().pop() ?? '') : '';
+        forms.push({
+          company: await companyFor(e.brandId ?? null),
+          employee: {
+            name: e.name,
+            code: e.employeeId ?? '',
+            department: e.department?.name ?? '',
+            designation: e.designation ?? '',
+            email: e.email,
+            mobile: e.contactNumber ?? '',
+          },
+          number: `REIM-${query.year}${mm}-${e.employeeId ?? ''}`,
+          periodFrom: dmyText(from),
+          periodTo: dmyText(to),
+          lines: list.map((c) => ({
+            date: dmyText(c.claimDate),
+            category: categoryLabel(c.category),
+            description: c.description,
+            amount: c.amount,
+            receipt: !!c.receiptUrl,
+          })),
+          approval: { decision, remarks, date: approvedOn ? dmyText(approvedOn) : '' },
+          paymentProcessedOn: paidOn ? dmyText(paidOn) : '',
+        });
+    }
+    const asExcel = query.format === 'xlsx';
+    const buffer = asExcel ? await buildReimbursementFormWorkbook(forms) : await renderReimbursementFormPdf(forms);
+    const who = forms.length === 1 ? forms[0].employee.code || forms[0].employee.name : 'All_Employees';
+    return {
+      buffer,
+      filename: `Reimbursement_Form_${who}_${monthName.slice(0, 3)}-${query.year}.${asExcel ? 'xlsx' : 'pdf'}`.replace(/[^A-Za-z0-9._-]/g, '_'),
+      contentType: asExcel ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'application/pdf',
+    };
+  }
+
+  // Returns the approved claim, or null when it does not qualify (or anything goes wrong: it then stays pending).
+  private async tryAutoApprove(id: string, amount: number, hasReceipt: boolean, requester: Actor, organizationId: string) {
+    try {
+      const rules = await loadAutoApproval(this.scopedPrisma, organizationId);
+      if (!reimbursementQualifies(rules.reimbursement, amount, hasReceipt)) return null;
+      const approver = await findAutoApprover(this.scopedPrisma, organizationId, requester.id);
+      if (!approver) return null;
+      return await this.review(id, { status: ReimbursementStatus.APPROVED } as never, approver as never, organizationId);
+    } catch {
+      return null;
+    }
   }
 
   async review(

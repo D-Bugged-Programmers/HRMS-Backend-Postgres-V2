@@ -11,7 +11,8 @@
 import { User } from '@prisma/client';
 import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
 import { signPersonalDataFileUrls } from './personal-data';
-import { maskPersonalData } from './personal-data-mask';
+import { maskPersonalData, maskRevealable } from './personal-data-mask';
+import { isPlaceholderEmail } from '../common/no-email';
 
 const MASKED_INTERNAL_FIELDS = [
   'lastLoginAt',
@@ -24,6 +25,8 @@ const MASKED_INTERNAL_FIELDS = [
   'epsExcluded',
   'epsExcludedUntil',
   'notificationPreferences',
+  // The company's own extra profile fields are for HR/Admin and the employee themself.
+  'customFields',
 ] as const;
 
 export function toSafe(user: User, mask = false) {
@@ -35,17 +38,21 @@ export function toSafe(user: User, mask = false) {
     const internal = safe as Record<string, unknown>;
     for (const k of MASKED_INTERNAL_FIELDS) delete internal[k];
   }
+  // The placeholder login address of someone with no email is never shown; the screens read this instead.
+  (safe as Record<string, unknown>).hasEmail = !isPlaceholderEmail(safe.email);
   if (safe.profileImage) {
     // Held in AuthContext for the whole session, not re-fetched on every
     // navigation — see SESSION_ASSET_TTL_SECONDS' comment.
     safe.profileImage = `/files/${signFileToken(safe.organizationId, safe.profileImage, SESSION_ASSET_TTL_SECONDS)}`;
   }
   if (safe.personalData && typeof safe.personalData === 'object') {
+    // PAN / Aadhaar / UAN / bank account are masked for everyone (see REVEALABLE_KEYS); `mask` masks the rest too.
     safe.personalData = signPersonalDataFileUrls(
       mask
         ? maskPersonalData(safe.personalData as Record<string, unknown>)
-        : (safe.personalData as Record<string, unknown>),
+        : maskRevealable(safe.personalData as Record<string, unknown>),
       safe.organizationId,
+      { contactNumber: safe.contactNumber, profileImage: safe.profileImage },
     ) as unknown as User['personalData'];
   }
   return safe;

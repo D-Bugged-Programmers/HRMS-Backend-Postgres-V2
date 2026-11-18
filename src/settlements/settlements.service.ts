@@ -16,6 +16,7 @@
 // with no minBalanceToRetain cap since there's no future balance to protect. The settlement notification
 // email goes to the employee's personalEmail, not their login email, since by process() time the account is
 // already deactivated.
+import { isCleanDraft } from './settlement-clean';
 import { getLeaveYearConfig } from '../leave-balances/leave-year-config';
 import { leaveYearOf } from '../leave-balances/leave-year';
 import { todayInOrgTz } from '../common/org-date';
@@ -30,6 +31,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AllocationType,
   LeaveEncashmentStatus,
   LeaveStatus,
   LoanStatus,
@@ -52,7 +54,7 @@ import { PayrollService } from '../payroll/payroll.service';
 import { getFinancialYear } from '../payroll-settings/financial-year';
 import { ListSettlementsQueryDto } from './dto/list-settlements-query.dto';
 import { paginate, skip } from '../common/pagination';
-import { deptScopedEmployeeIds } from '../common/dept-scope';
+import { deptScopedEmployeeIds, isScopedReviewer } from '../common/dept-scope';
 import { PayrollSettingsService } from '../payroll-settings/payroll-settings.service';
 import { EmployeeSalaryComponentsService } from '../employee-salary-components/employee-salary-components.service';
 import { LeaveBalanceService } from '../leave-balances/leave-balance.service';
@@ -63,7 +65,10 @@ import {
   bonusPaidIn,
   finalStatutoryBonus,
 } from './final-bonus';
-import { leaveEncashmentExemption } from './leave-encashment-tax';
+import { leaveEncashmentExemption, LEAVE_EXEMPTION_AVERAGE_MONTHS } from './leave-encashment-tax';
+import { getOrgLeaveSwitches } from '../organizations/org-leave-switches';
+import { isEligible } from '../leave-balances/leave-eligibility';
+import { LEAVE_TYPE_CODES } from '../common/reserved-codes';
 import { noticeRecoveryAmount, noticeShortfallDays } from './notice-shortfall';
 import { PayslipPdfService } from '../payroll/payslip-pdf.service';
 import { escapeHtml } from '../email-templates/email-layout';
@@ -89,6 +94,7 @@ import {
   isFixedTermEmployeeType,
 } from './gratuity-math';
 
+import { dmyText } from '../payroll/format-date';
 type Actor = Omit<User, 'password'>;
 
 interface EncashmentRule {
@@ -181,7 +187,7 @@ export class SettlementsService {
     const where: Prisma.SettlementWhereInput = { organizationId };
     if (actor.role === Role.EMPLOYEE) {
       where.employeeId = actor.id;
-    } else if (actor.role === Role.MANAGER) {
+    } else if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
       where.employeeId = {
         in: await deptScopedEmployeeIds(
           this.scopedPrisma,
@@ -203,7 +209,7 @@ export class SettlementsService {
             skip: skip(query.page, query.limit),
             take: query.limit,
           })
-        ).map((row) => this.withGratuityPayout(row)),
+        ).map((row) => ({ ...this.withGratuityPayout(row), cleanDraft: isCleanDraft(row) })),
       () => this.scopedPrisma.settlement.count({ where }),
       query.page,
       query.limit,
@@ -219,6 +225,11 @@ export class SettlementsService {
     dto: CalculateSettlementDto,
     actor: Actor,
     organizationId: string,
+    // system: the draft is prepared automatically (see OffboardingAutomationService). It is recorded as calculated by nobody, so
+    // the maker-checker rule is met by whoever reviews and processes it; `actor` is only who the audit / timeline entries name.
+    // provisional: the draft is figured before the last working day (when a resignation is approved) as an early estimate; it is
+    // recalculated automatically once the last working day has passed (see OffboardingAutomationService).
+    opts: { system?: boolean; provisional?: boolean } = {},
   ) {
     const employee = await this.scopedPrisma.user.findFirst({
       where: { id: dto.employeeId, organizationId },
@@ -260,7 +271,7 @@ export class SettlementsService {
       openCase.lastWorkingDay.slice(0, 10) !== dto.lastWorkingDay.slice(0, 10)
     ) {
       throw new BadRequestException(
-        `The offboarding case has last working day ${openCase.lastWorkingDay.slice(0, 10)} - change it there first (early release / extension), then calculate the settlement.`,
+        `The offboarding case has last working day ${dmyText(openCase.lastWorkingDay.slice(0, 10))} - change it there first (early release / extension), then calculate the settlement.`,
       );
     }
 
@@ -274,7 +285,7 @@ export class SettlementsService {
     const joinedOn = employee.joiningDate.toISOString().slice(0, 10);
     if (lwdDate < joinedOn) {
       throw new BadRequestException(
-        `The last working day (${lwdDate}) cannot be before the joining date (${joinedOn}).`,
+        `The last working day (${dmyText(lwdDate)}) cannot be before the joining date (${dmyText(joinedOn)}).`,
       );
     }
     const org = await this.scopedPrisma.organization.findFirst({
@@ -282,9 +293,9 @@ export class SettlementsService {
       select: { timezone: true },
     });
     const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
-    if (lwdDate > today) {
+    if (lwdDate > today && !opts.provisional) {
       throw new BadRequestException(
-        `The last working day (${lwdDate}) has not come yet. Calculate the final settlement on or after the last working day.`,
+        `The last working day (${dmyText(lwdDate)}) has not come yet. Calculate the final settlement on or after the last working day.`,
       );
     }
     // Read from the date string, not lwd's local-time getters: the string parses as UTC midnight, which is the
@@ -298,6 +309,20 @@ export class SettlementsService {
       year,
       organizationId,
     );
+
+    // Without a salary structure every amount (final pay, leave encashment, gratuity, notice pay) works out to 0, and
+    // processing would still use up the leave balance being encashed - a Rs 0 settlement that looks complete. Someone
+    // excluded from payroll is settled outside it, so they may go ahead.
+    if (!employee.excludeFromPayroll) {
+      const salaryLines = await this.scopedPrisma.employeeSalaryComponent.count({
+        where: { organizationId, employeeId: dto.employeeId, isEnabled: true },
+      });
+      if (salaryLines === 0) {
+        throw new BadRequestException(
+          `${employee.name} has no salary structure, so final pay, leave encashment and gratuity would all come to 0. Add their salary (Employees > Salary) first, then calculate the settlement.`,
+        );
+      }
+    }
 
     const activeLoans = await this.scopedPrisma.loan.findMany({
       where: {
@@ -335,6 +360,14 @@ export class SettlementsService {
       where: { organizationId },
     });
     let leaveDaysEncashed = 0;
+    // Company-wide "Allow Leave Encashment" switch (Organization Settings -> Policies). While it is off, no leave is paid
+    // out here - it overrides every leave type's own setting, the same as for encashment requests. The unused days are
+    // still counted (`leaveDaysNotPaid`) so a heads-up can tell HR what is not being paid.
+    const { allowLeaveEncashment } = await getOrgLeaveSwitches(
+      this.scopedPrisma,
+      organizationId,
+    );
+    let leaveDaysNotPaid = 0;
     const leaveEncashmentDetail: {
       leaveTypeId: string;
       year: number;
@@ -354,6 +387,19 @@ export class SettlementsService {
       for (const leaveType of encashableTypes) {
         const rule = (leaveType.encashment ?? {}) as EncashmentRule;
         if (!rule.allowed) continue;
+        // Only leave the employee actually has: an inactive type, one with no balance to speak of (comp-off, no
+        // allocation, unlimited), or one whose eligibility rules (gender, employee type, department, months of service
+        // on the last working day) they do not meet is not paid - and no balance row is built for it, which would
+        // otherwise credit a full-year quota that was never theirs.
+        if (
+          !leaveType.isActive ||
+          leaveType.code === LEAVE_TYPE_CODES.COMPOFF ||
+          leaveType.allocationType === AllocationType.NONE ||
+          leaveType.allocationType === AllocationType.UNLIMITED ||
+          !isEligible(leaveType, employee, new Date(`${lwdDate}T00:00:00Z`))
+        ) {
+          continue;
+        }
         const balanceRow = await this.leaveBalanceService.ensureBalanceRow(
           tx,
           dto.employeeId,
@@ -378,7 +424,9 @@ export class SettlementsService {
           0,
           balanceRow.closing - lapsed - (balanceRow.pending ?? 0),
         );
-        if (days > 0) {
+        if (days > 0 && !allowLeaveEncashment) {
+          leaveDaysNotPaid += days;
+        } else if (days > 0) {
           leaveDaysEncashed += days;
           leaveEncashmentDetail.push({
             leaveTypeId: leaveType.id,
@@ -403,7 +451,8 @@ export class SettlementsService {
     );
     const leaveEncashmentExempt = leaveEncashmentExemption({
       amount: leaveEncashmentAmount,
-      basicPlusDaMonthly: basicMonthly + daMonthly,
+      // s.10(10AA)(c) is the AVERAGE salary of the ten months before leaving, not the current figure.
+      basicPlusDaMonthly: await this.averageBasicDaBefore(dto.employeeId, lwdDate, basicMonthly + daMonthly, organizationId),
       yearsOfService: serviceYears,
     });
 
@@ -624,6 +673,15 @@ export class SettlementsService {
 
     // Heads-up (never blocks): things HR should look at before processing.
     const warnings: string[] = [];
+    if (opts.provisional && lwdDate > today) {
+      warnings.push('Provisional: figured before the last working day. It is recalculated automatically after that day, so check the final figures then.');
+    }
+    if (leaveDaysNotPaid > 0) {
+      const days = Math.round(leaveDaysNotPaid * 100) / 100;
+      warnings.push(
+        `Leave encashment is turned off for the organization, so ${days} unused leave day(s) (about Rs ${Math.round(leaveDaysNotPaid * ratePerDay).toLocaleString('en-IN')}) are not paid in this settlement. Turn it on in Organization Settings > Policies and recalculate if they should be paid.`,
+      );
+    }
     const [pendingLeaveCount, pendingClaimCount] = await Promise.all([
       this.scopedPrisma.leave.count({
         where: {
@@ -640,6 +698,25 @@ export class SettlementsService {
         },
       }),
     ]);
+    // A regular run locked before the exit was known pays the whole month: the days after the last working day were
+    // paid although the employee had left. The settlement cannot take that back by itself, so say so.
+    if (monthAlreadyPaid) {
+      const monthLastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+      const daysAfterLwd = monthLastDay - Number(lwdDate.slice(8, 10));
+      if (daysAfterLwd > 0) {
+        const paidRun = await this.scopedPrisma.payrollRun.findFirst({
+          where: { organizationId, employeeId: dto.employeeId, month, year, isFinalSettlement: false, runSequence: 0, status: { in: SETTLED_REGULAR_RUN_STATUSES } },
+          select: { grossSalary: true, attendanceSummary: true },
+        });
+        const notElapsed = Number((paidRun?.attendanceSummary as { daysNotElapsed?: number } | null)?.daysNotElapsed ?? 0);
+        if (paidRun && notElapsed < daysAfterLwd) {
+          const extra = Math.round((paidRun.grossSalary / monthLastDay) * (daysAfterLwd - notElapsed));
+          warnings.push(
+            `The ${month}/${year} regular payroll was locked for the whole month, but the last working day is ${dmyText(lwdDate)}: about Rs ${extra.toLocaleString('en-IN')} was paid for ${daysAfterLwd - notElapsed} day(s) after they left. Enter it under Recoveries (reason: salary paid after last working day) and recalculate, or unlock that payroll and re-run it.`,
+          );
+        }
+      }
+    }
     if (pendingLeaveCount > 0)
       warnings.push(
         `${pendingLeaveCount} leave application(s) are still pending - decide them before processing.`,
@@ -715,8 +792,8 @@ export class SettlementsService {
       receivableNote: null,
       receivableClosedAt: null,
       receivableClosedById: null,
-      calculatedById: actor.id,
-      processedById: actor.id,
+      calculatedById: opts.system ? null : actor.id,
+      processedById: opts.system ? null : actor.id,
     };
     const pendingSalaryNote = monthAlreadyPaid
       ? `Pending salary is 0 — the ${month}/${year} salary was already covered by a regular payroll run.`
@@ -741,6 +818,7 @@ export class SettlementsService {
         data,
         dto.employeeId,
       );
+      await this.linkToOpenCase(dto.employeeId, existing.id, lwdDate, organizationId);
       return {
         ...this.withGratuityPayout(
           await this.scopedPrisma.settlement.findFirstOrThrow({
@@ -771,6 +849,7 @@ export class SettlementsService {
         where: { id: winner.id, organizationId },
         data,
       });
+      await this.linkToOpenCase(dto.employeeId, winner.id, lwdDate, organizationId);
       return {
         ...this.withGratuityPayout(
           await this.scopedPrisma.settlement.findFirstOrThrow({
@@ -788,6 +867,7 @@ export class SettlementsService {
       data,
       dto.employeeId,
     );
+    await this.linkToOpenCase(dto.employeeId, created.id, lwdDate, organizationId);
     // FNF_INITIATED — only on the first calculate() for this employee (the
     // `existing` branch above is a re-preview of the same in-flight draft,
     // not a new initiation), so re-calculating doesn't spam the timeline.
@@ -798,6 +878,21 @@ export class SettlementsService {
       performedById: actor.id,
     });
     return { ...this.withGratuityPayout(created), pendingSalaryNote, warnings };
+  }
+
+  // A settlement figured for the last working day of an exit that is under way is linked to that offboarding case by itself, so
+  // HR never links it by hand (and a recalculation keeps the link). A case with a different last working day is left alone.
+  private async linkToOpenCase(employeeId: string, settlementId: string, lwdDate: string, organizationId: string) {
+    await this.scopedPrisma.offboardingCase.updateMany({
+      where: {
+        organizationId,
+        employeeId,
+        status: { in: ['INITIATED', 'IN_PROGRESS'] },
+        lastWorkingDay: lwdDate,
+        OR: [{ settlementId: null }, { settlementId: { not: settlementId } }],
+      },
+      data: { settlementId },
+    });
   }
 
   // Gratuity for the exit. The GRATUITY statutory version in force on the last working day decides whether it is
@@ -847,16 +942,7 @@ export class SettlementsService {
     // Codes' 50% wages rule is on, at least half of the latest full regular payslip's gross.
     let lastDrawn = basicMonthly + daMonthly;
     if (cfg.applyFiftyPercentRule === true) {
-      const latest = await this.scopedPrisma.payrollRun.findFirst({
-        where: {
-          organizationId,
-          employeeId: dto.employeeId,
-          isFinalSettlement: false,
-          runSequence: 0,
-        },
-        orderBy: [{ year: 'desc' }, { month: 'desc' }],
-        select: { grossSalary: true },
-      });
+      const latest = await this.lastFullMonthRun(dto.employeeId, dto.lastWorkingDay.slice(0, 10), organizationId);
       lastDrawn = Math.max(lastDrawn, (latest?.grossSalary ?? 0) * 0.5);
     }
     // Average Basic + DA of the last ten months - the wages a non-covered employer's exemption is figured on.
@@ -1022,6 +1108,48 @@ export class SettlementsService {
   // default) running from the day they gave it: days short of it are recovered at the daily rate. When the company
   // ends the employment it is the company that owes the notice: the shortfall is paid in lieu only if HR asks
   // (payNoticeInLieu). The daily rate is the last full month's gross over 30, falling back to basic + DA.
+  // Average Basic + DA earned over the (up to) ten finalised regular months before the last working day's month - what
+  // the leave-encashment exemption is capped on. `fallback` (the current monthly Basic + DA) when there is no history.
+  private async averageBasicDaBefore(employeeId: string, lwdDate: string, fallback: number, organizationId: string): Promise<number> {
+    const year = Number(lwdDate.slice(0, 4));
+    const month = Number(lwdDate.slice(5, 7));
+    const runs = await this.scopedPrisma.payrollRun.findMany({
+      where: {
+        organizationId,
+        employeeId,
+        isFinalSettlement: false,
+        runSequence: 0,
+        status: { in: SETTLED_REGULAR_RUN_STATUSES },
+        OR: [{ year: { lt: year } }, { year, month: { lt: month } }],
+      },
+      orderBy: [{ year: 'desc' }, { month: 'desc' }],
+      take: LEAVE_EXEMPTION_AVERAGE_MONTHS,
+      select: { earnings: true },
+    });
+    const figures = runs
+      .map((r) => bonusMonthFromRun({ ...r, month: 0, year: 0, attendanceSummary: null }).basicDaEarned)
+      .filter((v) => v > 0);
+    return figures.length > 0 ? figures.reduce((a, b) => a + b, 0) / figures.length : fallback;
+  }
+
+  // The latest regular payslip from a month BEFORE the last working day's: the exit month's own run is cut short at the
+  // last working day, so its gross is part of a month and would understate the daily rate for notice pay and the
+  // gratuity wage floor. Falls back to the latest run of any month when there is none earlier.
+  private async lastFullMonthRun(employeeId: string, lwdDate: string, organizationId: string) {
+    const year = Number(lwdDate.slice(0, 4));
+    const month = Number(lwdDate.slice(5, 7));
+    const base = { organizationId, employeeId, isFinalSettlement: false, runSequence: 0 };
+    const order = [{ year: 'desc' as const }, { month: 'desc' as const }];
+    return (
+      (await this.scopedPrisma.payrollRun.findFirst({
+        where: { ...base, OR: [{ year: { lt: year } }, { year, month: { lt: month } }] },
+        orderBy: order,
+        select: { grossSalary: true },
+      })) ??
+      (await this.scopedPrisma.payrollRun.findFirst({ where: base, orderBy: order, select: { grossSalary: true } }))
+    );
+  }
+
   private async computeNotice(args: {
     dto: CalculateSettlementDto;
     organizationId: string;
@@ -1056,16 +1184,7 @@ export class SettlementsService {
     const shortfallDays = noticeShortfallDays(noticeDays, startedOn, lwdDate);
     if (shortfallDays <= 0) return none;
 
-    const lastRun = await this.scopedPrisma.payrollRun.findFirst({
-      where: {
-        organizationId,
-        employeeId: dto.employeeId,
-        isFinalSettlement: false,
-        runSequence: 0,
-      },
-      orderBy: [{ year: 'desc' }, { month: 'desc' }],
-      select: { grossSalary: true },
-    });
+    const lastRun = await this.lastFullMonthRun(dto.employeeId, lwdDate, organizationId);
     const monthly =
       lastRun && lastRun.grossSalary > 0
         ? lastRun.grossSalary
@@ -1131,7 +1250,7 @@ export class SettlementsService {
     });
     if (open) {
       throw new BadRequestException(
-        `The regular ${month}/${year} payroll run for this employee is ${open.status.toLowerCase()} but not locked — lock that run first (it then pays the ${month}/${year} salary), then calculate the settlement.`,
+        `The regular ${month}/${year} payroll run for this employee is ${open.status.toLowerCase()} but not locked — lock that run first (it then pays the ${month}/${year} salary up to the last working day), or delete it from Payroll, then calculate the settlement.`,
       );
     }
   }
@@ -1261,6 +1380,13 @@ export class SettlementsService {
         'Only a draft settlement can be processed.',
       );
     }
+    // An early estimate (made when the resignation was approved) cannot be paid out before the last working day has passed.
+    const orgTz = (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata';
+    if (settlement.lastWorkingDay.slice(0, 10) > todayInOrgTz(orgTz)) {
+      throw new BadRequestException(
+        `The last working day (${dmyText(settlement.lastWorkingDay.slice(0, 10))}) has not come yet. This settlement is an estimate until then - recalculate it on or after that day, then process it.`,
+      );
+    }
     // Leave still waiting on a decision (an application or an encashment request) holds days this settlement is about
     // to pay out - settle those first so the same day is not paid, or taken, twice.
     const [pendingLeaves, openEncashments] = await Promise.all([
@@ -1284,6 +1410,17 @@ export class SettlementsService {
     if (pendingLeaves > 0 || openEncashments > 0) {
       throw new BadRequestException(
         `This employee still has ${pendingLeaves} pending leave application(s) and ${openEncashments} leave encashment request(s) not yet paid. Decide or pay them first, then recalculate the settlement.`,
+      );
+    }
+    // The figures were worked out under the leave policy of that day. If leave encashment has been switched off for the
+    // company since, a draft that still pays leave out must be recalculated (it then pays none) rather than paid.
+    const { allowLeaveEncashment } = await getOrgLeaveSwitches(
+      this.scopedPrisma,
+      organizationId,
+    );
+    if (!allowLeaveEncashment && settlement.leaveEncashmentAmount > 0) {
+      throw new BadRequestException(
+        `Leave encashment has been turned off for the organization since this settlement was calculated, but it still includes a leave encashment payout of Rs ${Math.round(settlement.leaveEncashmentAmount).toLocaleString('en-IN')}. Recalculate the settlement (it will then pay no leave) before processing it.`,
       );
     }
     // Maker-checker: whoever calculated the figures cannot also approve them for payment, unless they are an Admin
@@ -1517,10 +1654,12 @@ export class SettlementsService {
         );
       }
 
+      const joiner = await tx.user.findFirst({ where: { id: settlement.employeeId, organizationId }, select: { brandId: true } });
       const run = await tx.payrollRun.create({
         data: {
           organizationId,
           employeeId: settlement.employeeId,
+          brandId: joiner?.brandId ?? null,
           month,
           year,
           isFinalSettlement: true,
@@ -1709,6 +1848,7 @@ export class SettlementsService {
       // Fire-and-forget — the settlement has already been processed.
       void this.emailService.send({
         organizationId,
+        allowInactive: true, // addressed to a leaver on purpose
         to: personalEmail,
         subject: rendered.subject,
         html: rendered.html,
@@ -1853,6 +1993,46 @@ export class SettlementsService {
     );
   }
 
+  // Throws away a DRAFT - a preview calculated for the wrong employee or date. A draft has booked nothing (no payroll
+  // run, loans, claims or leave touched), so it is deleted outright; an exit case it was linked to is unlinked first.
+  // Processed and paid settlements are never deleted - reverse a processed one instead.
+  async discardDraft(id: string, actor: Actor, organizationId: string) {
+    const settlement = await this.scopedPrisma.settlement.findFirst({
+      where: { id, organizationId },
+    });
+    if (!settlement) throw new NotFoundException('Settlement not found.');
+    if (settlement.status !== SettlementStatus.DRAFT) {
+      throw new BadRequestException(
+        'Only a draft settlement can be discarded - reverse a processed settlement instead.',
+      );
+    }
+    await this.scopedPrisma.$transaction(async (tx) => {
+      await tx.offboardingCase.updateMany({
+        where: { organizationId, settlementId: id },
+        data: { settlementId: null },
+      });
+      const { count } = await tx.settlement.deleteMany({
+        where: { id, organizationId, status: SettlementStatus.DRAFT },
+      });
+      if (count === 0) {
+        throw new ConflictException('This settlement was already changed.');
+      }
+    });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'SETTLEMENT_DISCARDED',
+      module: 'PAYROLL',
+      organizationId,
+      targetId: id,
+      details: {
+        employeeId: settlement.employeeId,
+        lastWorkingDay: settlement.lastWorkingDay,
+        netSettlementAmount: settlement.netSettlementAmount,
+      },
+    });
+    return { id, discarded: true };
+  }
+
   async markPaid(
     id: string,
     actor: Actor,
@@ -1983,6 +2163,7 @@ export class SettlementsService {
       );
       await this.emailService.send({
         organizationId,
+        allowInactive: true, // addressed to a leaver on purpose
         to,
         subject: rendered.subject,
         html: rendered.html,

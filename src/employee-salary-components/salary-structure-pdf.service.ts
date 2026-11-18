@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import PDFDocument from 'pdfkit';
 import * as path from 'path';
+import { BrandingLookupService } from '../company-brands/branding-lookup.service';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { readStoredFile } from '../files/file-storage.config';
@@ -350,6 +351,7 @@ export class SalaryStructurePdfService {
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly payrollService: PayrollService,
+    private readonly brandingLookup: BrandingLookupService,
   ) {}
 
   async build(
@@ -375,6 +377,7 @@ export class SalaryStructurePdfService {
           employeeId: true,
           designation: true,
           joiningDate: true,
+          brandId: true,
         },
       }),
     ]);
@@ -428,12 +431,15 @@ export class SalaryStructurePdfService {
     const costs = await this.payrollService
       .structureCosts(organizationId, employeeId)
       .catch(() => null);
-    const logo = org?.companyLogoUrl
-      ? await readStoredFile(org.companyLogoUrl).catch(() => null)
+    // A sister company's salary structure carries its brand's name, address and logo; no brand keeps the organization's own.
+    const branding = employee.brandId ? await this.brandingLookup.forBrand(organizationId, employee.brandId) : null;
+    const logoKey = branding?.brandId ? branding.logoUrl : org?.companyLogoUrl;
+    const logo = logoKey
+      ? await readStoredFile(logoKey).catch(() => null)
       : null;
     const buffer = await renderSalaryStructurePdf({
-      companyName: org?.companyName || 'the Company',
-      companyAddress: org?.registeredAddress || '',
+      companyName: branding?.brandId ? branding.companyName : org?.companyName || 'the Company',
+      companyAddress: (branding?.brandId ? branding.address : org?.registeredAddress) || '',
       companyLogoBuffer: logo,
       watermarkEnabled: !!org?.watermarkLogo,
       employeeName: employee.name,

@@ -6,6 +6,9 @@
 // Important: sendBroadcast() always writes category=GENERAL (hardcoded, matching the original release exactly);
 // the optional accompanying email is gated per-recipient by their own emailEnabled preference — the only
 // place that flag is actually consulted.
+import { reviewerScope } from '../common/dept-scope';
+import { withLink } from './notification-link-rules';
+import { managerIdsOf } from '../common/managers';
 import {
   BadRequestException,
   Inject,
@@ -19,6 +22,14 @@ import {
   Role,
   User,
 } from '@prisma/client';
+import {
+  channelAllowed,
+  hiddenInAppCategories,
+  mergeChannels,
+  readPreferences,
+  unknownChannelKeys,
+  type NotificationPreferences,
+} from './notification-preferences';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { AuditLogService } from '../audit-log/audit-log.service';
@@ -33,18 +44,6 @@ import { companyLogoImgTag } from '../email-templates/company-logo';
 
 type Actor = Omit<User, 'password'>;
 
-export interface NotificationPreferences {
-  mutedCategories: NotificationCategory[];
-  emailEnabled: boolean;
-  // Push notifications to the user's phone(s).
-  pushEnabled: boolean;
-}
-
-const DEFAULT_PREFERENCES: NotificationPreferences = {
-  mutedCategories: [],
-  emailEnabled: true,
-  pushEnabled: true,
-};
 
 // Every other module in the app calls this to create a Notification row —
 // the closest backend-v2 equivalent to the original release's inline
@@ -58,16 +57,9 @@ export interface CreateNotificationInput {
   category: NotificationCategory;
   // Marks a notification that asks the recipient to decide on something (see push-messages.ts).
   pushKind?: 'APPROVAL';
-}
-
-function readPreferences(raw: unknown): NotificationPreferences {
-  const prefs = raw as Partial<NotificationPreferences> | null | undefined;
-  return {
-    mutedCategories:
-      prefs?.mutedCategories ?? DEFAULT_PREFERENCES.mutedCategories,
-    emailEnabled: prefs?.emailEnabled ?? DEFAULT_PREFERENCES.emailEnabled,
-    pushEnabled: prefs?.pushEnabled ?? DEFAULT_PREFERENCES.pushEnabled,
-  };
+  // A page inside the web app (starting with "/") that opening the notification goes to, when its kind alone does not say
+  // where (e.g. one person's Documents tab). Stored on the notification; the web app follows it.
+  link?: string;
 }
 
 @Injectable()
@@ -91,6 +83,7 @@ export class NotificationsService {
         title: input.title,
         message: input.message,
         category: input.category,
+        ...(input.link ? { link: input.link } : {}),
       },
     });
     // The same event also goes to the user's phone(s); never allowed to fail the caller.
@@ -98,13 +91,17 @@ export class NotificationsService {
     return row;
   }
 
-  // Tells whoever has to decide on a request that it is waiting: the requester's reporting manager when managerFirst
-  // is set and they have one, otherwise every active HR and Admin user (never the requester). Used for request types
-  // that otherwise reach no one until a reviewer happens to open the pending list (overtime, comp-off, leave
-  // encashment, reimbursement). Best-effort — a notification problem must never fail the request itself.
+  // Tells whoever has to decide on a request that it is waiting. Only the people assigned to the requester hear of it:
+  // - managerFirst: the requester's reporting managers and the head of their department (Organization > Departments).
+  // - otherwise (an HR/Admin queue), or when there is nobody for managerFirst: the HR users who look after the requester
+  //   (they head the requester's department, or the requester is in their reporting line). Only when no HR user is
+  //   assigned does it go to every Admin and every HR user who heads no department.
+  // An Admin's request goes to the other Admins only. Never the requester. Used for request types that otherwise reach
+  // no one until a reviewer happens to open the pending list (overtime, comp-off, leave encashment, reimbursement).
+  // Best-effort — a notification problem must never fail the request itself.
   async notifyReviewers(input: {
     organizationId: string;
-    requester: Pick<User, 'id' | 'reportingManagerId'>;
+    requester: Pick<User, 'id' | 'reportingManagerId'> & { additionalReportingManagerIds?: string[] | null };
     title: string;
     message: string;
     category: NotificationCategory;
@@ -112,53 +109,62 @@ export class NotificationsService {
   }) {
     try {
       const { organizationId, requester, title, message, category } = input;
-      if (
-        input.managerFirst &&
-        requester.reportingManagerId &&
-        requester.reportingManagerId !== requester.id
-      ) {
-        await this.create({
-          organizationId,
-          userId: requester.reportingManagerId,
-          title,
-          message,
-          category,
-          pushKind: 'APPROVAL',
-        });
-        return;
-      }
-      // An Admin's request goes to the other Admins only: it never falls back to HR.
-      const requesterRow = await this.scopedPrisma.user.findFirst({
-        where: { id: requester.id, organizationId },
-        select: { role: true },
-      });
-      const reviewers = await this.scopedPrisma.user.findMany({
-        where: {
-          organizationId,
-          isActive: true,
-          id: { not: requester.id },
-          role: {
-            in:
-              requesterRow?.role === Role.ADMIN
-                ? [Role.ADMIN]
-                : [Role.HR, Role.ADMIN],
-          },
-        },
-        select: { id: true },
-      });
+      const recipients = await this.reviewersFor(organizationId, requester, !!input.managerFirst);
       await this.createMany(
-        reviewers.map((u) => ({
-          organizationId,
-          userId: u.id,
-          title,
-          message,
-          category,
-          pushKind: 'APPROVAL',
-        })),
+        recipients.map((userId) => ({ organizationId, userId, title, message, category, pushKind: 'APPROVAL' as const })),
       );
     } catch {
       // Intentionally swallowed — see above.
     }
+  }
+
+  // The user ids notifyReviewers tells (see there). Exposed so other "please decide" messages can follow the same rule.
+  async reviewersFor(
+    organizationId: string,
+    requester: Pick<User, 'id' | 'reportingManagerId'> & { additionalReportingManagerIds?: string[] | null },
+    managerFirst: boolean,
+  ): Promise<string[]> {
+    const today = new Date().toISOString().slice(0, 10);
+    // Only people who still work here: a request must not be addressed to someone whose account is closed or whose
+    // last working day has passed (it would reach nobody).
+    const working = { isActive: true, OR: [{ exitDate: null }, { exitDate: { gte: today } }] };
+    const requesterRow = await this.scopedPrisma.user.findFirst({
+      where: { id: requester.id, organizationId },
+      select: { role: true, departmentId: true, department: { select: { departmentHeadId: true } } },
+    });
+    if (requesterRow?.role === Role.ADMIN) {
+      const admins = await this.scopedPrisma.user.findMany({
+        where: { organizationId, ...working, id: { not: requester.id }, role: Role.ADMIN },
+        select: { id: true },
+      });
+      return admins.map((u) => u.id);
+    }
+    if (managerFirst) {
+      const headId = requesterRow?.department?.departmentHeadId;
+      const candidates = [...new Set([...managerIdsOf(requester), ...(headId ? [headId] : [])])].filter(
+        (m) => m !== requester.id,
+      );
+      const managers = candidates.length
+        ? await this.scopedPrisma.user.findMany({
+            where: { organizationId, ...working, id: { in: candidates } },
+            select: { id: true },
+          })
+        : [];
+      if (managers.length > 0) return managers.map((m) => m.id);
+    }
+    const hrAndAdmins = await this.scopedPrisma.user.findMany({
+      where: { organizationId, ...working, id: { not: requester.id }, role: { in: [Role.HR, Role.ADMIN] } },
+      select: { id: true, role: true },
+    });
+    const assignedHr: string[] = [];
+    const unassignedHr: string[] = [];
+    for (const u of hrAndAdmins.filter((x) => x.role === Role.HR)) {
+      const scope = await reviewerScope(this.scopedPrisma, u, organizationId);
+      if (scope === null) unassignedHr.push(u.id);
+      else if (scope.includes(requester.id)) assignedHr.push(u.id);
+    }
+    if (assignedHr.length > 0) return assignedHr;
+    return [...hrAndAdmins.filter((x) => x.role === Role.ADMIN).map((u) => u.id), ...unassignedHr];
   }
 
   async createMany(inputs: CreateNotificationInput[]) {
@@ -170,6 +176,7 @@ export class NotificationsService {
         title: input.title,
         message: input.message,
         category: input.category,
+        ...(input.link ? { link: input.link } : {}),
       })),
     });
     this.pushService.notify(inputs);
@@ -180,13 +187,12 @@ export class NotificationsService {
     actor: Actor,
     organizationId: string,
   ) {
-    const prefs = readPreferences(actor.notificationPreferences);
+    // Kinds the person muted, or has the in-app channel switched off for, stay out of their inbox.
+    const hidden = hiddenInAppCategories(actor.notificationPreferences);
     const where: Prisma.NotificationWhereInput = {
       organizationId,
       userId: actor.id,
-      ...(prefs.mutedCategories.length > 0 && {
-        category: { notIn: prefs.mutedCategories },
-      }),
+      ...(hidden.length > 0 && { category: { notIn: hidden } }),
     };
 
     const [result, unreadCount] = await Promise.all([
@@ -207,21 +213,20 @@ export class NotificationsService {
       }),
     ]);
 
-    return { ...result, unreadCount };
+    // Each row carries the page it opens: the one the sender set, else the one its title implies.
+    return { ...result, data: result.data.map((n: any) => withLink(n)), unreadCount };
   }
 
   // Lightweight badge count — same muted-category filtering as findMine's
   // unreadCount, without loading/paginating the list.
   async unreadCount(actor: Actor, organizationId: string) {
-    const prefs = readPreferences(actor.notificationPreferences);
+    const hidden = hiddenInAppCategories(actor.notificationPreferences);
     const unreadCount = await this.scopedPrisma.notification.count({
       where: {
         organizationId,
         userId: actor.id,
         isRead: false,
-        ...(prefs.mutedCategories.length > 0 && {
-          category: { notIn: prefs.mutedCategories },
-        }),
+        ...(hidden.length > 0 && { category: { notIn: hidden } }),
       },
     });
     return { unreadCount };
@@ -237,10 +242,21 @@ export class NotificationsService {
     organizationId: string,
   ) {
     const current = readPreferences(actor.notificationPreferences);
+    if (dto.channels) {
+      const bad = unknownChannelKeys(dto.channels);
+      if (bad.length > 0) {
+        throw new BadRequestException(
+          `Unknown notification setting: ${bad.join(', ')}.`,
+        );
+      }
+    }
     const merged: NotificationPreferences = {
       mutedCategories: dto.mutedCategories ?? current.mutedCategories,
       emailEnabled: dto.emailEnabled ?? current.emailEnabled,
       pushEnabled: dto.pushEnabled ?? current.pushEnabled,
+      channels: dto.channels
+        ? mergeChannels(current.channels, dto.channels)
+        : current.channels,
     };
 
     await this.scopedPrisma.user.updateMany({
@@ -365,8 +381,12 @@ export class NotificationsService {
       );
       await Promise.all(
         recipients
-          .filter(
-            (r) => readPreferences(r.notificationPreferences).emailEnabled,
+          .filter((r) =>
+            channelAllowed(
+              r.notificationPreferences,
+              NotificationCategory.GENERAL,
+              'email',
+            ),
           )
           .map((r) =>
             this.emailService.send({

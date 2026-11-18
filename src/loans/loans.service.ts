@@ -5,6 +5,7 @@
 // but is also exposed for HR to record/adjust a repayment manually.
 // Important: getRepayments() re-applies the EMPLOYEE-can-only-see-own-loan and MANAGER-own-dept-only checks
 // independently of findAll's filter, since it's reached directly by loan id rather than through the pre-filtered list.
+import { isLoanEligible, LOAN_ELIGIBILITY_NOTE } from './loan-eligibility';
 import { EMPLOYEE_RELATION_ORDER_BY } from '../common/employee-order';
 import {
   BadRequestException,
@@ -41,11 +42,15 @@ import { RecordRepaymentDto } from './dto/record-repayment.dto';
 import { QueryLoanDto } from './dto/query-loan.dto';
 import { paginate, skip } from '../common/pagination';
 import {
+  assertManagerDeptScope,
   deptScopedEmployeeIds,
-  assertNotSelfApproval,
+  inReviewerScope,
+  isScopedReviewer,
 } from '../common/dept-scope';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
+import { dmyText } from '../payroll/format-date';
+import { sendOccasionEmail } from '../email-templates/send-occasion-email';
 import { EmailTemplatesService } from '../email-templates/email-templates.service';
 
 type Actor = Omit<User, 'password'>;
@@ -142,6 +147,8 @@ export class LoansService {
     excludeLoanId?: string;
   }): Promise<void> {
     const { employee, actor, emiAmount, organizationId } = params;
+    // Eligibility (confirmed and permanent) is checked when an employee applies; whoever sanctions or approves - Admin or HR -
+    // is the one who decides, so it does not stop them here.
     const startProblem = loanStartError(params.startMonth, params.startYear);
     if (startProblem) throw new BadRequestException(startProblem);
 
@@ -181,14 +188,20 @@ export class LoansService {
 
     if (actor.role === Role.EMPLOYEE) {
       where.employeeId = actor.id;
-    } else if (actor.role === Role.MANAGER) {
-      where.employeeId = {
-        in: await deptScopedEmployeeIds(
-          this.scopedPrisma,
-          actor,
-          organizationId,
-        ),
-      };
+    } else if (await isScopedReviewer(this.scopedPrisma, actor, organizationId)) {
+      // A manager's own loans (My Loans / Advances) - they borrow like any employee - or one person, or the whole
+      // department they manage.
+      const scope = await deptScopedEmployeeIds(
+        this.scopedPrisma,
+        actor,
+        organizationId,
+      );
+      where.employeeId =
+        query.employeeId === actor.id
+          ? actor.id
+          : query.employeeId
+            ? { in: scope.filter((id) => id === query.employeeId) }
+            : { in: scope };
     } else if (query.employeeId) {
       where.employeeId = query.employeeId;
     }
@@ -229,6 +242,7 @@ export class LoansService {
         'Cannot sanction a loan for a deactivated employee.',
       );
     }
+    if (employeeRow.exitDate) throw new BadRequestException(EXIT_IN_PROGRESS_LOAN_MESSAGE);
 
     this.assertAdvanceIsInterestFree(
       dto.loanType ?? LoanType.LOAN,
@@ -342,6 +356,12 @@ export class LoansService {
         'You already have a loan/advance request waiting for a decision. Wait for it to be reviewed, or ask HR to reject it, before requesting another.',
       );
     }
+    const requester = await this.scopedPrisma.user.findFirst({
+      where: { id: actor.id, organizationId },
+      select: { exitDate: true, employmentStatus: true, employeeType: true },
+    });
+    if (requester?.exitDate) throw new BadRequestException(EXIT_IN_PROGRESS_LOAN_MESSAGE);
+    // Anyone can apply; whether they are confirmed and permanent is for the approver to weigh, so the approver is told below.
     const now = new Date();
     const emiAmount = calculateEmi(dto.principal, 0, dto.tenureMonths);
 
@@ -362,16 +382,14 @@ export class LoansService {
       },
     });
 
-    const hrUsers = await this.scopedPrisma.user.findMany({
-      where: { organizationId, role: { in: [Role.HR, Role.ADMIN] } },
-      select: { id: true },
-    });
+    // The HR assigned to the employee (see NotificationsService.reviewersFor), not every HR user.
+    const hrUsers = await this.notificationsService.reviewersFor(organizationId, actor, false);
     await this.notificationsService.createMany(
-      hrUsers.map((u) => ({
+      hrUsers.map((userId) => ({
         organizationId,
-        userId: u.id,
+        userId,
         title: 'Loan/Advance Request Pending Review',
-        message: `${actor.name} requested a ${loanKind(loan.loanType)} of ${dto.principal} over ${dto.tenureMonths} month(s).`,
+        message: `${actor.name} requested a ${loanKind(loan.loanType)} of ${dto.principal} over ${dto.tenureMonths} month(s).${requester && !isLoanEligible(requester) ? ` ${LOAN_ELIGIBILITY_NOTE}` : ''}`,
         category: NotificationCategory.GENERAL,
       })),
     );
@@ -411,7 +429,7 @@ export class LoansService {
     // An HR/Admin can't approve their own loan request — same self-review
     // gate as document/probation reviews elsewhere; ADMIN is exempt since
     // there's no one above an Admin to approve it instead.
-    assertNotSelfApproval(actor, loan.employeeId);
+    await assertManagerDeptScope(this.scopedPrisma, actor, organizationId, loan.employeeId);
     await this.auditLogService.logSelfApproval(actor, {
       module: 'PAYROLL',
       targetId: id,
@@ -428,6 +446,7 @@ export class LoansService {
         'Cannot approve a loan for a deactivated employee.',
       );
     }
+    if (employee.exitDate) throw new BadRequestException(EXIT_IN_PROGRESS_LOAN_MESSAGE);
 
     const interestRate = dto.interestRate ?? 0;
     this.assertAdvanceIsInterestFree(loan.loanType, interestRate);
@@ -459,6 +478,7 @@ export class LoansService {
         startYear: dto.startYear,
         outstandingBalance: loan.principal,
         approvedById: actor.id,
+        decisionNote: dto.comments?.trim() || null,
       },
     });
     if (count === 0) {
@@ -470,7 +490,7 @@ export class LoansService {
 
     if (employee) {
       const title = 'Loan Request Approved';
-      const message = `Your ${loanKind(loan.loanType)} request of ${loan.principal} has been approved, repayable as ${emiAmount}/month over ${tenureMonths} month(s) starting ${dto.startMonth}/${dto.startYear}.`;
+      const message = `Your ${loanKind(loan.loanType)} request of ${loan.principal} has been approved, repayable as ${emiAmount}/month over ${tenureMonths} month(s) starting ${dto.startMonth}/${dto.startYear}.${dto.comments?.trim() ? ` Comments: ${dto.comments.trim()}` : ''}`;
       await this.notificationsService.create({
         organizationId,
         userId: employee.id,
@@ -532,7 +552,7 @@ export class LoansService {
     if (loan.status !== LoanStatus.PENDING) {
       throw new BadRequestException('Only a pending request can be rejected.');
     }
-    assertNotSelfApproval(actor, loan.employeeId);
+    await assertManagerDeptScope(this.scopedPrisma, actor, organizationId, loan.employeeId);
     await this.auditLogService.logSelfApproval(actor, {
       module: 'PAYROLL',
       targetId: id,
@@ -543,7 +563,12 @@ export class LoansService {
     // Guarded compare-and-swap — see approve()'s comment for why.
     const { count } = await this.scopedPrisma.loan.updateMany({
       where: { id, organizationId, status: LoanStatus.PENDING },
-      data: { status: LoanStatus.REJECTED, approvedById: actor.id },
+      // A rejected request was never paid out, so nothing is owed on it (the requested amount sat in the balance).
+      data: {
+        status: LoanStatus.REJECTED,
+        approvedById: actor.id,
+        outstandingBalance: 0,
+      },
     });
     if (count === 0) {
       throw new ConflictException('This loan request was already reviewed.');
@@ -713,6 +738,10 @@ export class LoansService {
           message,
           category: NotificationCategory.GENERAL,
         });
+        if (dto.status === LoanStatus.CLOSED && loan.outstandingBalance === 0) {
+          void this.emailLoanClosed(organizationId, loan);
+          return updated;
+        }
         const rendered = await this.emailTemplatesService.renderOccasion(
           organizationId,
           'LOAN_STATUS_UPDATE',
@@ -853,6 +882,9 @@ export class LoansService {
       return { repayment, loan: updatedLoan };
     });
 
+    if (result.loan.status === LoanStatus.CLOSED ) {
+      void this.emailLoanClosed(organizationId, loan);
+    }
     await this.auditLogService.log({
       actorId: actorId ?? loan.approvedById ?? loan.employeeId,
       action: 'LOAN_REPAYMENT_RECORDED',
@@ -876,6 +908,34 @@ export class LoansService {
     return result;
   }
 
+  // "Your loan is fully repaid" (template LOAN_CLOSED). Best-effort.
+  private async emailLoanClosed(
+    organizationId: string,
+    loan: { employeeId: string; loanType: string; principal: number },
+  ) {
+    try {
+      const employee = await this.scopedPrisma.user.findFirst({
+        where: { id: loan.employeeId, organizationId },
+        select: { name: true, email: true, notificationPreferences: true },
+      });
+      if (!employee) return;
+      await sendOccasionEmail(this.emailService, this.emailTemplatesService, {
+        organizationId,
+        to: employee.email,
+        occasionKey: 'LOAN_CLOSED',
+        notificationPreferences: employee.notificationPreferences,
+        variables: {
+          employeeName: employee.name,
+          loanType: loanKind(loan.loanType as never),
+          amount: `₹${loan.principal}`,
+          closedOn: dmyText(new Date().toISOString().slice(0, 10)),
+        },
+      });
+    } catch {
+      /* best-effort */
+    }
+  }
+
   async getRepayments(id: string, actor: Actor, organizationId: string) {
     const loan = await this.scopedPrisma.loan.findFirst({
       where: { id, organizationId },
@@ -891,9 +951,9 @@ export class LoansService {
     }
     // A manager with no department has no team: two null departments are not "the same department".
     if (
-      actor.role === Role.MANAGER &&
-      (actor.departmentId === null ||
-        loan.employee.departmentId !== actor.departmentId)
+      actor.role !== Role.ADMIN &&
+      actor.role !== Role.EMPLOYEE &&
+      !(await inReviewerScope(this.scopedPrisma, actor, organizationId, loan.employeeId))
     ) {
       throw new ForbiddenException('Not authorized to view this loan.');
     }
@@ -904,6 +964,11 @@ export class LoansService {
     });
   }
 }
+
+// A loan or advance is recovered from the final settlement, which may not cover it: nothing new is lent to someone who is
+// leaving (their last working day is set) - HR can lend again if the exit is cancelled.
+export const EXIT_IN_PROGRESS_LOAN_MESSAGE =
+  'This employee is leaving (their last working day is set), so a new loan or advance cannot be given. Cancel the exit first if they are staying.';
 
 // "LOAN" -> "loan", "ADVANCE" -> "advance" for user-facing sentences (the enum value read "A LOAN loan").
 function loanKind(type: string): string {

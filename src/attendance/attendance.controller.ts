@@ -13,12 +13,14 @@ import {
   Put,
   Query,
   UseGuards,
+  BadRequestException,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiHeader, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Role, User } from '@prisma/client';
 import { AttendanceService } from './attendance.service';
 import { IngestPunchDto } from './dto/ingest-punch.dto';
+import { BulkManualPunchDto } from './dto/bulk-manual-punch.dto';
 import { ManualPunchDto } from './dto/manual-punch.dto';
 import { SelfPunchDto } from './dto/self-punch.dto';
 import { SetWorkArrangementDto } from './dto/set-work-arrangement.dto';
@@ -26,7 +28,9 @@ import { QueryAttendanceDto } from './dto/query-attendance.dto';
 import { RequestRegularizationDto } from './dto/request-regularization.dto';
 import { ReviewRegularizationDto } from './dto/review-regularization.dto';
 import { PreviewWfhDaysQueryDto } from './dto/preview-wfh-days-query.dto';
+import { DecidedWfhQueryDto } from './dto/decided-wfh-query.dto';
 import { ReviewWfhDto } from './dto/review-wfh.dto';
+import { ImportWfhDto } from './dto/import-wfh.dto';
 import { UploadImportBatchDto } from './dto/upload-import-batch.dto';
 import { NotifyAbsenteesDto } from './dto/notify-absentees.dto';
 import { BackfillAttendanceDto } from './dto/backfill-attendance.dto';
@@ -74,6 +78,19 @@ export class AttendanceController {
     );
   }
 
+  // The same In/Out for several employees on several days at once; the reply lists any person-day that was refused.
+  @Post('punch/manual/bulk')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  @ApiBearerAuth('access-token')
+  manualPunchBulk(@Body() dto: BulkManualPunchDto, @CurrentUser() caller: Caller) {
+    return this.attendanceService.manualPunchBulk(
+      dto,
+      caller.organizationId,
+      caller.id,
+    );
+  }
+
   // No @Roles() — any authenticated caller punches for themselves only.
   @Post('punch/self')
   @ApiBearerAuth('access-token')
@@ -90,6 +107,21 @@ export class AttendanceController {
     );
   }
 
+  // Work From Home usage for the employee profile (days used / upcoming / awaiting approval). Own by default;
+  // Admin/HR/Manager can pass an employeeId. Literal path, before any :id route.
+  @Get('wfh-summary')
+  @ApiBearerAuth('access-token')
+  wfhSummary(
+    @Query('employeeId') employeeId: string | undefined,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.attendanceService.getWfhSummary(
+      employeeId,
+      caller,
+      caller.organizationId,
+    );
+  }
+
   @Put('work-arrangement')
   @ApiBearerAuth('access-token')
   setWorkArrangement(
@@ -101,6 +133,16 @@ export class AttendanceController {
       caller,
       caller.organizationId,
     );
+  }
+
+  // Migration of past, already-approved Work From Home from a spreadsheet (Admin/HR). dryRun (the default) only checks
+  // every row. POST, so it never meets the :id review routes.
+  @Post('work-arrangement/import')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  @ApiBearerAuth('access-token')
+  importWfh(@Body() dto: ImportWfhDto, @CurrentUser() caller: Caller) {
+    return this.attendanceService.importWfh(dto, caller, caller.organizationId);
   }
 
   // What a multi-day request would cover (nothing is written). Literal path, registered before the :id routes.
@@ -125,6 +167,23 @@ export class AttendanceController {
     return this.attendanceService.listPendingWfhRequests(
       caller,
       caller.organizationId,
+    );
+  }
+
+  // Already-decided (approved / rejected) Work From Home days, with who decided them and any remarks.
+  // Literal path, registered before the ':id' routes.
+  @Get('work-arrangement/decided')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
+  @ApiBearerAuth('access-token')
+  listDecidedWfhRequests(
+    @Query() query: DecidedWfhQueryDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.attendanceService.listDecidedWfhRequests(
+      caller,
+      caller.organizationId,
+      query,
     );
   }
 
@@ -170,6 +229,13 @@ export class AttendanceController {
     return this.attendanceService.getMyGeoFence(caller, caller.organizationId);
   }
 
+  // One employee's day (record, overtime, shift, time beyond shift) for the Attendance Tracker popup. Literal path, before the :id routes.
+  @Get('day-detail')
+  @ApiBearerAuth('access-token')
+  dayDetail(@Query('employeeId') employeeId: string, @Query('date') date: string, @CurrentUser() caller: Caller) {
+    return this.attendanceService.getDayDetail(employeeId, date, caller, caller.organizationId);
+  }
+
   @Get()
   @ApiBearerAuth('access-token')
   list(@Query() query: QueryAttendanceDto, @CurrentUser() caller: Caller) {
@@ -195,6 +261,24 @@ export class AttendanceController {
   @ApiBearerAuth('access-token')
   regularizationSettings(@CurrentUser() caller: Caller) {
     return this.attendanceService.getRegularizationSettings(
+      caller.organizationId,
+    );
+  }
+
+  // No @Roles() - the caller's own standing against the Admin-set regularization caps for a date's month. Declared
+  // before the ':id' routes so "usage" is not read as an id.
+  @Get('regularization/usage')
+  @ApiBearerAuth('access-token')
+  regularizationUsage(
+    @Query('date') date: string,
+    @CurrentUser() caller: Caller,
+  ) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date ?? '')) {
+      throw new BadRequestException('date must be YYYY-MM-DD.');
+    }
+    return this.attendanceService.getRegularizationUsage(
+      caller.id,
+      date,
       caller.organizationId,
     );
   }
@@ -314,6 +398,18 @@ export class AttendanceController {
     @CurrentUser() caller: Caller,
   ) {
     return this.attendanceService.notifyAbsentees(dto, caller.organizationId);
+  }
+
+  // Turns empty Absent rows on reference (past-dated) holidays into Holiday, in months whose payroll is still open.
+  @Post('apply-reference-holidays')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  @ApiBearerAuth('access-token')
+  applyReferenceHolidays(@CurrentUser() caller: Caller) {
+    return this.attendanceService.applyReferenceHolidays(
+      caller.organizationId,
+      caller.id,
+    );
   }
 
   // One-off repair of HR users' missing weekend/holiday/absent rows (see AttendanceService.backfillMissingAttendance).

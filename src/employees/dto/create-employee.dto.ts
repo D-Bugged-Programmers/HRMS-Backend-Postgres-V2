@@ -1,17 +1,6 @@
 import { IsIndianMobile } from '../../common/indian-mobile';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import {
-  IsBoolean,
-  IsEmail,
-  IsEnum,
-  IsNotEmpty,
-  IsOptional,
-  IsString,
-  IsUUID,
-  Matches,
-  MaxLength,
-  ValidateIf,
-} from 'class-validator';
+import { IsBoolean, IsEmail, IsEnum, IsNotEmpty, IsOptional, IsString, IsUUID, Matches, MaxLength, ValidateIf, IsArray, ArrayMaxSize } from 'class-validator';
 import { Gender, LocationRequirement, Role, SelfieRequirement } from '@prisma/client';
 import { NormalizeEmail, Trim } from '../../common/normalize-input';
 import { IsReasonableJoiningDate } from '../../common/is-reasonable-joining-date.validator';
@@ -30,10 +19,13 @@ export class CreateEmployeeDto {
   @Matches(PERSON_NAME_PATTERN, { message: `name ${PERSON_NAME_MESSAGE}` })
   name!: string;
 
-  @ApiProperty({ example: 'jane@acme.test' })
+  // Optional only for a company that allows people with no email (Policies > Sign-in); create() refuses it otherwise.
+  @ApiPropertyOptional({ example: 'jane@acme.test' })
   @NormalizeEmail()
+  @IsOptional()
+  @ValidateIf((o: CreateEmployeeDto) => o.email !== '')
   @IsEmail()
-  email!: string;
+  email?: string;
 
   // Optional at this DTO/type level so bulkCreate's row shape (no
   // per-row personalEmail column in the Excel import) keeps working
@@ -56,6 +48,33 @@ export class CreateEmployeeDto {
 
   // Department, designation, employee category and work location are required - the Add Employee form and the
   // Excel import enforce the same four, so an employee cannot be created without them from any client.
+  // Marked present on every working day without punching (shown with the person's own shift timings; absent only on approved leave; payroll counts the days).
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  alwaysPresent?: boolean;
+
+  // Live tracking of a field employee (only when the company has the feature on; Admin / HR only). Switching it on tells the person
+  // and asks them to agree in the app; it is applied through FieldTrackingService, never written straight to the record.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  fieldTrackingEnabled?: boolean;
+
+  // YYYY-MM-DD the marking starts from (today when left out as it is switched on).
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'alwaysPresentFrom must be YYYY-MM-DD.' })
+  alwaysPresentFrom?: string;
+
+  // The company (brand) whose name and logo this person's payslips, letters and emails carry. Blank/omitted = the default company
+  // brand if one is set, else the organization's own. null = the organization's own, even when a default exists.
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsUUID()
+  brandId?: string | null;
+
   @ApiProperty({ description: 'Department the employee belongs to.' })
   @IsNotEmpty({ message: 'Department is required.' })
   @IsUUID()
@@ -155,6 +174,15 @@ export class CreateEmployeeDto {
   @IsOptional()
   @IsUUID()
   reportingManagerId?: string;
+
+  // Further managers beyond the primary one (the "Reporting managers" multi-select: the first pick is the primary, the rest
+  // are listed here). They can approve and are notified like the primary. An Admin reports to nobody, so it is cleared then.
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @IsUUID('all', { each: true })
+  additionalReportingManagerIds?: string[];
 
   @ApiPropertyOptional({ example: 'permanent' })
   @IsOptional()

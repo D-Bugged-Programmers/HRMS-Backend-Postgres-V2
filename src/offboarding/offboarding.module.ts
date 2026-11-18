@@ -5,6 +5,14 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
 import { EmployeeTimelineModule } from '../employee-timeline/employee-timeline.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { EmailTemplatesModule } from '../email-templates/email-templates.module';
+import { LettersModule } from '../letters/letters.module';
+import { SettlementsModule } from '../settlements/settlements.module';
+import { LeavesModule } from '../leaves/leaves.module';
+import { LoansModule } from '../loans/loans.module';
+import { PayrollModule } from '../payroll/payroll.module';
+import { FieldTrackingModule } from '../field-tracking/field-tracking.module';
+import { OffboardingAutomationService } from './offboarding-automation.service';
+import { ExitClosureService } from './exit-closure.service';
 
 @Module({
   imports: [
@@ -12,10 +20,16 @@ import { EmailTemplatesModule } from '../email-templates/email-templates.module'
     EmployeeTimelineModule,
     NotificationsModule,
     EmailTemplatesModule,
+    LettersModule,
+    SettlementsModule,
+    LeavesModule,
+    LoansModule,
+    PayrollModule,
+    FieldTrackingModule,
   ],
   controllers: [OffboardingController],
-  providers: [OffboardingService],
+  providers: [OffboardingService, OffboardingAutomationService, ExitClosureService],
   // Exported so ResignationsService can auto-initiate the exit when a resignation is approved.
-  exports: [OffboardingService],
+  exports: [OffboardingService, OffboardingAutomationService],
 })
 export class OffboardingModule {}

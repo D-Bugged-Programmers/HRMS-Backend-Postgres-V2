@@ -76,6 +76,22 @@ function offsetWeekdayAvoidingHolidays(days: number): string {
   return date;
 }
 
+// The n-th working day (not Saturday, Sunday or a fixed national holiday) before today. Distinct n always give
+// distinct dates, for tests that need a run of separate working days: work on a weekly off is a Weekly Off day,
+// never late, early or Present.
+function nthWorkdayBack(n: number): string {
+  let found = 0;
+  let d = 0;
+  while (true) {
+    d -= 1;
+    const date = offsetDate(d);
+    if (FIXED_NATIONAL_HOLIDAYS.has(date.slice(5))) continue;
+    if ([0, 6].includes(new Date(`${date}T00:00:00Z`).getUTCDay())) continue;
+    found += 1;
+    if (found === n) return date;
+  }
+}
+
 // Finds the next date (from a UTC anchor) matching the given getUTCDay()
 // value, so weekly-off tests aren't flaky depending on when the suite runs.
 function nextWeekday(targetDay: number, fromOffsetDays: number): string {
@@ -316,7 +332,7 @@ describe('Attendance (e2e)', () => {
     });
 
     it('HR can punch on behalf of an employee; two punches spanning >=8h yield PRESENT', async () => {
-      const date = offsetDateAvoidingHolidays(-5);
+      const date = nthWorkdayBack(9);
       const inTime = istIso(date, '09:00');
       const outTime = istIso(date, '18:00');
 
@@ -478,6 +494,26 @@ describe('Attendance (e2e)', () => {
       expect(row?.status).toBe('WEEKLY_OFF');
     });
 
+    it('a full In/Out day worked on a weekly off shows PRESENT with its hours, and is never late', async () => {
+      const sunday = nextWeekday(0, -47);
+      await request(app.getHttpServer())
+        .post('/attendance/punch/manual')
+        .set('Authorization', `Bearer ${hrToken}`)
+        .send({
+          employeeId,
+          punchTime: `${sunday}T04:00:00.000Z`,
+          outPunchTime: `${sunday}T12:00:00.000Z`,
+        })
+        .expect(201);
+
+      const row = await prisma.attendance.findFirst({
+        where: { employeeId, date: sunday },
+      });
+      expect(row?.status).toBe('PRESENT');
+      expect(row?.workDurationMinutes).toBe(480);
+      expect(row?.isLate).toBe(false);
+    });
+
     it('regularization JSON on an Attendance row survives a later recalculation', async () => {
       const date = offsetDate(-6);
       await request(app.getHttpServer())
@@ -554,7 +590,7 @@ describe('Attendance (e2e)', () => {
     });
 
     it('pairs a late check-in with a post-midnight check-out into ONE PRESENT day, not two ABSENT days', async () => {
-      const shiftDate = offsetDateAvoidingHolidays(-4);
+      const shiftDate = offsetWeekdayAvoidingHolidays(-4);
       const nextDate = nextDateStr(shiftDate);
       const checkIn = istIso(shiftDate, '22:15');
       const checkOut = istIso(nextDate, '06:30');
@@ -601,8 +637,31 @@ describe('Attendance (e2e)', () => {
         .send({ employeeId: nightEmployeeId, punchTime })
         .expect(201);
 
+    it('a night shift starting on a weekly off (Sunday 22:00 to Monday 06:00) counts on Sunday, as Present with its hours', async () => {
+      const sunday = nextWeekday(0, -34);
+      const monday = nextDateStr(sunday);
+      await manualPunchAt(istIso(sunday, '22:00'));
+      await manualPunchAt(istIso(monday, '06:00'));
+
+      const row = await prisma.attendance.findFirstOrThrow({
+        where: { employeeId: nightEmployeeId, date: sunday },
+      });
+      expect(row.status).toBe('PRESENT');
+      expect(row.workDurationMinutes).toBe(8 * 60);
+      // Nothing lands on Monday, and any overtime raised is Sunday's, at the weekend rate.
+      expect(
+        await prisma.attendance.findFirst({
+          where: { employeeId: nightEmployeeId, date: monday },
+        }),
+      ).toBeNull();
+      const overtime = await prisma.overtimeRecord.findMany({
+        where: { employeeId: nightEmployeeId, date: { in: [sunday, monday] } },
+      });
+      expect(overtime.every((o) => o.date === sunday && o.type === 'WEEKEND')).toBe(true);
+    });
+
     it('a checkout running past noon (in the quiet gap, nearer the shift end) still counts toward the previous night', async () => {
-      const shiftDate = offsetDateAvoidingHolidays(-12);
+      const shiftDate = offsetWeekdayAvoidingHolidays(-12);
       const nextDate = nextDateStr(shiftDate);
       await manualPunchAt(istIso(shiftDate, '22:00'));
       // 12:30 is past the old hardcoded noon cutoff but still nearer the
@@ -623,7 +682,7 @@ describe('Attendance (e2e)', () => {
     });
 
     it('an early check-in in the quiet gap (nearer the shift start) belongs to that evening’s shift and pairs with its checkout', async () => {
-      const shiftDate = offsetDateAvoidingHolidays(-16);
+      const shiftDate = offsetWeekdayAvoidingHolidays(-16);
       const nextDate = nextDateStr(shiftDate);
       // 15:00 is past the 14:00 gap midpoint -> this evening's shift.
       await manualPunchAt(istIso(shiftDate, '15:00'));
@@ -649,7 +708,7 @@ describe('Attendance (e2e)', () => {
     });
 
     it('punches exactly at and just before the gap midpoint split between adjacent shift-days with no gap', async () => {
-      const shiftDate = offsetDateAvoidingHolidays(-20);
+      const shiftDate = offsetWeekdayAvoidingHolidays(-20);
       const nextDate = nextDateStr(shiftDate);
       const justBefore = new Date(
         Date.parse(istIso(nextDate, '14:00')) - 1000,
@@ -675,7 +734,7 @@ describe('Attendance (e2e)', () => {
       outHHMM: string,
       zone: 'ist' | 'utc' = 'ist',
     ) => {
-      const date = offsetDateAvoidingHolidays(daysAgo);
+      const date = nthWorkdayBack(-daysAgo);
       const at = (hhmm: string) =>
         zone === 'ist' ? istIso(date, hhmm) : `${date}T${hhmm}:00.000Z`;
       await request(app.getHttpServer())
@@ -1294,7 +1353,7 @@ describe('Attendance (e2e)', () => {
     });
 
     it('accepts a non-WFH arrangement regardless of the org toggle, without touching other fields', async () => {
-      const date = offsetDateAvoidingHolidays(-5); // the PRESENT day from the manual-punch test above
+      const date = nthWorkdayBack(9); // the PRESENT day from the manual-punch test above
       const before = await prisma.attendance.findFirstOrThrow({
         where: { employeeId, date },
       });
@@ -1546,6 +1605,344 @@ describe('Attendance (e2e)', () => {
         .expect(400);
     });
 
+    describe("the employee's reason", () => {
+      const REASON = 'Home repair visit';
+      // Monday..Wednesday, far enough ahead to clear the days the other tests here use and inside the 60-day window.
+      const firstMondayOffset = (() => {
+        let off = 47;
+        while (new Date(`${offsetDate(off)}T00:00:00Z`).getUTCDay() !== 1) {
+          off += 1;
+        }
+        return off;
+      })();
+      const monday = offsetDate(firstMondayOffset);
+      const wednesday = offsetDate(firstMondayOffset + 2);
+
+      type ListedRow = {
+        id: string;
+        date: string;
+        workArrangementReason?: string | null;
+      };
+      type PendingWfhItem = {
+        id: string;
+        groupId: string | null;
+        date: string;
+        endDate: string | null;
+        reason?: string | null;
+      };
+
+      const requestWfh = (body: Record<string, unknown>) =>
+        request(app.getHttpServer())
+          .put('/attendance/work-arrangement')
+          .set('Authorization', `Bearer ${wfhEmployeeToken}`)
+          .send({ workArrangement: 'WFH', ...body });
+      const pendingWfhItems = async () =>
+        (
+          await request(app.getHttpServer())
+            .get('/dashboard/pending-items')
+            .query({ type: 'WFH' })
+            .set('Authorization', `Bearer ${hrToken}`)
+            .expect(200)
+        ).body as PendingWfhItem[];
+      const listedRows = async (query: Record<string, string>) =>
+        (
+          (
+            await request(app.getHttpServer())
+              .get('/attendance')
+              .query(query)
+              .set('Authorization', `Bearer ${wfhEmployeeToken}`)
+              .expect(200)
+          ).body as { data: ListedRow[] }
+        ).data;
+
+      // Later tests look for this employee's pending row by employee id, so nothing is left behind.
+      afterEach(async () => {
+        await prisma.attendance.deleteMany({
+          where: {
+            employeeId: wfhEmployeeId,
+            date: { gte: monday, lte: wednesday },
+          },
+        });
+      });
+
+      it('a single day keeps the trimmed reason and returns it from both GETs', async () => {
+        const res = await requestWfh({
+          date: monday,
+          reason: `  ${REASON}  `,
+        }).expect(200);
+        expect(
+          (res.body as { workArrangementReason: string }).workArrangementReason,
+        ).toBe(REASON);
+
+        // A range of 31 days or fewer and an open-ended list are built differently; both carry the field.
+        const bounded = await listedRows({ from: monday, to: monday });
+        expect(bounded.map((r) => r.workArrangementReason)).toEqual([REASON]);
+        const unbounded = await listedRows({ limit: '100' });
+        expect(
+          unbounded.find((r) => r.date === monday)?.workArrangementReason,
+        ).toBe(REASON);
+
+        const item = (await pendingWfhItems()).find((i) => i.date === monday);
+        expect(item?.groupId).toBeNull();
+        expect(item?.reason).toBe(REASON);
+      });
+
+      it('every day of a multi-day request has the reason, and its one pending item shows it', async () => {
+        const res = await requestWfh({
+          date: monday,
+          endDate: wednesday,
+          reason: REASON,
+        }).expect(200);
+        const { requestId, days } = res.body as {
+          requestId: string;
+          days: string[];
+        };
+        expect(days.length).toBeGreaterThan(1);
+
+        const rows = await prisma.attendance.findMany({
+          where: { employeeId: wfhEmployeeId, wfhRequestId: requestId },
+        });
+        expect(rows).toHaveLength(days.length);
+        expect(rows.every((r) => r.workArrangementReason === REASON)).toBe(true);
+
+        const listed = await listedRows({ from: monday, to: wednesday });
+        for (const day of days) {
+          expect(
+            listed.find((r) => r.date === day)?.workArrangementReason,
+          ).toBe(REASON);
+        }
+
+        const items = (await pendingWfhItems()).filter(
+          (i) => i.groupId === requestId,
+        );
+        expect(items).toHaveLength(1);
+        expect(items[0].reason).toBe(REASON);
+        expect(items[0].date).toBe(days[0]);
+        expect(items[0].endDate).toBe(days[days.length - 1]);
+      });
+
+      it('a request with no reason works as before: null in both GETs, on one day and on several', async () => {
+        const single = await requestWfh({ date: monday }).expect(200);
+        expect(
+          (single.body as { workArrangementStatus: string })
+            .workArrangementStatus,
+        ).toBe('PENDING');
+        expect(
+          (await listedRows({ from: monday, to: monday }))[0]
+            .workArrangementReason,
+        ).toBeNull();
+        expect(
+          (await pendingWfhItems()).find((i) => i.date === monday)?.reason,
+        ).toBeNull();
+        await prisma.attendance.deleteMany({
+          where: { employeeId: wfhEmployeeId, date: monday },
+        });
+
+        const range = await requestWfh({
+          date: monday,
+          endDate: wednesday,
+        }).expect(200);
+        const { requestId } = range.body as { requestId: string };
+        const rows = await prisma.attendance.findMany({
+          where: { employeeId: wfhEmployeeId, wfhRequestId: requestId },
+        });
+        expect(rows.every((r) => r.workArrangementReason === null)).toBe(true);
+        expect(
+          (await pendingWfhItems()).find((i) => i.groupId === requestId)
+            ?.reason,
+        ).toBeNull();
+      });
+
+      it('a day with no record in a date range still returns the field, as null', async () => {
+        // Blank rows are only built for past days since the employee was added, so this employee is added earlier for
+        // the length of the check.
+        const { createdAt } = await prisma.user.findUniqueOrThrow({
+          where: { id: wfhEmployeeId },
+          select: { createdAt: true },
+        });
+        await prisma.user.update({
+          where: { id: wfhEmployeeId },
+          data: { createdAt: new Date(`${offsetDate(-30)}T00:00:00Z`) },
+        });
+        try {
+          const listed = await listedRows({
+            from: offsetDate(-20),
+            to: offsetDate(-10),
+          });
+          const blank = listed.filter((r) => r.id.startsWith('synthetic:'));
+          expect(blank.length).toBeGreaterThan(0);
+          for (const row of blank) {
+            expect(row).toHaveProperty('workArrangementReason', null);
+          }
+        } finally {
+          await prisma.user.update({
+            where: { id: wfhEmployeeId },
+            data: { createdAt },
+          });
+        }
+      });
+
+      it.each([
+        ['an empty string', ''],
+        ['only spaces', '    '],
+        ['null', null],
+      ])('%s counts as no reason', async (_label, reason) => {
+        const res = await requestWfh({ date: monday, reason }).expect(200);
+        expect(
+          (res.body as { workArrangementReason: string | null })
+            .workArrangementReason,
+        ).toBeNull();
+      });
+
+      it('500 characters are accepted, counted after trimming; 501 are refused with a clear message and nothing is saved', async () => {
+        const tooLong = await requestWfh({
+          date: monday,
+          reason: 'x'.repeat(501),
+        }).expect(400);
+        expect((tooLong.body as { message: string[] }).message).toEqual([
+          'Reason must be at most 500 characters.',
+        ]);
+        const tooLongRange = await requestWfh({
+          date: monday,
+          endDate: wednesday,
+          reason: 'x'.repeat(501),
+        }).expect(400);
+        expect((tooLongRange.body as { message: string[] }).message).toEqual([
+          'Reason must be at most 500 characters.',
+        ]);
+        expect(
+          await prisma.attendance.count({
+            where: {
+              employeeId: wfhEmployeeId,
+              date: { gte: monday, lte: wednesday },
+            },
+          }),
+        ).toBe(0);
+
+        const fits = 'x'.repeat(500);
+        const res = await requestWfh({
+          date: monday,
+          reason: `  ${fits}  `,
+        }).expect(200);
+        expect(
+          (res.body as { workArrangementReason: string }).workArrangementReason,
+        ).toBe(fits);
+      });
+
+      it('a reason that is not text is refused', async () => {
+        // The wording the running app shows is checked in set-work-arrangement.dto.spec.ts (this app's pipe is a plain one).
+        await requestWfh({ date: monday, reason: 42 }).expect(400);
+        expect(
+          await prisma.attendance.count({
+            where: { employeeId: wfhEmployeeId, date: monday },
+          }),
+        ).toBe(0);
+      });
+
+      it('withdrawing clears the reason, and a new request without one does not bring it back', async () => {
+        await requestWfh({ date: monday, reason: REASON }).expect(200);
+        const withdrawn = await requestWfh({
+          date: monday,
+          workArrangement: 'OFFICE',
+        }).expect(200);
+        const row = withdrawn.body as {
+          workArrangement: string;
+          workArrangementStatus: string;
+          workArrangementReason: string | null;
+        };
+        expect(row.workArrangement).toBe('OFFICE');
+        expect(row.workArrangementStatus).toBe('NONE');
+        expect(row.workArrangementReason).toBeNull();
+
+        const again = await requestWfh({ date: monday }).expect(200);
+        expect(
+          (again.body as { workArrangementReason: string | null })
+            .workArrangementReason,
+        ).toBeNull();
+      });
+
+      it('a reason sent with another arrangement is not stored', async () => {
+        const res = await requestWfh({
+          date: monday,
+          workArrangement: 'OFFICE',
+          reason: REASON,
+        }).expect(200);
+        expect(
+          (res.body as { workArrangementReason: string | null })
+            .workArrangementReason,
+        ).toBeNull();
+      });
+
+      it('withdrawing one day of a multi-day request clears only that day', async () => {
+        const res = await requestWfh({
+          date: monday,
+          endDate: wednesday,
+          reason: REASON,
+        }).expect(200);
+        const { requestId, days } = res.body as {
+          requestId: string;
+          days: string[];
+        };
+        await requestWfh({
+          date: days[0],
+          workArrangement: 'OFFICE',
+        }).expect(200);
+
+        const gone = await prisma.attendance.findFirst({
+          where: { employeeId: wfhEmployeeId, date: days[0] },
+        });
+        expect(gone?.workArrangementReason).toBeNull();
+        expect(gone?.wfhRequestId).toBeNull();
+        const rest = await prisma.attendance.findMany({
+          where: { employeeId: wfhEmployeeId, wfhRequestId: requestId },
+        });
+        expect(rest).toHaveLength(days.length - 1);
+        expect(rest.every((r) => r.workArrangementReason === REASON)).toBe(true);
+      });
+
+      it("review leaves the employee's reason alone and keeps the reviewer's comment separate, single and group", async () => {
+        const single = await requestWfh({
+          date: monday,
+          reason: REASON,
+        }).expect(200);
+        const reviewed = await request(app.getHttpServer())
+          .patch(
+            `/attendance/work-arrangement/${(single.body as { id: string }).id}/review`,
+          )
+          .set('Authorization', `Bearer ${hrToken}`)
+          .send({ decision: 'REJECTED', comments: 'Team day' })
+          .expect(200);
+        const row = reviewed.body as {
+          workArrangementReason: string;
+          workArrangementReviewComments: string;
+        };
+        expect(row.workArrangementReason).toBe(REASON);
+        expect(row.workArrangementReviewComments).toBe('Team day');
+        await prisma.attendance.deleteMany({
+          where: { employeeId: wfhEmployeeId, date: monday },
+        });
+
+        const range = await requestWfh({
+          date: monday,
+          endDate: wednesday,
+          reason: REASON,
+        }).expect(200);
+        const { requestId } = range.body as { requestId: string };
+        await request(app.getHttpServer())
+          .patch(`/attendance/work-arrangement/group/${requestId}/review`)
+          .set('Authorization', `Bearer ${hrToken}`)
+          .send({ decision: 'APPROVED', comments: 'Fine' })
+          .expect(200);
+        const rows = await prisma.attendance.findMany({
+          where: { employeeId: wfhEmployeeId, wfhRequestId: requestId },
+        });
+        expect(rows.every((r) => r.workArrangementReason === REASON)).toBe(true);
+        expect(
+          rows.every((r) => r.workArrangementReviewComments === 'Fine'),
+        ).toBe(true);
+      });
+    });
+
     it('EMPLOYEE gets 403 listing or reviewing pending WFH requests', async () => {
       await request(app.getHttpServer())
         .get('/attendance/work-arrangement/pending')
@@ -1687,6 +2084,115 @@ describe('Attendance (e2e)', () => {
         .set('Authorization', `Bearer ${hrToken}`)
         .send({ decision: 'APPROVED' })
         .expect(400);
+    });
+
+    it('a day already waiting or approved is not asked for again; going back to the office withdraws it and tells the approver', async () => {
+      const date = offsetDate(20);
+      const put = (workArrangement: string) =>
+        request(app.getHttpServer())
+          .put('/attendance/work-arrangement')
+          .set('Authorization', `Bearer ${wfhEmployeeToken}`)
+          .send({ date, workArrangement });
+      await put('WFH').expect(200);
+      const again = await put('WFH').expect(409);
+      expect((again.body as { message: string }).message).toMatch(
+        /already waiting for approval\. Only one request is allowed per day\./,
+      );
+
+      const before = await prisma.notification.count({
+        where: { title: 'Work From Home Withdrawn' },
+      });
+      await put('OFFICE').expect(200);
+      const row = await prisma.attendance.findFirstOrThrow({
+        where: { employeeId: wfhEmployeeId, date },
+      });
+      expect(row.workArrangement).toBe('OFFICE');
+      expect(row.workArrangementStatus).toBe('NONE');
+      expect(
+        await prisma.notification.count({
+          where: { title: 'Work From Home Withdrawn' },
+        }),
+      ).toBeGreaterThan(before);
+
+      // Withdrawn, so it may be asked for again; leave nothing pending for later tests.
+      await put('WFH').expect(200);
+      await prisma.attendance.deleteMany({
+        where: { employeeId: wfhEmployeeId, date },
+      });
+    });
+
+    it('a day whose request was turned down is not asked for again, and switching it to office leaves it turned down', async () => {
+      const date = offsetDate(21);
+      const put = (workArrangement: string) =>
+        request(app.getHttpServer())
+          .put('/attendance/work-arrangement')
+          .set('Authorization', `Bearer ${wfhEmployeeToken}`)
+          .send({ date, workArrangement });
+      await put('WFH').expect(200);
+      const row = await prisma.attendance.findFirstOrThrow({
+        where: { employeeId: wfhEmployeeId, date },
+      });
+      await request(app.getHttpServer())
+        .patch(`/attendance/work-arrangement/${row.id}/review`)
+        .set('Authorization', `Bearer ${hrToken}`)
+        .send({ decision: 'REJECTED' })
+        .expect(200);
+      const again = await put('WFH').expect(409);
+      expect((again.body as { message: string }).message).toMatch(
+        /was not approved\. Only one request is allowed per day\./,
+      );
+      await put('OFFICE').expect(200);
+      const after = await prisma.attendance.findFirstOrThrow({
+        where: { employeeId: wfhEmployeeId, date },
+      });
+      expect(after.workArrangement).toBe('WFH');
+      expect(after.workArrangementStatus).toBe('REJECTED');
+      await put('WFH').expect(409);
+
+      // A range skips days already requested (the turned-down one included): with the next weekday requested too,
+      // a range of just those two has nothing left to ask for.
+      let next = 22;
+      while (
+        [0, 6].includes(new Date(`${offsetDate(next)}T00:00:00Z`).getUTCDay())
+      )
+        next += 1;
+      const nextDate = offsetDate(next);
+      await request(app.getHttpServer())
+        .put('/attendance/work-arrangement')
+        .set('Authorization', `Bearer ${wfhEmployeeToken}`)
+        .send({ date: nextDate, workArrangement: 'WFH' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/attendance/work-arrangement')
+        .set('Authorization', `Bearer ${wfhEmployeeToken}`)
+        .send({ date, endDate: nextDate, workArrangement: 'WFH' })
+        .expect(400);
+      await prisma.attendance.deleteMany({
+        where: { employeeId: wfhEmployeeId, date: { in: [date, nextDate] } },
+      });
+    });
+
+    it('two requests for the same day sent at the same moment: one goes through, the other gets 409', async () => {
+      // A weekday no earlier test in this file has requested.
+      let off = 55;
+      while ([0, 6].includes(new Date(`${offsetDate(off)}T00:00:00Z`).getUTCDay())) off += 1;
+      const date = offsetDate(off);
+      const send = () =>
+        request(app.getHttpServer())
+          .put('/attendance/work-arrangement')
+          .set('Authorization', `Bearer ${wfhEmployeeToken}`)
+          .send({ date, workArrangement: 'WFH' });
+      const results = await Promise.all([send(), send()]);
+      const codes = results.map((r) => r.status).sort();
+      expect(codes).toEqual([200, 409]);
+      expect(
+        await prisma.attendance.count({
+          where: { employeeId: wfhEmployeeId, date },
+        }),
+      ).toBe(1);
+      await prisma.attendance.deleteMany({
+        where: { employeeId: wfhEmployeeId, date },
+      });
     });
   });
 
@@ -1976,11 +2482,19 @@ describe('Attendance (e2e)', () => {
         .set('Authorization', `Bearer ${adminToken}`)
         .expect(200);
       const data = (
-        res.body as { data: { status: string; leaveTypeName?: string }[] }
+        res.body as {
+          data: {
+            status: string;
+            leaveTypeName?: string;
+            leavePaid?: boolean;
+          }[];
+        }
       ).data;
       expect(data.length).toBe(1);
       expect(data[0].status).toBe('ON_LEAVE');
       expect(data[0].leaveTypeName).toBe('List Endpoint Leave');
+      // A paid leave type, so the day is paid leave (not an absent / unpaid day).
+      expect(data[0].leavePaid).toBe(true);
     });
 
     it('a PRESENT row carries neither holidayName nor leaveTypeName', async () => {
@@ -2279,7 +2793,7 @@ describe('Attendance (e2e)', () => {
       });
 
       it('approval recalculates the late / early-out flags for the corrected times', async () => {
-        const date = offsetDate(-3);
+        const date = offsetWeekdayAvoidingHolidays(-3);
         await request(app.getHttpServer())
           .post('/attendance/punch/manual')
           .set('Authorization', `Bearer ${hrToken}`)
@@ -2766,7 +3280,7 @@ describe('Attendance (e2e)', () => {
           .get('/attendance/regularization/settings')
           .set('Authorization', `Bearer ${reqToken}`)
           .expect(200);
-      expect((await read()).body).toEqual({ windowDays: 7 });
+      expect((await read()).body).toMatchObject({ windowDays: 7 });
 
       await request(app.getHttpServer())
         .patch('/organizations/settings/auto-approval')
@@ -2785,7 +3299,7 @@ describe('Attendance (e2e)', () => {
         .send({ regularizationWindowDays: 3 })
         .expect(200);
       try {
-        expect((await read()).body).toEqual({ windowDays: 3 });
+        expect((await read()).body).toMatchObject({ windowDays: 3 });
         const tooOld = await submit(reqToken, offsetDate(-4)).expect(400);
         expect(JSON.stringify(tooOld.body)).toContain('last 3 days');
         // Day 3 is inside, day 4 is not (the 7-day fixture days above are all outside now).
@@ -2806,7 +3320,7 @@ describe('Attendance (e2e)', () => {
           .send({ regularizationWindowDays: 7 })
           .expect(200);
       }
-      expect((await read()).body).toEqual({ windowDays: 7 });
+      expect((await read()).body).toMatchObject({ windowDays: 7 });
     });
   });
 
@@ -3107,10 +3621,69 @@ describe('Attendance (e2e)', () => {
         .expect(400);
     });
 
+    it('an import never changes a day already marked: leave, a regularization or a half day of leave', async () => {
+      const [leaveDate, regDate, pendingDate, halfDate, openDate] = [-70, -71, -72, -73, -74].map((n) => nthWorkdayBack(-n));
+      const seed = (date: string, data: object) =>
+        scopedPrisma.attendance.create({
+          data: { organizationId, employeeId, date, source: 'SYSTEM', status: 'ABSENT', ...data },
+        });
+      await seed(leaveDate, { status: 'ON_LEAVE' });
+      await seed(regDate, { status: 'PRESENT', source: 'REGULARIZED', workDurationMinutes: 400 });
+      await seed(pendingDate, { regularization: { requested: true, status: 'pending' } });
+      await seed(halfDate, { status: 'HALF_DAY', leaveOverriddenStatus: 'ABSENT', leaveOverriddenSource: 'SYSTEM' });
+      await seed(openDate, {});
+      const dates = [leaveDate, regDate, pendingDate, halfDate, openDate];
+      const upload = await request(app.getHttpServer())
+        .post('/attendance/import')
+        .set('Authorization', `Bearer ${hrToken}`)
+        .send({
+          rows: dates.map((date) => ({
+            employeeId: employeeHumanId,
+            date,
+            inTime: `${date}T04:00:00.000Z`,
+            outTime: `${date}T13:00:00.000Z`,
+          })),
+        })
+        .expect(201);
+      const id = (upload.body as { id: string }).id;
+      await request(app.getHttpServer())
+        .post(`/attendance/import/${id}/validate`)
+        .set('Authorization', `Bearer ${hrToken}`)
+        .expect(201);
+      const executed = await request(app.getHttpServer())
+        .post(`/attendance/import/${id}/execute`)
+        .set('Authorization', `Bearer ${hrToken}`)
+        .expect(201);
+      const result = (executed.body as {
+        executionResult: { imported: number; skipped: number; skippedRows: { date: string; reason: string }[] };
+      }).executionResult;
+      expect(result).toMatchObject({ imported: 2, skipped: 3 });
+      expect(result.skippedRows.map((r) => [r.date, r.reason])).toEqual([
+        [leaveDate, 'On approved leave'],
+        [regDate, 'Already regularized'],
+        [pendingDate, 'A regularization request is waiting'],
+      ]);
+      const row = (date: string) =>
+        prisma.attendance.findFirstOrThrow({ where: { employeeId, date } });
+      expect((await row(leaveDate)).status).toBe('ON_LEAVE');
+      expect(await row(regDate)).toMatchObject({ status: 'PRESENT', source: 'REGULARIZED', workDurationMinutes: 400 });
+      expect(await row(pendingDate)).toMatchObject({ status: 'ABSENT', source: 'SYSTEM', inTime: null });
+      // The half day stays leave; the other half's times are kept under it.
+      expect(await row(halfDate)).toMatchObject({
+        status: 'HALF_DAY',
+        source: 'SYSTEM',
+        leaveOverriddenStatus: 'PRESENT',
+        leaveOverriddenSource: 'EXCEL_IMPORT',
+      });
+      expect((await row(halfDate)).inTime).not.toBeNull();
+      // A day nobody marked takes the import.
+      expect(await row(openDate)).toMatchObject({ status: 'PRESENT', source: 'EXCEL_IMPORT' });
+    });
+
     it('a clean batch validates to VALIDATED and executes with the biometric-skip rule honored', async () => {
       // A separate, all-valid batch: one fresh row (imports) and one row
       // that collides with an existing FACE_API-sourced punch (skipped).
-      const freshDate = offsetDateAvoidingHolidays(-32);
+      const freshDate = offsetWeekdayAvoidingHolidays(-32);
       const biometricDate = offsetDate(-33);
 
       await scopedPrisma.attendance.create({
@@ -3354,7 +3927,7 @@ describe('Attendance (e2e)', () => {
         });
       try {
         await setOvertimePay(false);
-        const offDate = offsetWeekdayAvoidingHolidays(-33);
+        const offDate = offsetWeekdayAvoidingHolidays(-80);
         await punchAt(employeeId, istIso(offDate, '09:30'));
         await punchAt(employeeId, istIso(offDate, '19:15')); // 45 min past shift end
         expect(
@@ -3364,7 +3937,7 @@ describe('Attendance (e2e)', () => {
         ).toBeNull();
 
         await setOvertimePay(true);
-        const onDate = offsetWeekdayAvoidingHolidays(-34);
+        const onDate = offsetWeekdayAvoidingHolidays(-84);
         await punchAt(employeeId, istIso(onDate, '09:30'));
         await punchAt(employeeId, istIso(onDate, '19:15'));
         expect(
@@ -3534,6 +4107,167 @@ describe('Attendance (e2e)', () => {
         },
       });
       expect(notifs.length).toBe(0);
+    });
+  });
+
+  describe('Regularization caps set by the Admin (blank = no limit)', () => {
+    let capToken: string;
+    let capEmployeeId: string;
+
+    beforeAll(async () => {
+      const created = await request(app.getHttpServer())
+        .post('/employees')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Reg Cap Employee',
+          email: 'att-e2e-reg-cap@example.test',
+          joiningDate: '2025-01-01',
+        });
+      const b = created.body as EmployeeCreateBody;
+      capEmployeeId = b.employee.id;
+      const login = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'att-e2e-reg-cap@example.test',
+          password: b.generatedPassword,
+        });
+      capToken = (login.body as AuthBody).accessToken;
+    });
+
+    afterAll(async () => {
+      await prisma.organization.update({
+        where: { id: organizationId },
+        data: {
+          regularizationMonthlyLimit: null,
+          regularizationResubmitLimit: null,
+        },
+      });
+    });
+
+    const setLimits = (monthly: number | null, resubmit: number | null) =>
+      prisma.organization.update({
+        where: { id: organizationId },
+        data: {
+          regularizationMonthlyLimit: monthly,
+          regularizationResubmitLimit: resubmit,
+        },
+      });
+    const send = (date: string) =>
+      request(app.getHttpServer())
+        .post('/attendance/regularization')
+        .set('Authorization', `Bearer ${capToken}`)
+        .send({
+          date,
+          requestedInTime: istIso(date, '09:30'),
+          requestedOutTime: istIso(date, '18:30'),
+          reason: 'Biometric was down',
+        });
+    const rejectIt = async (attendanceId: string) =>
+      request(app.getHttpServer())
+        .patch(`/attendance/regularization/${attendanceId}`)
+        .set('Authorization', `Bearer ${hrToken}`)
+        .send({ decision: 'REJECTED', comments: 'Not convincing' })
+        .expect(200);
+    const usage = async (date: string) =>
+      (
+        await request(app.getHttpServer())
+          .get(`/attendance/regularization/usage?date=${date}`)
+          .set('Authorization', `Bearer ${capToken}`)
+          .expect(200)
+      ).body as {
+        monthlyLimit: number | null;
+        usedThisMonth: number;
+        remainingThisMonth: number | null;
+        resubmitLimit: number | null;
+        rejectedForDate: number;
+        remainingResubmits: number | null;
+      };
+
+    it('with no limits set, a rejected date can be sent again as often as the employee likes', async () => {
+      await setLimits(null, null);
+      const date = offsetDate(-3);
+      for (let i = 0; i < 3; i++) {
+        const res = await send(date).expect(201);
+        await rejectIt((res.body as { id: string }).id);
+      }
+      const u = await usage(date);
+      expect(u.monthlyLimit).toBeNull();
+      expect(u.resubmitLimit).toBeNull();
+      expect(u.rejectedForDate).toBe(3);
+    });
+
+    it('stops re-sending a rejected date once the resubmission limit is passed', async () => {
+      const date = offsetDate(-4);
+      await setLimits(null, 1);
+      // First send, rejected; one re-send allowed, rejected again; a further re-send is refused.
+      const first = await send(date).expect(201);
+      await rejectIt((first.body as { id: string }).id);
+      expect((await usage(date)).remainingResubmits).toBe(1);
+      const second = await send(date).expect(201);
+      await rejectIt((second.body as { id: string }).id);
+      const blocked = await send(date).expect(400);
+      expect((blocked.body as { message: string }).message).toMatch(
+        /rejected 2 times and can be re-sent at most 1 time/,
+      );
+    });
+
+    it('stops new requests once the month is used up, counting every request submitted', async () => {
+      const date = offsetDate(-5);
+      await setLimits(null, null);
+      const used = (await usage(date)).usedThisMonth;
+      await setLimits(used + 1, null);
+      await send(date).expect(201);
+      const u = await usage(date);
+      expect(u.remainingThisMonth).toBe(0);
+      const other = offsetDate(-6);
+      // Same month, so over the cap - unless the day is in the previous month (then it has its own count).
+      if (other.slice(0, 7) === date.slice(0, 7)) {
+        const blocked = await send(other).expect(400);
+        expect((blocked.body as { message: string }).message).toMatch(
+          /used all .* regularization request/,
+        );
+      }
+    });
+
+    it('an Admin is exempt from the caps (their request is approved at once)', async () => {
+      await setLimits(1, 1);
+      const date = offsetDate(-2);
+      const res = await request(app.getHttpServer())
+        .post('/attendance/regularization')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          date,
+          requestedInTime: istIso(date, '09:30'),
+          requestedOutTime: istIso(date, '18:30'),
+          reason: 'Admin correction',
+        });
+      // Whatever else the request runs into (the test Admin joined today), it is never stopped by a cap.
+      expect(JSON.stringify(res.body)).not.toMatch(/used all|re-sent at most/);
+    });
+
+    it('the Organization setting accepts a blank limit (= none) and rejects a nonsense one', async () => {
+      await request(app.getHttpServer())
+        .patch('/organizations/settings/auto-approval')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ regularizationMonthlyLimit: 5, regularizationResubmitLimit: 2 })
+        .expect(200);
+      const blank = await request(app.getHttpServer())
+        .patch('/organizations/settings/auto-approval')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          regularizationMonthlyLimit: '',
+          regularizationResubmitLimit: '',
+        })
+        .expect(200);
+      expect(blank.body).toMatchObject({
+        regularizationMonthlyLimit: null,
+        regularizationResubmitLimit: null,
+      });
+      await request(app.getHttpServer())
+        .patch('/organizations/settings/auto-approval')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ regularizationMonthlyLimit: 0 })
+        .expect(400);
     });
   });
 });

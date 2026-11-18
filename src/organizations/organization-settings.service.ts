@@ -6,6 +6,8 @@
 // Important: regenerateFaceApiKey() replaces the old single process-wide FACE_API_KEY that let anyone
 // holding it forge attendance webhooks for ANY organization; the generated key is shown once and never
 // exposed again on a read path, same as a generated employee password.
+import { readLoginPolicy } from '../common/no-email';
+import { wfhDaysPerMonthOf } from './org-wfh-policy';
 import {
   netWorkingHours,
   shiftConsistencyError,
@@ -22,6 +24,8 @@ import { AuditModule, Organization, Role, User } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
+import { takenEmployeeIdPrefixes } from '../common/employee-id-prefixes';
+import { employeeIdPrefixOf, prefixesClash } from '../company-brands/brand-rules';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmailService } from '../notifications/email.service';
 import { EmailTemplatesService } from '../email-templates/email-templates.service';
@@ -72,6 +76,8 @@ const BRANDING_URL_FIELDS = [
   'faviconUrl',
   'reportLogoUrl',
   'emailLogoUrl',
+  'letterHeaderUrl',
+  'letterFooterUrl',
   'sealUrl',
 ] as const;
 
@@ -143,14 +149,22 @@ const SECTION_FIELDS: Record<string, string[]> = {
     'faviconUrl',
     'reportLogoUrl',
     'emailLogoUrl',
+    'letterHeaderUrl',
+    'letterFooterUrl',
     'assetMeta',
     'watermarkLogo',
   ],
-  signatory: ['signatories', 'sealUrl'],
+  signatory: ['signatories'],
   // Combined General Settings tab — org.policies and the shift-default
   // blob save together from one PATCH now (previously a separate
   // 'attendancePayroll' section/tab).
-  policies: ['policies', 'orgPayrollAttendancePrefs'],
+  // The two regularization caps live in General Settings too (blank = no limit).
+  policies: [
+    'policies',
+    'orgPayrollAttendancePrefs',
+    'regularizationMonthlyLimit',
+    'regularizationResubmitLimit',
+  ],
   documentNumbering: ['documentNumbering'],
   employeeTypes: ['customEmployeeTypes'],
   workArrangement: [
@@ -160,6 +174,8 @@ const SECTION_FIELDS: Record<string, string[]> = {
     'regularizationAutoApproveIfNoAction',
     'regularizationAutoApproveHours',
     'regularizationWindowDays',
+    'regularizationMonthlyLimit',
+    'regularizationResubmitLimit',
   ],
 };
 
@@ -277,6 +293,29 @@ export class OrganizationSettingsService {
     private readonly emailTemplatesService: EmailTemplatesService,
   ) {}
 
+  // The company's public contact details and primary signatory, to prefill a new payslip template. HR may read these (they
+  // print on every payslip) without being given the whole Admin-only settings document.
+  async getContactForTemplates(organizationId: string) {
+    const org = await this.findOrThrow(organizationId);
+    const signatories = (org.signatories ?? []) as { name?: string; designation?: string; isPrimary?: boolean }[];
+    const primary = signatories.find((s) => s.isPrimary) ?? signatories[0];
+    return {
+      contactEmail: org.contactEmail ?? '',
+      website: org.website ?? '',
+      phone: org.phone ?? '',
+      registeredAddress: org.registeredAddress ?? '',
+      signatoryName: primary?.name ?? '',
+      signatoryDesignation: primary?.designation ?? '',
+    };
+  }
+
+  // Only the shift and weekly-off defaults (orgPayrollAttendancePrefs): what Work Schedules and Departments start new schedules
+  // and departments from. HR needs these to do their job, without being given the whole Admin-only settings document.
+  async getAttendancePrefs(organizationId: string) {
+    const org = await this.findOrThrow(organizationId);
+    return { orgPayrollAttendancePrefs: org.orgPayrollAttendancePrefs ?? {} };
+  }
+
   private async findOrThrow(organizationId: string) {
     const org = await this.prisma.organization.findUnique({
       where: { id: organizationId },
@@ -300,6 +339,8 @@ export class OrganizationSettingsService {
         org.regularizationAutoApproveIfNoAction,
       regularizationAutoApproveHours: org.regularizationAutoApproveHours,
       regularizationWindowDays: org.regularizationWindowDays,
+      regularizationMonthlyLimit: org.regularizationMonthlyLimit,
+      regularizationResubmitLimit: org.regularizationResubmitLimit,
     };
   }
 
@@ -314,10 +355,21 @@ export class OrganizationSettingsService {
       'regularizationAutoApproveIfNoAction',
       'regularizationAutoApproveHours',
       'regularizationWindowDays',
+      'regularizationMonthlyLimit',
+      'regularizationResubmitLimit',
     ];
     const data: Record<string, unknown> = {};
     for (const field of allowedFields) {
       if (field in body) data[field] = body[field];
+    }
+    // A blank limit means "no limit": stored as NULL, never as an empty string.
+    for (const field of [
+      'regularizationMonthlyLimit',
+      'regularizationResubmitLimit',
+    ]) {
+      if (data[field] === '' || data[field] === undefined) {
+        if (field in data) data[field] = null;
+      }
     }
     validateSectionData(data);
 
@@ -379,12 +431,14 @@ export class OrganizationSettingsService {
   async getPublicBranding(organizationId: string) {
     const org = await this.findOrThrow(organizationId);
     const signed = this.withSignedUrls(org);
+    const loginPolicy = readLoginPolicy(org.policies);
     const policies = (org.policies ?? {}) as {
       currencySymbol?: string;
       defaultNoticeDays?: number;
       dateFormat?: string;
       timeFormat?: string;
       autoCarryForwardEnabled?: boolean;
+      wfhDaysPerMonth?: number | null;
     };
     const attendancePayrollPrefs = (org.orgPayrollAttendancePrefs ?? {}) as {
       enableTaxDeclaration?: boolean;
@@ -393,6 +447,9 @@ export class OrganizationSettingsService {
     };
     return {
       isInitialized: org.isInitialized,
+      // How people sign in, and whether someone may have no email (Policies > Sign-in); the Add Employee form follows them.
+      loginMethod: loginPolicy.method,
+      allowNoEmail: loginPolicy.allowNoEmail,
       companyName: org.companyName,
       tagline: org.tagline,
       companyLogoUrl: signed.companyLogoUrl,
@@ -406,6 +463,8 @@ export class OrganizationSettingsService {
       primaryColor: org.primaryColor,
       secondaryColor: org.secondaryColor,
       enableWFH: org.enableWFH,
+      // Work From Home days allowed per month (null = no limit): the denominator of the profile's WFH balance.
+      wfhDaysPerMonth: wfhDaysPerMonthOf(policies.wfhDaysPerMonth),
       // Drives every hardcoded-₹ display across the app (see
       // frontend/src/utils/currency.ts) — read from Policies' currency
       // symbol so switching it in Setup/Organization Settings changes the
@@ -482,11 +541,31 @@ export class OrganizationSettingsService {
     for (const field of allowedFields) {
       if (field in body) data[field] = body[field];
     }
+    // A blank regularization cap means "no limit": stored as NULL, never ''.
+    for (const f of [
+      'regularizationMonthlyLimit',
+      'regularizationResubmitLimit',
+    ]) {
+      if (data[f] === '') data[f] = null;
+    }
 
     // Type/shape/range guard — a wrong-typed value (e.g. companyName:
     // 12345, documentNumbering: "x") is a 400 here, never a Prisma 500 or
     // a silently-corrupted JSON column.
     validateSectionData(data);
+    // An employee ID prefix is unique across companies (it is what lets an employee sign in with their ID), so a new employee ID format
+    // cannot reuse another company's prefix.
+    const newIdFormat = (data.documentNumbering as { employeeId?: { format?: string } } | undefined)?.employeeId?.format;
+    if (typeof newIdFormat === 'string') {
+      const current = (await this.prisma.organization.findUnique({ where: { id: organizationId }, select: { documentNumbering: true } }))?.documentNumbering as { employeeId?: { format?: string } } | null;
+      if (newIdFormat !== current?.employeeId?.format) {
+        const prefix = employeeIdPrefixOf(newIdFormat);
+        const taken = await takenEmployeeIdPrefixes(this.prisma, organizationId);
+        if (prefix && taken.some((t) => prefixesClash(prefix, t))) {
+          throw new BadRequestException(`The employee ID prefix "${prefix}" is already used by another company. Pick a different prefix so employee IDs stay unique.`);
+        }
+      }
+    }
     // Optional wizard-progress advancement, allowed alongside any section's
     // payload.
     const setupStep =
@@ -507,6 +586,31 @@ export class OrganizationSettingsService {
       Record<string, unknown> | undefined;
     if (incomingPolicies && typeof incomingPolicies === 'object') {
       incomingPolicies.dateFormat = 'DD-MM-YYYY';
+    }
+    // "Email only" would lock out anyone who has no email (they sign in with the employee ID): refuse it while such people exist.
+    if (section === 'policies' && (incomingPolicies as { loginMethod?: unknown } | undefined)?.loginMethod === 'EMAIL') {
+      const noEmail = await this.prisma.user.count({ where: { organizationId, isActive: true, email: { endsWith: '.invalid' } } });
+      if (noEmail > 0) {
+        throw new BadRequestException(
+          `${noEmail} active ${noEmail === 1 ? 'person has' : 'people have'} no email and sign in with the employee ID, so "Email only" would lock them out. Give them an email address first, or choose "Email or employee ID".`,
+        );
+      }
+    }
+    // The financial year decides how every payslip, declaration and tax figure is grouped: once payroll has been run it
+    // cannot move without re-labelling years already processed.
+    const newFyStart = (incomingPolicies as { financialYearStartMonth?: unknown } | undefined)?.financialYearStartMonth;
+    if (section === 'policies' && newFyStart !== undefined && newFyStart !== null && newFyStart !== '') {
+      const [current, anyRun] = await Promise.all([
+        this.prisma.payrollSettings.findFirst({ where: { organizationId }, select: { financialYearStartMonth: true } }),
+        this.prisma.payrollRun.findFirst({ where: { organizationId }, select: { id: true } }),
+      ]);
+      const existingPolicies = (await this.findOrThrow(organizationId)).policies as { financialYearStartMonth?: unknown } | null;
+      const currentMonth = Number(existingPolicies?.financialYearStartMonth) || current?.financialYearStartMonth || 4;
+      if (anyRun && Number(newFyStart) !== currentMonth) {
+        throw new BadRequestException(
+          'The financial year start month cannot be changed once payroll has been run - it would re-label the years already processed.',
+        );
+      }
     }
     if (jsonObjectFields.length > 0) {
       const existingOrg = await this.findOrThrow(organizationId);

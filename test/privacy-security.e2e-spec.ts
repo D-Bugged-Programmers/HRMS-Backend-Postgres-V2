@@ -161,6 +161,8 @@ describe('Privacy security hardening (e2e)', () => {
     // profile is complete); the masked values are available on the single-employee read above.
     expect(row.personalData.panNumber).toBeUndefined();
 
+    // Every response masks PAN / Aadhaar / UAN / account number, ADMIN included; the full value comes only from the
+    // audited reveal endpoint (the eye button), which a MANAGER cannot use.
     const asAdmin = await http()
       .get(`/employees/${e1Id}`)
       .set(auth(adminToken))
@@ -168,7 +170,18 @@ describe('Privacy security hardening (e2e)', () => {
     expect(
       (asAdmin.body as { personalData: Record<string, string> }).personalData
         .panNumber,
-    ).toBe('ABCDE1234F');
+    ).toBe('******234F');
+    const revealed = await http()
+      .get(`/employees/${e1Id}/personal-data/sensitive`)
+      .set(auth(adminToken))
+      .expect(200);
+    expect((revealed.body as { panNumber: string }).panNumber).toBe(
+      'ABCDE1234F',
+    );
+    await http()
+      .get(`/employees/${e1Id}/personal-data/sensitive`)
+      .set(auth(deptMgr.token))
+      .expect(403);
   });
 
   it('viewing another employee and listing documents each write a privacy audit row (ids only)', async () => {
@@ -272,12 +285,14 @@ describe('Privacy security hardening (e2e)', () => {
       svc.transporter = {
         sendMail: () => Promise.reject(new Error('smtp down')),
       };
+      // A deliverable-looking address: a reserved one (example.test) is skipped before the transporter is tried. The
+      // transporter is the stub above, so nothing is sent.
       await app
         .get(EmailService)
-        .send({ to: 'y@example.test', subject: 'Welcome', html });
+        .send({ to: 'y@smtp-check.co.in', subject: 'Welcome', html });
       svc.transporter = null;
       const out = logged();
-      expect(out).toContain('y@example.test');
+      expect(out).toContain('y@smtp-check.co.in');
       expect(out).toContain('smtp down');
       expect(out).not.toContain(SECRET);
     });

@@ -1,8 +1,8 @@
 // Purpose: CRUD for Department records, department-head assignment, and employee-to-department mapping.
 // Responsibilities: Owns department lifecycle including deletion guard (blocks delete while employees are
 // mapped); assignHead() folds a role promotion (to MANAGER) into the same call as head assignment.
-// Important: assignHead() refuses to promote a user who already holds ADMIN/HR (NON_DEMOTABLE_ROLES) since
-// that would silently demote their real role to MANAGER — mirrors the frontend's own NON_DEMOTABLE_ROLES list.
+// Important: the department head is who looks after that department's people and requests (common/dept-scope.ts).
+// An HR user can head departments and keeps the HR role; an ADMIN cannot (an Admin already sees everyone).
 import { shiftConsistencyError } from '../attendance/shift-hours';
 import { orgAttendanceDefaults } from './org-attendance-sync';
 import {
@@ -18,7 +18,6 @@ import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { CreateDepartmentDto } from './dto/create-department.dto';
 import { UpdateDepartmentDto } from './dto/update-department.dto';
 import { MapEmployeesDto } from './dto/map-employees.dto';
-import { BulkImportDepartmentsDto } from './dto/bulk-import-departments.dto';
 import { wrapAll } from '../common/pagination';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AttendanceService } from '../attendance/attendance.service';
@@ -29,10 +28,8 @@ import {
 } from '../attendance/attendance-shift-config';
 import type { AlternateWeeklyOffDto } from '../work-schedules/dto/create-work-schedule.dto';
 
-// Mirrors the frontend's own NON_DEMOTABLE_ROLES — these roles already
-// carry broader-than-department authority, so assigning one of these users
-// as a department head must never overwrite their real role with MANAGER
-// (that would silently demote them). Only a plain employee gets promoted.
+// Assigning a department head never overwrites these roles with MANAGER (that would silently demote them). Only a
+// plain employee gets promoted.
 const NON_DEMOTABLE_ROLES: Role[] = [Role.ADMIN, Role.HR];
 
 const DEPARTMENT_INCLUDE = {
@@ -170,56 +167,26 @@ export class DepartmentsService {
     return department;
   }
 
-  // Client-parsed Excel/CSV import — same Promise.allSettled per-row
-  // isolation as OrgListItemsService/DocumentRequirementsService's bulk
-  // imports. Reuses create() itself for each row rather than duplicating
-  // its duplicate-check/audit-log logic.
-  async bulkImport(
-    dto: BulkImportDepartmentsDto,
-    organizationId: string,
-    actorId?: string,
-  ) {
-    const results = await Promise.allSettled(
-      dto.rows.map((row) => {
-        const name = row.name?.trim();
-        const code = row.code?.trim();
-        if (!name || !code) {
-          return Promise.reject(new Error('Row needs both a name and a code.'));
-        }
-        return this.create(
-          { name, code, description: row.description?.trim() },
-          organizationId,
-          actorId,
-        );
-      }),
-    );
-
-    const created: string[] = [];
-    const skipped: { name: string; reason: string }[] = [];
-    results.forEach((result, idx) => {
-      if (result.status === 'fulfilled') {
-        created.push(result.value.name);
-      } else {
-        const reason =
-          result.reason instanceof ConflictException
-            ? 'A department with this name or code already exists.'
-            : result.reason instanceof Error
-              ? result.reason.message
-              : 'Failed to import row.';
-        skipped.push({ name: dto.rows[idx]?.name ?? '(unknown)', reason });
-      }
-    });
-
-    return { created, skipped };
-  }
-
   async findAll(organizationId: string) {
-    const data = await this.scopedPrisma.department.findMany({
-      where: { organizationId, isActive: true },
-      orderBy: { name: 'asc' },
-      include: DEPARTMENT_INCLUDE,
-    });
-    return wrapAll(data);
+    const [data, headcount] = await Promise.all([
+      this.scopedPrisma.department.findMany({
+        where: { organizationId, isActive: true },
+        orderBy: { name: 'asc' },
+        include: DEPARTMENT_INCLUDE,
+      }),
+      // Same people remove() counts, so the number on the list is what blocks a delete.
+      this.scopedPrisma.user.groupBy({
+        by: ['departmentId'],
+        where: { organizationId, departmentId: { not: null } },
+        _count: { _all: true },
+      }),
+    ]);
+    return wrapAll(
+      data.map((d) => ({
+        ...d,
+        employeeCount: headcount.find((h) => h.departmentId === d.id)?._count._all ?? 0,
+      })),
+    );
   }
 
   // The org-level defaults a department starts from; the Manage Department form shows them and can reset to them.
@@ -389,9 +356,9 @@ export class DepartmentsService {
       where: { id: userId, organizationId },
     });
     if (!user) throw new NotFoundException('User not found.');
-    if (NON_DEMOTABLE_ROLES.includes(user.role)) {
+    if (user.role === Role.ADMIN) {
       throw new BadRequestException(
-        `${user.name} already has the ${user.role} role, which already covers every department — assign a regular employee as department head instead.`,
+        `${user.name} is an Admin, who already sees every department — assign a manager, HR user or employee as department head instead.`,
       );
     }
 
@@ -400,10 +367,15 @@ export class DepartmentsService {
         where: { id, organizationId },
         data: { departmentHeadId: userId },
       }),
-      this.scopedPrisma.user.updateMany({
-        where: { id: userId, organizationId },
-        data: { role: Role.MANAGER, departmentId: id },
-      }),
+      // An HR user heads the department as HR: their role and their own department stay as they are.
+      ...(NON_DEMOTABLE_ROLES.includes(user.role)
+        ? []
+        : [
+            this.scopedPrisma.user.updateMany({
+              where: { id: userId, organizationId },
+              data: { role: Role.MANAGER, departmentId: id },
+            }),
+          ]),
     ]);
 
     return this.scopedPrisma.department.findFirstOrThrow({

@@ -26,6 +26,8 @@ function build(
         orgPayrollAttendancePrefs: opts.orgPrefs ?? {},
       }),
     },
+    // Which departments the reviewer heads (common/dept-scope.ts): none here.
+    department: { findMany: async () => [] },
     user: {
       findMany: async (a: Row) =>
         (a?.where?.id?.in ?? [])
@@ -41,7 +43,7 @@ function build(
               departmentId: 'd1',
             },
     },
-    payrollRun: { count: async () => opts.payrollRuns ?? 0 },
+    payrollRun: { count: async () => opts.payrollRuns ?? 0, updateMany: async () => ({ count: 0 }) },
     employeeTaxDeclaration: {
       findFirst: async (a: Row) => {
         const r = store.find((x) => match(x, a?.where));

@@ -17,6 +17,7 @@ import { OffboardingService } from './offboarding.service';
 import { UpdateLastWorkingDayDto } from './dto/update-last-working-day.dto';
 import { InitiateOffboardingDto } from './dto/initiate-offboarding.dto';
 import { UpdateChecklistDto } from './dto/update-checklist.dto';
+import { UpdateChecklistOwnerDto } from './dto/update-checklist-owner.dto';
 import { SubmitExitInterviewDto } from './dto/submit-exit-interview.dto';
 import { LinkSettlementDto } from './dto/link-settlement.dto';
 import { CompleteOffboardingDto } from './dto/complete-offboarding.dto';
@@ -55,6 +56,20 @@ export class OffboardingController {
     return this.offboardingService.findMine(caller);
   }
 
+  // The leaver fills in their own exit interview (ticks the checklist item). Before ':id' routes so 'mine' is not read as an id.
+  @Post('mine/exit-interview')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER, Role.EMPLOYEE)
+  @UseGuards(RolesGuard)
+  submitMyExitInterview(@Body() dto: SubmitExitInterviewDto, @CurrentUser() caller: Caller) {
+    return this.offboardingService.submitMyExitInterview(dto, caller);
+  }
+
+  // Exit tracker: open exits with days left, owners, overdue items and settlement state.
+  @Get('overview')
+  overview(@CurrentUser() caller: Caller) {
+    return this.offboardingService.overview(caller.organizationId);
+  }
+
   @Get(':id')
   findOne(@Param('id') id: string, @CurrentUser() caller: Caller) {
     return this.offboardingService.findOne(id, caller.organizationId);
@@ -76,6 +91,16 @@ export class OffboardingController {
       dto,
       caller.organizationId,
     );
+  }
+
+  // Who owns a checklist item and by when (the owner is told, and reminded until it is done).
+  @Patch(':id/checklist-owner')
+  updateChecklistOwner(
+    @Param('id') id: string,
+    @Body() dto: UpdateChecklistOwnerDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.offboardingService.updateChecklistOwner(id, dto, caller.organizationId);
   }
 
   @Patch(':id/exit-interview')

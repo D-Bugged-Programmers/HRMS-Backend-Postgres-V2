@@ -10,6 +10,8 @@ const EMP = (over: Row = {}): Row => ({
   email: 'a@x.com',
   role: Role.EMPLOYEE,
   isActive: true,
+  employmentStatus: 'CONFIRMED',
+  employeeType: 'permanent',
   ...over,
 });
 
@@ -20,6 +22,8 @@ function build(
     runs?: Row[];
     components?: Row[];
     repayments?: Row[];
+    // Everyone in the organisation, for the department-head scope (common/dept-scope.ts).
+    people?: Row[];
   } = {},
 ) {
   const loans: Row[] = (opts.loans ?? []).map((l) => ({ ...l }));
@@ -71,9 +75,12 @@ function build(
     },
   };
   const prisma: Row = {
+    // Which departments the reviewer heads (common/dept-scope.ts): none here.
+    department: { findMany: async () => [] },
     user: {
-      findFirst: async () => employee,
-      findMany: async () => [{ id: 'hr1' }],
+      findFirst: async (a: Row) =>
+        opts.people?.find((p) => p.id === a?.where?.id) ?? employee,
+      findMany: async () => opts.people ?? [{ id: 'hr1' }],
     },
     loan: loanModel,
     loanRepayment: repaymentModel,
@@ -87,7 +94,8 @@ function build(
     stub(prisma),
     stub({
       create: async (n: Row) => notes.push(n),
-      createMany: async () => undefined,
+      createMany: async (rows: Row[]) => { notes.push(...rows); },
+      reviewersFor: async () => ['hr1'],
     }),
     stub({ send: async () => undefined }),
     stub({
@@ -394,6 +402,19 @@ describe('loans: sanctioning', () => {
         'org',
       ),
     ).rejects.toThrow(/months from now/);
+  });
+});
+
+describe('loans: who may apply', () => {
+  it.each([
+    ['PROBATION', 'permanent'],
+    ['EXTENDED_PROBATION', 'permanent'],
+    ['CONFIRMED', 'intern'],
+  ])('a %s / %s employee can still request a loan or advance, and the approver is told', async (employmentStatus, employeeType) => {
+    const { service, notes } = build({ employee: EMP({ employmentStatus, employeeType }) });
+    const loan = await service.request({ loanType: 'ADVANCE', principal: 1000, tenureMonths: 1 } as never, { id: 'e1', name: 'Asha', role: Role.EMPLOYEE } as never, 'org');
+    expect(loan.status).toBe('PENDING');
+    expect(notes.some((n) => /not a confirmed permanent employee/.test(String(n.message)))).toBe(true);
   });
 });
 
@@ -785,7 +806,15 @@ describe('loans: who can read the repayments', () => {
   });
 
   it('a manager reads repayments only within their own department', async () => {
-    const { service } = build({ loans: [loan('d1')] });
+    // Neither department has a head, so each manager sees their own department.
+    const { service } = build({
+      loans: [loan('d1')],
+      people: [
+        { id: 'e1', departmentId: 'd1' },
+        { id: 'm1', departmentId: 'd1', department: { id: 'd1', departmentHeadId: null } },
+        { id: 'm2', departmentId: 'd2', department: { id: 'd2', departmentHeadId: null } },
+      ],
+    });
     const same = { id: 'm1', role: Role.MANAGER, departmentId: 'd1' } as never;
     const other = { id: 'm2', role: Role.MANAGER, departmentId: 'd2' } as never;
     await expect(

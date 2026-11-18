@@ -146,6 +146,8 @@ describe('Leave Tracker (e2e)', () => {
       .send({
         name: 'Eng Manager',
         email: 'leavetracker-e2e-manager@example.test',
+        // Joined before the fixture month, so they are on the grid (people appear from their joining date).
+        joiningDate: '2020-01-01',
         role: 'MANAGER',
         departmentId,
       });
@@ -189,6 +191,8 @@ describe('Leave Tracker (e2e)', () => {
       .send({
         name: 'Employee B',
         email: 'leavetracker-e2e-empb@example.test',
+        // Joined before the fixture month, so they are on the grid (people appear from their joining date).
+        joiningDate: '2020-01-01',
         departmentId,
       });
     empBId = (empBCreate.body as EmployeeCreateBody).employee.id;
@@ -199,6 +203,8 @@ describe('Leave Tracker (e2e)', () => {
       .send({
         name: 'Outside Employee',
         email: 'leavetracker-e2e-outside@example.test',
+        // Joined before the fixture month, so they are on the grid (people appear from their joining date).
+        joiningDate: '2020-01-01',
         departmentId: otherDepartmentId,
       });
     outsideEmployeeId = (outsideCreate.body as EmployeeCreateBody).employee.id;
@@ -380,9 +386,9 @@ describe('Leave Tracker (e2e)', () => {
       // recorded is backfilled to ABSENT, not left blank.
       expect(cells[11]).toBe('ABSENT');
 
-      // Day 15 (a Saturday) also has no Attendance row, but it's a weekend
-      // — must stay blank, never backfilled to ABSENT.
-      expect(cells[15]).toBeUndefined();
+      // Day 15 (a Saturday) also has no Attendance row, but it's a weekly off
+      // — shown as Weekly Off from the shift, never backfilled to ABSENT.
+      expect(cells[15]).toBe('WEEKLY_OFF');
 
       const day8 = body.days.find((day) => day.day === 8);
       expect(day8?.holidayName).toBe('Test Holiday');
@@ -410,12 +416,13 @@ describe('Leave Tracker (e2e)', () => {
       expect(ids).not.toContain(outsideEmployeeId);
     });
 
-    it('MANAGER passing a departmentId that is not their own is rejected', async () => {
-      await request(app.getHttpServer())
+    it('MANAGER passing a departmentId that is not their own gets nobody (a filter narrows, never widens)', async () => {
+      const res = await request(app.getHttpServer())
         .get('/leave-tracker/grid')
         .query({ month: MONTH, year: YEAR, departmentId: otherDepartmentId })
         .set('Authorization', `Bearer ${managerToken}`)
-        .expect(403);
+        .expect(200);
+      expect((res.body as GridResponse).employees).toEqual([]);
     });
 
     it("MANAGER passing their own departmentId is accepted (doesn't widen or narrow)", async () => {
@@ -455,11 +462,12 @@ describe('Leave Tracker (e2e)', () => {
         .expect(200);
       const cells = (res.body as GridResponse).cells[empAId] ?? {};
       // No Attendance rows exist for empA in the current month at all — if
-      // today/future backfilling ever leaked in, this would start failing.
-      expect(cells[todayDay]).toBeUndefined();
+      // today/future backfilling ever leaked in, this would start failing. (A weekly off is shown as Weekly Off even
+      // ahead of time, so only Absent is ruled out.)
+      expect(cells[todayDay]).not.toBe('ABSENT');
       const lastDay = new Date(Date.UTC(todayYear, todayMonth, 0)).getUTCDate();
       if (lastDay > todayDay) {
-        expect(cells[lastDay]).toBeUndefined();
+        expect(cells[lastDay]).not.toBe('ABSENT');
       }
     });
 
@@ -475,6 +483,277 @@ describe('Leave Tracker (e2e)', () => {
       // Attendance row backfills to ABSENT same as any other employee's.
       expect(cells[11]).toBeUndefined();
       expect(cells[13]).toBe('ABSENT');
+    });
+
+    it('shows an employee only from their joining date: not listed before it, and no data on days before it', async () => {
+      const lateJoiner = await prisma.user.findFirstOrThrow({
+        where: { id: lateJoinerId },
+      });
+      // A stray record dated before they joined (an import or manual entry).
+      await prisma.attendance.create({
+        data: {
+          organizationId: lateJoiner.organizationId,
+          employeeId: lateJoinerId,
+          date: `${YEAR}-08-05`,
+          status: 'PRESENT',
+          source: 'FACE_API',
+          workDurationMinutes: 480,
+        },
+      });
+      const grid = async (month: number) =>
+        (
+          await request(app.getHttpServer())
+            .get('/leave-tracker/grid')
+            .query({ month, year: YEAR })
+            .set('Authorization', `Bearer ${adminToken}`)
+            .expect(200)
+        ).body as GridResponse;
+      const july = await grid(MONTH - 1);
+      expect(july.employees.map((e) => e.id)).not.toContain(lateJoinerId);
+      const august = await grid(MONTH);
+      expect(august.employees.map((e) => e.id)).toContain(lateJoinerId);
+      expect(august.cells[lateJoinerId]?.[5]).toBeUndefined();
+      expect(august.hours[lateJoinerId]?.[5]).toBeUndefined();
+
+      // The Attendance Records list leaves the same stray row out.
+      const list = await request(app.getHttpServer())
+        .get('/attendance')
+        .query({
+          employeeId: lateJoinerId,
+          from: `${YEAR}-08-01`,
+          to: `${YEAR}-08-31`,
+          limit: 100,
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const dates = (list.body as { data: { date: string }[] }).data.map(
+        (r) => r.date,
+      );
+      expect(dates).not.toContain(`${YEAR}-08-05`);
+      expect(dates.every((d) => d >= `${YEAR}-08-12`)).toBe(true);
+
+      // The Attendance report export and the custom report builder follow the same rule.
+      const report = await request(app.getHttpServer())
+        .get('/reports/attendance')
+        .query({ format: 'csv', from: `${YEAR}-08-01`, to: `${YEAR}-08-31` })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const lateJoinerLines = (report.text as string)
+        .split('\n')
+        .filter((l) => l.includes('Late Joiner'));
+      expect(lateJoinerLines.some((l) => l.includes('05-08-2026'))).toBe(false);
+      const custom = await request(app.getHttpServer())
+        .get('/reports/custom')
+        .query({
+          source: 'attendance',
+          format: 'json',
+          from: `${YEAR}-08-01`,
+          to: `${YEAR}-08-31`,
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const customDates = (
+        custom.body as { rows: { employeeName: string; date: string }[] }
+      ).rows
+        .filter((r) => r.employeeName === 'Late Joiner')
+        .map((r) => r.date);
+      expect(customDates).not.toContain('05-08-2026');
+    });
+  });
+
+  describe('reference (past-dated) holidays', () => {
+    it('count as holidays: the grid shows them, and Absent rows on them become Holiday - except where payroll is locked', async () => {
+      const emp = await prisma.user.findFirstOrThrow({ where: { id: empAId } });
+      const date = `${YEAR}-07-01`; // a Wednesday, and no fixture data in July
+      await prisma.holiday.create({
+        data: {
+          organizationId: emp.organizationId,
+          name: 'Reference Day',
+          date,
+          year: YEAR,
+          isActive: false,
+          isReference: true,
+        },
+      });
+      const row = (employeeId: string) => ({
+        organizationId: emp.organizationId,
+        employeeId,
+        date,
+        status: 'ABSENT' as const,
+        source: 'EXCEL_IMPORT' as const,
+      });
+      await prisma.attendance.create({ data: row(empAId) });
+      await prisma.attendance.create({ data: row(empBId) });
+      await prisma.payrollRun.create({
+        data: {
+          organizationId: emp.organizationId,
+          employeeId: empBId,
+          month: 7,
+          year: YEAR,
+          status: 'LOCKED',
+        },
+      });
+
+      const before = (
+        await request(app.getHttpServer())
+          .get('/leave-tracker/grid')
+          .query({ month: 7, year: YEAR })
+          .set('Authorization', `Bearer ${adminToken}`)
+          .expect(200)
+      ).body as GridResponse;
+      // The holiday is on the grid's calendar even before any repair.
+      expect(before.days.find((d) => d.day === 1)?.holidayName).toBe(
+        'Reference Day',
+      );
+
+      const fixed = await request(app.getHttpServer())
+        .post('/attendance/apply-reference-holidays')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(201);
+      expect(fixed.body).toMatchObject({ updated: 1, skippedLocked: 1 });
+      const rows = await prisma.attendance.findMany({
+        where: { date, employeeId: { in: [empAId, empBId] } },
+      });
+      expect(rows.find((r) => r.employeeId === empAId)?.status).toBe('HOLIDAY');
+      expect(rows.find((r) => r.employeeId === empBId)?.status).toBe('ABSENT'); // locked month untouched
+
+      // A deactivated (non-reference) holiday still never counts.
+      await prisma.holiday.create({
+        data: {
+          organizationId: emp.organizationId,
+          name: 'Switched off',
+          date: `${YEAR}-07-02`,
+          year: YEAR,
+          isActive: false,
+        },
+      });
+      const after = (
+        await request(app.getHttpServer())
+          .get('/leave-tracker/grid')
+          .query({ month: 7, year: YEAR })
+          .set('Authorization', `Bearer ${adminToken}`)
+          .expect(200)
+      ).body as GridResponse;
+      expect(after.days.find((d) => d.day === 2)?.holidayName).toBeUndefined();
+      expect(after.cells[empAId]?.[1]).toBe('HOLIDAY');
+    });
+  });
+
+  describe('the employee attendance list (what the mobile app and web calendar read)', () => {
+    it('shows a holiday still to come for one person, and only that - not other future days', async () => {
+      const emp = await prisma.user.findFirstOrThrow({ where: { id: empAId } });
+      const ymd = (days: number) => {
+        const d = new Date();
+        d.setUTCDate(d.getUTCDate() + days);
+        return d.toISOString().slice(0, 10);
+      };
+      await prisma.holiday.create({
+        data: {
+          organizationId: emp.organizationId,
+          name: 'Upcoming Test Day',
+          date: ymd(5),
+          year: Number(ymd(5).slice(0, 4)),
+        },
+      });
+      const list = async (employeeId?: string) =>
+        (
+          await request(app.getHttpServer())
+            .get('/attendance')
+            .query({
+              ...(employeeId && { employeeId }),
+              from: ymd(0),
+              to: ymd(10),
+              limit: 200,
+            })
+            .set('Authorization', `Bearer ${adminToken}`)
+            .expect(200)
+        ).body as {
+          data: { date: string; status: string; employeeId: string }[];
+        };
+      const one = (await list(empAId)).data.filter((r) => r.date >= ymd(0));
+      expect(one.map((r) => [r.date, r.status])).toEqual([[ymd(5), 'HOLIDAY']]);
+      // A table of many people is not filled with upcoming holiday rows.
+      const many = (await list()).data.filter((r) => r.date > ymd(0));
+      expect(many).toHaveLength(0);
+    });
+  });
+
+  describe('the grid follows the holiday calendar', () => {
+    it('marks company, department-only and (not) optional holidays per employee, with no attendance rows needed', async () => {
+      const emp = await prisma.user.findFirstOrThrow({ where: { id: empAId } });
+      const org = emp.organizationId;
+      const mk = (name: string, date: string, extra: object = {}) =>
+        prisma.holiday.create({
+          data: { organizationId: org, name, date, year: YEAR, ...extra },
+        });
+      await mk('Company Day', `${YEAR}-11-10`);
+      await mk('Eng Only Day', `${YEAR}-11-11`, { departmentId });
+      await mk('Optional Fest', `${YEAR}-11-12`, {
+        isOptional: true,
+        type: 'OPTIONAL',
+      });
+
+      const grid = (
+        await request(app.getHttpServer())
+          .get('/leave-tracker/grid')
+          .query({ month: 11, year: YEAR })
+          .set('Authorization', `Bearer ${adminToken}`)
+          .expect(200)
+      ).body as GridResponse;
+      // Everyone on the company holiday; only Engineering on its own; nobody on the optional one.
+      expect(grid.cells[empAId]?.[10]).toBe('HOLIDAY');
+      expect(grid.cells[outsideEmployeeId]?.[10]).toBe('HOLIDAY');
+      expect(grid.cells[empAId]?.[11]).toBe('HOLIDAY');
+      expect(grid.cells[outsideEmployeeId]?.[11]).toBeUndefined();
+      expect(grid.cells[empAId]?.[12]).toBeUndefined();
+      // The column header names only what applies to everyone.
+      expect(grid.days.find((d) => d.day === 10)?.holidayName).toBe(
+        'Company Day',
+      );
+      expect(grid.days.find((d) => d.day === 11)?.holidayName).toBeUndefined();
+      expect(grid.days.find((d) => d.day === 12)?.holidayName).toBeUndefined();
+    });
+  });
+
+  describe('balances follow the joining date', () => {
+    it('lists an employee only from the month they joined, and counts WFH days only from the joining date', async () => {
+      const lj = await prisma.user.findFirstOrThrow({
+        where: { id: lateJoinerId },
+      });
+      const wfh = (date: string) =>
+        prisma.attendance.upsert({
+          where: {
+            organizationId_employeeId_date: {
+              organizationId: lj.organizationId,
+              employeeId: lateJoinerId,
+              date,
+            },
+          },
+          update: { workArrangement: 'WFH' },
+          create: {
+            organizationId: lj.organizationId,
+            employeeId: lateJoinerId,
+            date,
+            status: 'PRESENT',
+            source: 'FACE_API',
+            workArrangement: 'WFH',
+          },
+        });
+      await wfh(`${YEAR}-08-04`); // before the 12 Aug joining date
+      await wfh(`${YEAR}-08-13`); // after it
+      const get = async (period?: string) =>
+        (
+          await request(app.getHttpServer())
+            .get('/leave-tracker/balances')
+            .query({ year: YEAR, ...(period && { period }) })
+            .set('Authorization', `Bearer ${adminToken}`)
+            .expect(200)
+        ).body as { employeeId: string; name: string; wfhDaysUsed: number }[];
+      const find = (rows: { name: string; wfhDaysUsed: number }[]) =>
+        rows.find((r) => r.name === 'Late Joiner');
+      expect(find(await get(`${YEAR}-08`))?.wfhDaysUsed).toBe(1);
+      expect(find(await get(`${YEAR}-07`))).toBeUndefined(); // a month before they joined
+      expect(find(await get())).toBeDefined(); // the whole year keeps everyone listed
     });
   });
 
@@ -566,12 +845,13 @@ describe('Leave Tracker (e2e)', () => {
       expect(ids).not.toContain(outsideEmployeeId);
     });
 
-    it('MANAGER passing a departmentId that is not their own is rejected', async () => {
-      await request(app.getHttpServer())
+    it('MANAGER passing a departmentId that is not their own gets nobody (a filter narrows, never widens)', async () => {
+      const res = await request(app.getHttpServer())
         .get('/leave-tracker/balances')
         .query({ year: YEAR, departmentId: otherDepartmentId })
         .set('Authorization', `Bearer ${managerToken}`)
-        .expect(403);
+        .expect(200);
+      expect(res.body as BalanceEntry[]).toEqual([]);
     });
   });
 });

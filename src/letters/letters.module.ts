@@ -1,5 +1,8 @@
 import { Module } from '@nestjs/common';
-import { LettersController } from './letters.controller';
+import {
+  LettersController,
+  LettersOverviewController,
+} from './letters.controller';
 import { LettersService } from './letters.service';
 import { LetterPdfService } from './letter-pdf.service';
 import { AuditLogModule } from '../audit-log/audit-log.module';
@@ -8,6 +11,8 @@ import { EmployeeTimelineModule } from '../employee-timeline/employee-timeline.m
 import { NotificationsModule } from '../notifications/notifications.module';
 import { EmailTemplatesModule } from '../email-templates/email-templates.module';
 
+import { CompanyBrandsModule } from '../company-brands/company-brands.module';
+
 @Module({
   imports: [
     AuditLogModule,
@@ -15,8 +20,11 @@ import { EmailTemplatesModule } from '../email-templates/email-templates.module'
     EmployeeTimelineModule,
     NotificationsModule,
     EmailTemplatesModule,
+    CompanyBrandsModule,
   ],
-  controllers: [LettersController],
+  controllers: [LettersController, LettersOverviewController],
   providers: [LettersService, LetterPdfService],
+  // Exported so completing an exit can email the relieving / experience letters.
+  exports: [LettersService],
 })
 export class LettersModule {}

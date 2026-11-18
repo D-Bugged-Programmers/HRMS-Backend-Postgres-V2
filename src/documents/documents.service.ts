@@ -6,6 +6,7 @@
 // canViewPolicy; HR/Admin bypass visibility entirely since they manage the library, not just consume it.
 // deletePolicy() only deletes the underlying file when fileUrl is an internal storage key, never an
 // external URL a user pasted in.
+import { documentNameProblem } from './dto/document-name';
 import {
   BadRequestException,
   ConflictException,
@@ -15,6 +16,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  EmployeeDocumentCategory,
+  NotificationCategory,
   Prisma,
   PolicyDocument,
   PolicyDocType,
@@ -34,8 +37,10 @@ import { UpdateDocumentRequirementDto } from './dto/update-document-requirement.
 import { BulkDeleteDocumentRequirementsDto } from './dto/bulk-delete-document-requirements.dto';
 import { BulkImportDocumentRequirementsDto } from './dto/bulk-import-document-requirements.dto';
 import { wrapAll } from '../common/pagination';
+import { EXTERNAL_URL_RE as STORED_URL_RE, extractPdfText } from '../ask-hr/policy-text';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 type Actor = Omit<User, 'password'>;
 
@@ -67,6 +72,7 @@ export class DocumentsService {
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly auditLogService: AuditLogService,
     private readonly timelineService: EmployeeTimelineService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   // Registration-time seed (same integration point as LeaveTypesService/OrgListItemsService
@@ -112,9 +118,12 @@ export class DocumentsService {
   private withSignedUrl<T extends { fileUrl: string; organizationId: string }>(
     doc: T,
   ): T {
-    if (EXTERNAL_URL_RE.test(doc.fileUrl)) return doc;
+    // The searchable text (can be very long) is never sent to a browser; the list only says whether Ask HR has any for it.
+    const { contentText, ...rest } = doc as T & { contentText?: string | null };
+    const base = ('contentText' in (doc as object) ? { ...rest, hasSearchText: !!contentText } : rest) as unknown as T;
+    if (EXTERNAL_URL_RE.test(doc.fileUrl)) return base;
     return {
-      ...doc,
+      ...base,
       fileUrl: `/files/${signFileToken(doc.organizationId, doc.fileUrl)}`,
     };
   }
@@ -122,12 +131,12 @@ export class DocumentsService {
   // Same visibility scoping as findPolicies, but returns raw storage keys
   // (never signed URLs) and only ever currently-active policies (isPublished
   // — even for HR/Admin, unlike findPolicies which lets them see retired
-  // drafts too). For internal server-side consumption only (the Policy
-  // Assistant reads file bytes directly via readStoredFile) — never
+  // drafts too). For internal server-side consumption only (Ask HR searches
+  // their stored text) — never
   // returned in an HTTP response as-is.
-  async findActivePoliciesRaw(actor: Actor, organizationId: string) {
+  async findActivePoliciesRaw(actor: Actor, organizationId: string, onlyIds?: string[]) {
     const policies = await this.scopedPrisma.policyDocument.findMany({
-      where: { organizationId, isPublished: true },
+      where: { organizationId, isPublished: true, ...(onlyIds ? { id: { in: onlyIds } } : {}) },
       orderBy: { createdAt: 'desc' },
     });
     return HR_ROLES.includes(actor.role)
@@ -262,6 +271,42 @@ export class DocumentsService {
   // this specific version. Only meaningful for a document that's actually
   // targeted at specific people (EVERYONE-visibility docs don't have a
   // fixed roster to diff against, so this just returns who signed).
+  // The people who should acknowledge a document (those it is visible to) and have not yet.
+  async listPendingAcknowledgments(id: string, organizationId: string) {
+    const policy = await this.scopedPrisma.policyDocument.findFirst({ where: { id, organizationId } });
+    if (!policy) throw new NotFoundException('Document not found.');
+    const signed = new Set(
+      (await this.scopedPrisma.policyDocumentAcknowledgment.findMany({ where: { organizationId, policyDocumentId: id }, select: { employeeId: true } })).map((a) => a.employeeId),
+    );
+    const people = await this.scopedPrisma.user.findMany({
+      where: { organizationId, isActive: true },
+      select: { id: true, name: true, employeeId: true, role: true, departmentId: true },
+    });
+    const pending = people.filter((u) => !signed.has(u.id) && this.canView(policy, u as unknown as Actor));
+    return { total: pending.length, data: pending.map((u) => ({ id: u.id, name: u.name, employeeId: u.employeeId })) };
+  }
+
+  // Sends each person who has not signed an in-app reminder (the same list as above).
+  async remindPending(id: string, organizationId: string, actorId: string) {
+    const policy = await this.scopedPrisma.policyDocument.findFirst({ where: { id, organizationId } });
+    if (!policy) throw new NotFoundException('Document not found.');
+    if (!policy.requiresAcknowledgment || !policy.isPublished) {
+      throw new BadRequestException('Only a published document that requires acknowledgment can be reminded.');
+    }
+    const { data } = await this.listPendingAcknowledgments(id, organizationId);
+    for (const u of data) {
+      await this.notificationsService.create({
+        organizationId,
+        userId: u.id,
+        title: `Please acknowledge: ${policy.title}`,
+        message: `Read "${policy.title}" and acknowledge it in Company Policy Documents.`,
+        category: NotificationCategory.GENERAL,
+      });
+    }
+    await this.auditLogService.log({ actorId, action: 'POLICY_ACK_REMINDER_SENT', module: 'DOCUMENT', organizationId, targetId: id, details: { reminded: data.length } });
+    return { reminded: data.length };
+  }
+
   async listAcknowledgments(id: string, organizationId: string) {
     const policy = await this.scopedPrisma.policyDocument.findFirst({
       where: { id, organizationId },
@@ -313,6 +358,7 @@ export class DocumentsService {
         organizationId,
         title,
         category: dto.category ?? previousVersion?.category ?? 'General',
+        reviewDate: dto.reviewDate ? new Date(dto.reviewDate) : (previousVersion?.reviewDate ?? null),
         docType,
         fileUrl: dto.fileUrl,
         fileName: dto.fileName,
@@ -332,8 +378,16 @@ export class DocumentsService {
           dto.visibleEmployees ?? previousVersion?.visibleEmployees ?? [],
         version: previousVersion ? previousVersion.version + 1 : 1,
         previousVersionId: previousVersion?.id ?? null,
+        // Text typed in for Ask HR (a link, image or scanned PDF); otherwise a stored PDF is read just below.
+        ...(dto.contentText?.trim() ? { contentText: dto.contentText.trim() } : {}),
       },
     });
+    // Read a stored PDF's text now, in the background, so the first Ask HR search does not have to wait for it.
+    if (!dto.contentText?.trim() && docType === PolicyDocType.PDF && !STORED_URL_RE.test(dto.fileUrl)) {
+      void extractPdfText(dto.fileUrl)
+        .then((text) => this.scopedPrisma.policyDocument.updateMany({ where: { id: policy.id, organizationId }, data: { contentText: text } }))
+        .catch(() => undefined);
+    }
 
     if (previousVersion) {
       await this.scopedPrisma.policyDocument.updateMany({
@@ -402,6 +456,7 @@ export class DocumentsService {
       data: {
         ...(dto.title !== undefined && { title: dto.title }),
         ...(dto.category !== undefined && { category: dto.category }),
+        ...(dto.reviewDate !== undefined && { reviewDate: dto.reviewDate ? new Date(dto.reviewDate) : null }),
         ...(dto.visibility !== undefined && { visibility: dto.visibility }),
         ...(dto.visibleDepartments !== undefined && {
           visibleDepartments: dto.visibleDepartments,
@@ -409,6 +464,8 @@ export class DocumentsService {
         ...(dto.visibleEmployees !== undefined && {
           visibleEmployees: dto.visibleEmployees,
         }),
+        // Typed text replaces whatever was read from the file; clearing it (null) makes Ask HR read the PDF again.
+        ...(dto.contentText !== undefined && { contentText: dto.contentText.trim() ? dto.contentText.trim() : null }),
         ...(dto.isPublished !== undefined && { isPublished: dto.isPublished }),
         ...(dto.requiresAcknowledgment !== undefined && {
           requiresAcknowledgment: dto.requiresAcknowledgment,
@@ -476,7 +533,9 @@ export class DocumentsService {
     return { success: true, message: 'Policy deleted' };
   }
 
-  async findRequirements(organizationId: string) {
+  // `withCounts` (HR/Admin only) adds, per requirement, how many active employees have uploaded it (a rejected upload does not
+  // count - same rule as profile completion) out of how many there are.
+  async findRequirements(organizationId: string, withCounts = false) {
     const data = await this.scopedPrisma.documentRequirement.findMany({
       where: { organizationId },
       // Built-in baseline documents always sort ahead of custom ones.
@@ -486,7 +545,20 @@ export class DocumentsService {
         { createdAt: 'asc' },
       ],
     });
-    return wrapAll(data);
+    if (!withCounts) return wrapAll(data);
+    const [employees, uploads] = await Promise.all([
+      this.scopedPrisma.user.count({ where: { organizationId, isActive: true } }),
+      this.scopedPrisma.employeeDocument.findMany({
+        where: { organizationId, category: EmployeeDocumentCategory.DOCUMENT, status: { not: 'REJECTED' }, employee: { isActive: true } },
+        select: { employeeId: true, docType: true },
+      }),
+    ]);
+    const byType = new Map<string, Set<string>>();
+    for (const u of uploads) {
+      if (!byType.has(u.docType)) byType.set(u.docType, new Set());
+      byType.get(u.docType)!.add(u.employeeId);
+    }
+    return wrapAll(data.map((r) => ({ ...r, uploadedCount: byType.get(r.name)?.size ?? 0, employeeCount: employees })));
   }
 
   async createRequirement(
@@ -713,6 +785,9 @@ export class DocumentsService {
         if (!name) {
           return Promise.reject(new Error('Row has no document name.'));
         }
+        // The same rule as a single create: a bad name skips this row with its reason, the rest still import.
+        const problem = documentNameProblem(name);
+        if (problem) return Promise.reject(new Error(problem));
         const existingId = existingByName.get(name);
         if (existingId) {
           return this.scopedPrisma.documentRequirement

@@ -6,6 +6,10 @@
 // Important: assertSelfOrHr() gates personal-data/document/asset self-service so a non-HR actor can only
 // touch their own profile; getFullProfile() is the HR/Admin-only variant that returns everything, unlike
 // the password-stripped-only view elsewhere.
+import { profileScore, withAccountFields, withRootGender } from './profile-score';
+import { LettersService } from '../letters/letters.service';
+import { sendLetterQuietly } from '../letters/auto-letter';
+import { todayInOrgTz } from '../common/org-date';
 import {
   BadRequestException,
   ConflictException,
@@ -13,6 +17,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import {
   EmployeeDocument,
@@ -35,6 +40,7 @@ import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.
 import { NotificationsService } from '../notifications/notifications.service';
 import { EmailService } from '../notifications/email.service';
 import { EmailTemplatesService } from '../email-templates/email-templates.service';
+import { sendOccasionEmail } from '../email-templates/send-occasion-email';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EXIT_STATUSES } from './employees.service';
 import { UpdatePersonalDataDto } from './dto/update-personal-data.dto';
@@ -45,25 +51,25 @@ import { SetDocumentVisibilityDto } from './dto/set-document-visibility.dto';
 import { CreateEmployeeAssetDto } from './dto/create-employee-asset.dto';
 import { UpdateEmployeeAssetDto } from './dto/update-employee-asset.dto';
 import {
+  isMaskedEcho,
+  REVEALABLE_KEYS,
+  type RevealableKey,
+} from './personal-data-mask';
+import {
   areMandatoryDocumentsUploaded,
   assertValidDates,
   assertPersonalDataShape,
   assertValidIdentifiers,
+  assertContactNumbersDistinct,
+  CONTACT_NUMBER_KEYS,
   mergePersonalData,
+  uanRequiredFor,
 } from './personal-data';
-import { assertNotSelfApproval } from '../common/dept-scope';
+import { assertNotSelfApproval, inReviewerScope } from '../common/dept-scope';
 
+import { dmyText } from '../payroll/format-date';
 type Actor = Omit<User, 'password'>;
 
-export type OrgChartNode = {
-  id: string;
-  employeeId: string;
-  name: string;
-  designation: string;
-  department: string;
-  children: OrgChartNode[];
-  teamSize: number;
-};
 
 const HR_ROLES: Role[] = [Role.ADMIN, Role.HR];
 
@@ -92,6 +98,8 @@ function withSignedFileUrl<T extends EmployeeDocument>(doc: T): T {
 
 @Injectable()
 export class EmployeeProfileService {
+  private readonly logger = new Logger(EmployeeProfileService.name);
+
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly timelineService: EmployeeTimelineService,
@@ -100,6 +108,7 @@ export class EmployeeProfileService {
     private readonly auditLogService: AuditLogService,
     private readonly emailTemplatesService: EmailTemplatesService,
     private readonly privacyAudit: PrivacyAuditService,
+    private readonly lettersService: LettersService,
   ) {}
 
   private async findEmployeeOrThrow(id: string, organizationId: string) {
@@ -168,146 +177,117 @@ export class EmployeeProfileService {
     return areMandatoryDocumentsUploaded(requirements, documents);
   }
 
+  // How complete one employee's profile is, and what is missing (see profile-score.ts). The employee themselves or HR/Admin.
+  async profileScore(id: string, actor: Actor, organizationId: string) {
+    this.assertSelfOrHr(actor, id);
+    const employee = await this.findEmployeeOrThrow(id, organizationId);
+    const [requirements, documents] = await Promise.all([
+      this.scopedPrisma.documentRequirement.findMany({
+        where: { organizationId, isMandatory: true, isActive: true },
+        select: { name: true, isMandatory: true, isActive: true },
+      }),
+      this.scopedPrisma.employeeDocument.findMany({
+        where: { organizationId, employeeId: id, category: EmployeeDocumentCategory.DOCUMENT },
+        select: { docType: true, status: true },
+      }),
+    ]);
+    return profileScore(
+      withAccountFields(withRootGender(employee.personalData as Record<string, unknown>, employee.gender), employee),
+      requirements,
+      documents,
+      { uanRequired: await this.uanRequired(employee, organizationId) },
+    );
+  }
+
+  // The score of every active employee who is not leaving, lowest first - so HR sees who to chase. Same visibility rule as the
+  // onboarding document list: an HR/Admin colleague's row is shown to an Admin (or to themselves) only.
+  async profileScores(actor: Actor, organizationId: string) {
+    const [requirements, employees, payrollSettings] = await Promise.all([
+      this.scopedPrisma.documentRequirement.findMany({
+        where: { organizationId, isMandatory: true, isActive: true },
+        select: { name: true, isMandatory: true, isActive: true },
+      }),
+      this.scopedPrisma.user.findMany({
+        where: { organizationId, isActive: true, exitDate: null },
+        select: {
+          id: true, name: true, employeeId: true, role: true, gender: true, personalData: true, employeeType: true, email: true,
+          contactNumber: true, profileImage: true, designation: true, departmentId: true, employeeCategory: true, workLocationId: true,
+        },
+      }),
+      this.scopedPrisma.payrollSettings.findFirst({ where: { organizationId }, select: { pfEnabled: true } }),
+    ]);
+    const visible = employees.filter(
+      (e) => actor.id === e.id || actor.role === Role.ADMIN || !(e.role === Role.ADMIN || e.role === Role.HR),
+    );
+    const documents = visible.length
+      ? await this.scopedPrisma.employeeDocument.findMany({
+          where: { organizationId, employeeId: { in: visible.map((e) => e.id) }, category: EmployeeDocumentCategory.DOCUMENT },
+          select: { employeeId: true, docType: true, status: true },
+        })
+      : [];
+    const byEmployee = new Map<string, { docType: string; status: string }[]>();
+    for (const d of documents) {
+      const list = byEmployee.get(d.employeeId) ?? [];
+      list.push(d);
+      byEmployee.set(d.employeeId, list);
+    }
+    const data = visible.map((e) => {
+      const score = profileScore(
+        withAccountFields(withRootGender(e.personalData as Record<string, unknown>, e.gender), e),
+        requirements,
+        byEmployee.get(e.id) ?? [],
+        { uanRequired: uanRequiredFor({ pfEnabled: payrollSettings?.pfEnabled ?? false, employeeType: e.employeeType }) },
+      );
+      return {
+        employeeId: e.id,
+        name: e.name,
+        code: e.employeeId,
+        percent: score.percent,
+        payrollReady: score.payrollReady,
+        missingCount: score.missing.length,
+        // Just the first few, enough for a list; the profile shows them all.
+        missingPreview: score.missing.slice(0, 3).map((m) => m.label),
+      };
+    });
+    data.sort((a, b) => a.percent - b.percent || a.name.localeCompare(b.name));
+    return { data };
+  }
+
+  // "Finish your profile" reminder, in the app and as a push, to the chosen employees or to everyone below 100%. Anyone reminded in the
+  // last 24 hours is skipped, so pressing the button twice does not nag.
+  async sendProfileReminders(employeeIds: string[] | undefined, actor: Actor, organizationId: string) {
+    const { data } = await this.profileScores(actor, organizationId);
+    const chosen = employeeIds ? new Set(employeeIds) : null;
+    const due = data.filter((r) => r.percent < 100 && (!chosen || chosen.has(r.employeeId)));
+    const title = 'Complete your profile';
+    const recent = due.length
+      ? await this.scopedPrisma.notification.findMany({
+          where: { organizationId, title, userId: { in: due.map((r) => r.employeeId) }, createdAt: { gte: new Date(Date.now() - 24 * 3600_000) } },
+          select: { userId: true },
+        })
+      : [];
+    const already = new Set(recent.map((n) => n.userId));
+    const toSend = due.filter((r) => !already.has(r.employeeId));
+    if (toSend.length > 0) {
+      await this.notificationsService.createMany(
+        toSend.map((r) => ({
+          organizationId,
+          userId: r.employeeId,
+          title,
+          message: `Your profile is ${r.percent}% complete. Still missing: ${r.missingPreview.join(', ')}${r.missingCount > r.missingPreview.length ? ` and ${r.missingCount - r.missingPreview.length} more` : ''}.`,
+          category: NotificationCategory.GENERAL,
+        })),
+      );
+    }
+    return { sent: toSend.length, skipped: due.length - toSend.length };
+  }
+
   // One row per active employee still onboarding (Onboarding / Probation / Extended Probation): how far their
   // mandatory documents are. Drives the Documents column on the Pending Onboarding list so HR sees who needs a
   // review or an upload without opening every profile. Each active mandatory requirement counts once, by the best
   // state any of the employee's documents of that type reached: APPROVED > PENDING (awaiting review) > REJECTED
   // (needs a new upload) > missing. Counts only - no file names or links. An HR/Admin employee's row is left out
   // for anyone but an Admin (or themselves), the same rule as their Documents tab (assertMayAccessDocumentsFor).
-  // The org chart: current employees as a reporting tree (name / designation / department only). Someone whose manager is
-  // missing, inactive or themselves sits at the top level; a reporting loop is cut so the tree always terminates.
-  async orgChart(organizationId: string): Promise<OrgChartNode[]> {
-    const people = await this.scopedPrisma.user.findMany({
-      where: {
-        organizationId,
-        isActive: true,
-        employmentStatus: {
-          notIn: ['RELEASED', 'TERMINATED', 'ABSCONDED', 'ON_HOLD'],
-        },
-      },
-      select: {
-        id: true,
-        employeeId: true,
-        name: true,
-        designation: true,
-        reportingManagerId: true,
-        department: { select: { name: true } },
-      },
-      orderBy: { name: 'asc' },
-    });
-    const nodes = new Map<string, OrgChartNode>(
-      people.map((e) => [
-        e.id,
-        {
-          id: e.id,
-          employeeId: e.employeeId,
-          name: e.name,
-          designation: e.designation,
-          department: e.department?.name ?? '',
-          children: [],
-          teamSize: 0,
-        },
-      ]),
-    );
-    const managerOf = new Map(people.map((x) => [x.id, x.reportingManagerId]));
-    const roots: OrgChartNode[] = [];
-    for (const e of people) {
-      const node = nodes.get(e.id)!;
-      // Walk up the managers: a loop back to this person means the link is cut.
-      let cursor = e.reportingManagerId
-        ? nodes.get(e.reportingManagerId)
-        : undefined;
-      let hops = 0;
-      let loops = false;
-      let up: string | null | undefined = e.reportingManagerId;
-      while (up && hops++ < 100) {
-        if (up === e.id) {
-          loops = true;
-          break;
-        }
-        up = managerOf.get(up);
-      }
-      if (cursor && !loops && cursor.id !== e.id) cursor.children.push(node);
-      else roots.push(node);
-    }
-    const size = (n: OrgChartNode): number => {
-      n.teamSize = n.children.reduce((sum, c) => sum + 1 + size(c), 0);
-      return n.teamSize;
-    };
-    roots.forEach(size);
-    return roots;
-  }
-
-  // Who is on probation and when it ends, overdue / due-soon first, for the Probation Tracker. A manager sees their own
-  // department and direct reports; HR and Admin see everyone (an HR/Admin row stays hidden from others, as elsewhere).
-  async probationTracker(actor: Actor, organizationId: string) {
-    const scope: Prisma.UserWhereInput[] =
-      actor.role === Role.MANAGER
-        ? [
-            { reportingManagerId: actor.id },
-            ...(actor.departmentId
-              ? [{ departmentId: actor.departmentId }]
-              : []),
-          ]
-        : [];
-    const people = await this.scopedPrisma.user.findMany({
-      where: {
-        organizationId,
-        isActive: true,
-        employmentStatus: { in: ['PROBATION', 'EXTENDED_PROBATION'] },
-        ...(scope.length ? { OR: scope } : {}),
-      },
-      select: {
-        id: true,
-        employeeId: true,
-        name: true,
-        role: true,
-        designation: true,
-        probationEndDate: true,
-        employmentStatus: true,
-        department: { select: { name: true } },
-        reportingManager: { select: { name: true } },
-      },
-    });
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const rows = people
-      .filter(
-        (e) =>
-          actor.id === e.id ||
-          actor.role === Role.ADMIN ||
-          !(e.role === Role.ADMIN || e.role === Role.HR),
-      )
-      .map((e) => {
-        const end = e.probationEndDate ? new Date(e.probationEndDate) : null;
-        const valid = end && !Number.isNaN(end.getTime());
-        const daysLeft = valid
-          ? Math.round((end.getTime() - today.getTime()) / 86400000)
-          : null;
-        const bucket =
-          daysLeft === null
-            ? 'NO_DATE'
-            : daysLeft < 0
-              ? 'OVERDUE'
-              : daysLeft <= 30
-                ? 'DUE_SOON'
-                : 'UPCOMING';
-        return {
-          id: e.id,
-          employeeId: e.employeeId,
-          name: e.name,
-          designation: e.designation,
-          department: e.department?.name ?? '',
-          probationEndDate: e.probationEndDate,
-          extended: e.employmentStatus === 'EXTENDED_PROBATION',
-          reportingManager: e.reportingManager?.name ?? null,
-          daysLeft,
-          bucket,
-        };
-      });
-    return rows.sort((a, b) => (a.daysLeft ?? 99999) - (b.daysLeft ?? 99999));
-  }
-
   async onboardingDocumentProgress(actor: Actor, organizationId: string) {
     const [requirements, employees] = await Promise.all([
       this.scopedPrisma.documentRequirement.findMany({
@@ -381,14 +361,30 @@ export class EmployeeProfileService {
   // completes the profile even without a subsequent Save Profile click; a
   // document getting rejected, or a required upload being deleted, can
   // un-complete it the same way).
+  // Whether this person's profile asks for a UAN: PF is on for the company and their employment type is covered.
+  private async uanRequired(
+    employee: { employeeType: string | null },
+    organizationId: string,
+  ): Promise<boolean> {
+    const settings = await this.scopedPrisma.payrollSettings.findFirst({
+      where: { organizationId },
+      select: { pfEnabled: true },
+    });
+    return uanRequiredFor({
+      pfEnabled: settings?.pfEnabled ?? false,
+      employeeType: employee.employeeType,
+    });
+  }
+
   private async refreshProfileCompletion(id: string, organizationId: string) {
     const employee = await this.findEmployeeOrThrow(id, organizationId);
     const mandatoryDocumentsUploaded =
       await this.computeMandatoryDocumentsUploaded(id, organizationId);
     const merged = mergePersonalData(
-      employee.personalData as Record<string, unknown>,
+      withRootGender(employee.personalData as Record<string, unknown>, employee.gender),
       {},
       mandatoryDocumentsUploaded,
+      { uanRequired: await this.uanRequired(employee, organizationId), hasContactNumber: !!employee.contactNumber, hasProfilePhoto: !!employee.profileImage },
     );
     const current = employee.personalData as Record<string, unknown>;
     if (merged.profileCompleted === current.profileCompleted) return;
@@ -396,6 +392,32 @@ export class EmployeeProfileService {
       where: { id, organizationId },
       data: { personalData: merged as Prisma.InputJsonValue },
     });
+  }
+
+  // The full PAN / Aadhaar / UAN / bank account number, which every other response masks: for the eye button on a
+  // profile. The person themself, or HR/Admin. Every reveal is written to the privacy audit trail (field names only).
+  async revealSensitive(id: string, actor: Actor, organizationId: string) {
+    this.assertSelfOrHr(actor, id);
+    const employee = await this.findEmployeeOrThrow(id, organizationId);
+    const pd = (employee.personalData ?? {}) as Record<string, unknown>;
+    const out = {} as Record<RevealableKey, string>;
+    for (const key of REVEALABLE_KEYS) {
+      const value = pd[key];
+      out[key] = typeof value === 'string' ? value : '';
+    }
+    auditSensitive(
+      this.privacyAudit,
+      { id: actor.id, role: actor.role, organizationId },
+      {
+        action: 'SENSITIVE_IDENTIFIERS_REVEALED',
+        category: 'PERSONAL_DATA',
+        targetUserId: id,
+        entity: 'User',
+        entityId: id,
+        meta: { fields: REVEALABLE_KEYS.filter((k) => out[k] !== '') },
+      },
+    );
+    return out;
   }
 
   async updatePersonalData(
@@ -416,6 +438,21 @@ export class EmployeeProfileService {
     // whose record can be touched, not which fields on it). Frontend
     // disables the input for everyone else; this is the actual boundary.
     const patch = { ...dto.personalData };
+    // The form was given these numbers masked; sent back unchanged, they keep the stored value.
+    for (const key of REVEALABLE_KEYS) {
+      if (isMaskedEcho(patch[key], before[key])) delete patch[key];
+    }
+    // PAN is required (TDS); once given it can be corrected but not removed.
+    if (
+      typeof patch.panNumber === 'string' &&
+      patch.panNumber.trim() === '' &&
+      typeof before.panNumber === 'string' &&
+      before.panNumber.trim() !== ''
+    ) {
+      throw new BadRequestException(
+        'PAN is required and cannot be removed. Enter the correct PAN instead.',
+      );
+    }
     if (!HR_ROLES.includes(actor.role)) {
       delete patch.personalEmail;
       // The company, not the employee, decides what an employee's CTC is.
@@ -461,7 +498,16 @@ export class EmployeeProfileService {
         }
       }
     }
-    const merged = mergePersonalData(before, patch, mandatoryDocumentsUploaded);
+    const merged = mergePersonalData(before, patch, mandatoryDocumentsUploaded, {
+      uanRequired: await this.uanRequired(employee, organizationId),
+      hasContactNumber: !!employee.contactNumber,
+      hasProfilePhoto: !!employee.profileImage,
+    });
+    // Only when this save touches a family or emergency number: an unrelated save (a cancelled cheque, an address)
+    // must not be refused over numbers stored earlier.
+    if (CONTACT_NUMBER_KEYS.some((k) => k in patch)) {
+      assertContactNumbersDistinct(merged, employee.contactNumber);
+    }
 
     await this.scopedPrisma.user.updateMany({
       where: { id, organizationId },
@@ -521,6 +567,30 @@ export class EmployeeProfileService {
         .catch(() => undefined);
     }
 
+    // Replacing the cancelled cheque: the superseded file is removed from storage (it used to be left behind forever),
+    // and a replacement made on someone else's record leaves a trace (who, when - never the file itself).
+    const chequeBefore = String(before.cancelledChequeUrl ?? '');
+    const chequeAfter = String(merged.cancelledChequeUrl ?? '');
+    if (chequeBefore !== chequeAfter) {
+      if (
+        chequeBefore &&
+        !/^https?:\/\//i.test(chequeBefore) &&
+        isKeyAllowedForOrg(organizationId, chequeBefore)
+      ) {
+        deleteStoredFile(chequeBefore);
+      }
+      if (actor.id !== id) {
+        await this.auditLogService.log({
+          actorId: actor.id,
+          action: 'CANCELLED_CHEQUE_REPLACED',
+          module: 'EMPLOYEE',
+          organizationId,
+          targetId: id,
+          details: { hadCheque: chequeBefore !== '', byRole: actor.role },
+        });
+      }
+    }
+
     // bankAccountNo/bankIFSC drive where Payroll actually sends this
     // employee's salary (see reports/payroll-reports.service.ts's bank
     // transfer file) — unlike every other write path in this codebase
@@ -573,10 +643,10 @@ export class EmployeeProfileService {
     // for someone in their own department — same "own team only" scope
     // MANAGER already gets everywhere else (attendance, leave review, etc).
     if (
-      actor.role === Role.MANAGER &&
+      actor.role !== Role.ADMIN &&
+      actor.role !== Role.EMPLOYEE &&
       actor.id !== id &&
-      (actor.departmentId === null ||
-        employee.departmentId !== actor.departmentId)
+      !(await inReviewerScope(this.scopedPrisma, actor, organizationId, employee.id))
     ) {
       throw new ForbiddenException(
         'You can only view profiles of employees in your own department.',
@@ -641,10 +711,15 @@ export class EmployeeProfileService {
         });
       }
     }
+    const safe = toSafe(employee) as Record<string, unknown>;
+    // The company's own extra profile fields are for HR/Admin and the employee themself, not a department manager.
+    if (actor.role === Role.MANAGER && actor.id !== id) delete safe.customFields;
     return {
-      ...toSafe(employee),
+      ...(safe as ReturnType<typeof toSafe>),
       documents: documents.map(withSignedFileUrl),
       assets,
+      // The profile form marks UAN required when PF applies to this person.
+      uanRequired: await this.uanRequired(employee, organizationId),
     };
   }
 
@@ -669,6 +744,7 @@ export class EmployeeProfileService {
     await this.findEmployeeOrThrow(id, organizationId);
     return this.scopedPrisma.employmentStatusHistory.findMany({
       where: { organizationId, employeeId: id },
+      include: { changedBy: { select: { id: true, name: true } } },
       orderBy: { changedAt: 'desc' },
     });
   }
@@ -791,6 +867,11 @@ export class EmployeeProfileService {
         'This employee is not on probation — there is nothing to decide.',
       );
     }
+    if (employee.exitDate) {
+      throw new BadRequestException(
+        'This employee is leaving (their last working day is set), so their probation cannot be decided. Cancel the exit first if they are staying.',
+      );
+    }
     if (dto.decision === 'extended' && !dto.newProbationEndDate) {
       throw new BadRequestException(
         'newProbationEndDate is required when extending probation.',
@@ -803,7 +884,7 @@ export class EmployeeProfileService {
       const newEnd = dto.newProbationEndDate as string;
       if (employee.probationEndDate && newEnd <= employee.probationEndDate) {
         throw new BadRequestException(
-          `The new probation end date must be after the current one (${employee.probationEndDate}).`,
+          `The new probation end date must be after the current one (${dmyText(employee.probationEndDate)}).`,
         );
       }
       if (newEnd <= joined) {
@@ -820,7 +901,9 @@ export class EmployeeProfileService {
       }
     }
     if (dto.decision === 'confirmed' && dto.effectiveDate) {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = todayInOrgTz(
+        (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata',
+      );
       if (dto.effectiveDate < joined || dto.effectiveDate > today) {
         throw new BadRequestException(
           'The confirmation date must be between the joining date and today.',
@@ -837,6 +920,18 @@ export class EmployeeProfileService {
           employmentStatus: newStatus,
           probationStatus:
             dto.decision === 'confirmed' ? 'CONFIRMED' : 'EXTENDED',
+          // Confirmed means Permanent: a probation-type employee is moved to the Permanent type, so leave types set for it apply.
+          ...(dto.decision === 'confirmed' && employee.employeeType === 'probation' ? { employeeType: 'permanent' } : {}),
+          // The date it counts from: the effective date the approver gave, else today in the organisation's time zone.
+          ...(dto.decision === 'confirmed'
+            ? {
+                confirmationDate:
+                  dto.effectiveDate ??
+                  todayInOrgTz(
+                    (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata',
+                  ),
+              }
+            : {}),
           probationEndDate:
             dto.decision === 'extended'
               ? dto.newProbationEndDate
@@ -850,7 +945,8 @@ export class EmployeeProfileService {
           previousStatus: employee.employmentStatus,
           newStatus,
           note:
-            (dto.effectiveDate ? `Effective ${dto.effectiveDate}. ` : '') +
+            (dto.effectiveDate ? `Effective ${dmyText(dto.effectiveDate)}. ` : '') +
+            (dto.decision === 'confirmed' && employee.employeeType === 'probation' ? 'Employee type changed from probation to permanent. ' : '') +
             (dto.note ?? ''),
           changedById: actor.id,
         },
@@ -871,7 +967,41 @@ export class EmployeeProfileService {
         : {}),
     });
 
-    return toSafe(await this.findEmployeeOrThrow(id, organizationId));
+    // A short notice of the outcome to the employee (the letter below carries the formal wording). Best-effort.
+    const decisionDate =
+      dto.decision === 'confirmed'
+        ? (dto.effectiveDate ?? new Date().toISOString().slice(0, 10))
+        : (dto.newProbationEndDate as string);
+    void sendOccasionEmail(this.emailService, this.emailTemplatesService, {
+      organizationId,
+      to: employee.email,
+      occasionKey: 'PROBATION_DECISION',
+      notificationPreferences: employee.notificationPreferences,
+      variables: {
+        employeeName: employee.name,
+        outcome: dto.decision === 'confirmed' ? 'Confirmed' : 'Extended',
+        dateLabel: dto.decision === 'confirmed' ? 'Confirmed on' : 'New probation end date',
+        decisionDate: dmyText(decisionDate),
+        note: dto.note ?? '',
+      },
+    });
+
+    // The outcome letter goes out with the decision (confirmation letter, or the extension notice) unless the caller asked to
+    // skip it, so HR does not have to generate it. Quiet on failure - the decision stands and HR can still send it from the
+    // Letters tab; `letterSent` tells the caller which happened (null when it was not asked for).
+    const letterSent =
+      dto.sendLetter === false
+        ? null
+        : await sendLetterQuietly(
+            this.lettersService,
+            this.logger,
+            id,
+            dto.decision === 'confirmed' ? 'confirmationLetter' : 'probationExtensionLetter',
+            actor as never,
+            organizationId,
+          );
+
+    return { ...toSafe(await this.findEmployeeOrThrow(id, organizationId)), letterSent };
   }
 
   // -- Documents --
@@ -925,6 +1055,9 @@ export class EmployeeProfileService {
   ) {
     this.assertSelfOrHr(actor, id);
     const employee = await this.findEmployeeOrThrow(id, organizationId);
+    // One tier up only: HR cannot upload into an HR or Admin colleague's file (an Admin's uploads are auto-approved, so
+    // that would let HR approve paperwork with nobody above to check it).
+    this.assertMayAccessDocumentsFor(actor, employee);
     // Approval tier follows the document owner's role, not who physically
     // clicked upload (an HR/Admin can upload on an employee's behalf):
     // Founder/Admin documents need no review at all — there's no one above
@@ -985,8 +1118,48 @@ export class EmployeeProfileService {
     // one, so skip the (harmless but pointless) recompute for those.
     if (category === EmployeeDocumentCategory.DOCUMENT) {
       await this.refreshProfileCompletion(id, organizationId);
+      // Tell the people who review it, so a document does not wait unseen (an Admin's own are approved on upload: nobody to tell).
+      if (!isFounderDoc) await this.notifyReviewersOfUpload(employee, doc.docType, organizationId);
     }
     return withSignedFileUrl(doc);
+  }
+
+  // Active Admins (and HR, unless the owner is an HR user, whose documents only an Admin reviews) get an in-app notice that a document is
+  // waiting. One notice per reviewer per person per hour, so several uploads in a row do not pile up. Best-effort: it never fails the upload.
+  private async notifyReviewersOfUpload(owner: { id: string; name: string; role: Role }, docType: string, organizationId: string) {
+    try {
+      const reviewers = await this.scopedPrisma.user.findMany({
+        where: {
+          organizationId,
+          isActive: true,
+          id: { not: owner.id },
+          role: { in: owner.role === Role.HR ? [Role.ADMIN] : [Role.ADMIN, Role.HR] },
+        },
+        select: { id: true },
+      });
+      if (reviewers.length === 0) return;
+      const title = `Documents to review: ${owner.name}`;
+      const recent = await this.scopedPrisma.notification.findMany({
+        where: { organizationId, title, userId: { in: reviewers.map((r) => r.id) }, createdAt: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+        select: { userId: true },
+      });
+      const already = new Set(recent.map((n) => n.userId));
+      await this.notificationsService.createMany(
+        reviewers
+          .filter((r) => !already.has(r.id))
+          .map((r) => ({
+            organizationId,
+            userId: r.id,
+            title,
+            message: `${owner.name} uploaded ${docType} and it is waiting for your review. Open their profile > Documents.`,
+            category: NotificationCategory.GENERAL,
+            // Opening the notice goes straight to that person's Documents tab.
+            link: `/employee-profile?id=${encodeURIComponent(owner.id)}&tab=documents`,
+          })),
+      );
+    } catch (err) {
+      this.logger.warn(`Reviewer notice for ${owner.id} failed: ${(err as Error).message}`);
+    }
   }
 
   // The "Visible to employee" tick on an uploaded letter. HR/Admin only (route-guarded); letters only, since a
@@ -1026,6 +1199,10 @@ export class EmployeeProfileService {
     organizationId: string,
   ) {
     this.assertSelfOrHr(actor, id);
+    this.assertMayAccessDocumentsFor(
+      actor,
+      await this.findEmployeeOrThrow(id, organizationId),
+    );
     const doc = await this.scopedPrisma.employeeDocument.findFirst({
       where: { id: docId, employeeId: id, organizationId },
     });
@@ -1038,9 +1215,13 @@ export class EmployeeProfileService {
     // having existed. HR/Admin can still delete an approved document
     // (e.g. to fix a mis-filed upload); only a plain self-service delete
     // of one's own already-approved document is blocked.
+    // HR does not remove their own approved document either (another HR user or an Admin does); an Admin, with nobody
+    // above them, may.
     if (
       doc.status === EmployeeDocumentStatus.APPROVED &&
-      !HR_ROLES.includes(actor.role)
+      (actor.id === id
+        ? actor.role !== Role.ADMIN
+        : !HR_ROLES.includes(actor.role))
     ) {
       throw new ForbiddenException(
         'This document has already been approved and can no longer be removed. Contact HR if it needs to be replaced.',
@@ -1183,6 +1364,8 @@ export class EmployeeProfileService {
       where: { organizationId, isActive: true },
       include: {
         employee: { select: { id: true, name: true, employeeId: true } },
+        // The Asset Inventory record this allocation is for (null for older, hand-typed allocations): its id links to the asset page.
+        asset: { select: { id: true, assetCode: true } },
       },
       orderBy: { createdAt: 'desc' },
       take: 500,
@@ -1310,6 +1493,27 @@ export class EmployeeProfileService {
       performedById: actor.id,
       description: `${asset.assetType}: ${asset.assetName}${asset.assetTag ? ` (${asset.assetTag})` : ''}`,
     });
+
+    // Tell the employee what was handed to them. Best-effort - the allocation is already saved.
+    const holder = await this.scopedPrisma.user.findFirst({
+      where: { id, organizationId },
+      select: { name: true, email: true, notificationPreferences: true },
+    });
+    if (holder) {
+      void sendOccasionEmail(this.emailService, this.emailTemplatesService, {
+        organizationId,
+        to: holder.email,
+        occasionKey: 'ASSET_ALLOCATED',
+        notificationPreferences: holder.notificationPreferences,
+        variables: {
+          employeeName: holder.name,
+          assetName: asset.assetName,
+          assetType: asset.assetType,
+          assetTag: asset.assetTag ?? '-',
+          allocatedDate: dmyText(asset.allocatedDate),
+        },
+      });
+    }
 
     return asset;
   }

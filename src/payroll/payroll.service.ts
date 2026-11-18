@@ -9,6 +9,9 @@
 // afterLock() marks approved-unprocessed leave encashments PROCESSED so a future run can't double-count
 // them. afterPay()'s notification/email failures are swallowed deliberately — the payment transition has
 // already committed by that point and must not be rolled back by a PDF/email failure.
+import { sandwichKindsOf, type LeaveRules } from '../leaves/leave-rules';
+import { employeeDob, missingPastMonths } from './fy-employment';
+import { holidayInEffect } from '../holidays/holiday-in-effect';
 import {
   EMPLOYEE_ORDER_BY,
   EMPLOYEE_RELATION_ORDER_BY,
@@ -54,6 +57,7 @@ import { PayrollSettingsService } from '../payroll-settings/payroll-settings.ser
 import { StatutoryConfigService } from '../statutory-config/statutory-config.service';
 import { getFinancialYear } from '../payroll-settings/financial-year';
 import {
+  OCCURRENCES_PER_YEAR,
   resolveCurrentRows,
   splitPeriodAtRevisions,
   type PeriodSegment,
@@ -64,7 +68,7 @@ import {
 } from '../employee-salary-components/city-hra';
 import { buildBankAdvice } from './bank-advice';
 import { redactHoldForEmployee } from './payroll-hold';
-import { buildReadiness } from './payroll-readiness';
+import { buildReadiness, readinessVerdict } from './payroll-readiness';
 import { withOpeningBalance } from './opening-balances';
 import { HoldPayrollDto } from './dto/hold-payroll.dto';
 import {
@@ -123,6 +127,8 @@ import {
   missingOffDayRows,
   offDayCalendar,
   splitLeavesAroundOffDays,
+  absenceSandwichedDates,
+  resolveAbsenceSandwich,
   type LeaveRowWithSandwich,
 } from './off-days';
 import {
@@ -155,6 +161,7 @@ import {
   BulkTransitionPayrollDto,
   type PayrollTransitionAction,
 } from './dto/bulk-transition-payroll.dto';
+import { BulkUnlockPayrollDto } from './dto/bulk-unlock-payroll.dto';
 import { UnlockPayrollDto } from './dto/unlock-payroll.dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
@@ -332,7 +339,7 @@ export interface CalculatedPayroll {
 // An employee sees a payslip only once it is final (LOCKED or PAID). An APPROVED run can still be sent back for
 // recalculation when attendance, leave or overtime changes, and the employee must not be shown - or download - amounts
 // that may then change.
-const EMPLOYEE_VISIBLE_STATUSES: PayrollRunStatus[] = [
+export const EMPLOYEE_VISIBLE_STATUSES: PayrollRunStatus[] = [
   PayrollRunStatus.LOCKED,
   PayrollRunStatus.PAID,
 ];
@@ -514,12 +521,20 @@ export class PayrollService {
         status: { not: PayrollRunStatus.DRAFT },
         OR: earlier,
       },
-      select: { deductions: true },
+      select: { deductions: true, employerContributions: true },
     });
-    return runs.some((r) =>
-      ((r.deductions ?? []) as { code: string; amount: number }[]).some(
-        (d) => d.code === 'ESI' && d.amount > 0,
-      ),
+    // Covered means ESI was charged on this employee's wages - their own share OR the employer's. An employee whose
+    // average daily wage is Rs 176 or less pays no share (so no ESI deduction line) but is covered all the same and
+    // the employer's share is still due; looking only at the deduction lost that coverage when wages later crossed
+    // the ceiling inside the same period.
+    const charged = (lines: unknown, code: string) =>
+      ((lines ?? []) as { code: string; amount: number }[]).some(
+        (l) => l.code === code && l.amount > 0,
+      );
+    return runs.some(
+      (r) =>
+        charged(r.deductions, 'ESI') ||
+        charged(r.employerContributions, 'ESI_EMPLOYER'),
     );
   }
 
@@ -540,6 +555,8 @@ export class PayrollService {
     // still read fresh, exactly as a normal calculate() would.
     options?: {
       lopDaysOverride?: number;
+      // The same for Leave Without Pay days (unpaid leave): a manual correction made when editing the run.
+      lwpDaysOverride?: number;
       // Final settlement: the pending-salary preview is allowed to be negative (the settlement nets it against
       // recoveries), tax is trued up on actual income (no projection of months that will not be worked), and
       // one-off taxable settlement payments (leave encashment, bonus) are taxed with it.
@@ -632,7 +649,7 @@ export class PayrollService {
       this.scopedPrisma.holiday.findMany({
         where: {
           organizationId,
-          isActive: true,
+          AND: [holidayInEffect],
           isOptional: false,
           date: { startsWith: monthPrefix },
           OR: employee.departmentId
@@ -648,7 +665,11 @@ export class PayrollService {
         : Promise.resolve(null),
       this.scopedPrisma.organization.findFirst({
         where: { id: organizationId },
-        select: { attendancePayrollPrefs: true, timezone: true },
+        select: {
+          attendancePayrollPrefs: true,
+          orgPayrollAttendancePrefs: true,
+          timezone: true,
+        },
       }),
     ]);
 
@@ -663,13 +684,19 @@ export class PayrollService {
     // not for days to come: those are neither unpaid nor paid weekly offs yet. A final settlement does its own period
     // handling.
     const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    // A regular run for someone leaving stops at their last working day (exitDate, kept in step with the offboarding
+    // case): paying the whole month and then calling the settlement's pending salary "already paid" overpaid them for
+    // the days after they had left.
+    const runThrough = lastCountedDay(today, month, year);
     const employed = employmentWindow(
       employee.joiningDate,
       month,
       year,
       options?.finalSettlement
         ? options.finalSettlement.lastWorkingDay
-        : lastCountedDay(today, month, year),
+        : employee.exitDate && employee.exitDate < runThrough
+          ? employee.exitDate
+          : runThrough,
     );
     const elapsedAttendanceRows = attendanceRows.filter(
       (r) => r.date <= employed.to,
@@ -694,10 +721,9 @@ export class PayrollService {
       endDate: l.endDate,
       isHalfDay: l.isHalfDay,
       leaveType: l.leaveType,
-      // A weekly off or holiday inside a leave is only part of the leave when its type applies the sandwich rule.
-      sandwichApplies: !!(
-        l.leaveType.rules as { sandwichLeaveApplies?: boolean } | null
-      )?.sandwichLeaveApplies,
+      // A weekly off or holiday inside a leave is only part of the leave when its type's sandwich rule takes that
+      // kind of day in.
+      sandwich: sandwichKindsOf(l.leaveType.rules as Partial<LeaveRules> | null),
     }));
     // Approving a leave stamps ON_LEAVE on its weekends/holidays too; without the sandwich rule those go back to being
     // paid off days.
@@ -708,7 +734,7 @@ export class PayrollService {
     );
     const leaves: LeaveRowWithSandwich[] = splitLeavesAroundOffDays(
       leaveInputs,
-      new Set([...calendar.weeklyOffDates, ...calendar.holidayDates]),
+      calendar,
     );
     // Nobody who was absent on every working day of the period is paid for the weekly offs and holidays in between.
     const absentThroughout = hasNoAttendedDay(
@@ -717,6 +743,15 @@ export class PayrollService {
       calendar,
       employed.from,
       employed.to,
+    );
+    // The company's sandwich rule for absences: off days between two unpaid working days are not paid either.
+    const sandwichedOffDays = absenceSandwichedDates(
+      keptRows,
+      leaves,
+      calendar,
+      employed.from,
+      employed.to,
+      resolveAbsenceSandwich(org?.orgPayrollAttendancePrefs),
     );
     const attendanceForPay = absentThroughout
       ? keptRows.filter(
@@ -727,7 +762,7 @@ export class PayrollService {
       : [
           ...keptRows,
           ...missingOffDayRows(calendar, new Set(keptRows.map((r) => r.date))),
-        ];
+        ].filter((r) => !sandwichedOffDays.has(r.date));
     const attendanceSummary = computeAttendanceSummary(
       attendanceForPay,
       leaves,
@@ -737,16 +772,25 @@ export class PayrollService {
       employed.daysBeforeJoining + employed.daysNotElapsed,
     );
     attendanceSummary.daysBeforeJoining = employed.daysBeforeJoining;
+    attendanceSummary.absenceSandwichDays = absentThroughout ? 0 : sandwichedOffDays.size;
     attendanceSummary.daysNotElapsed = employed.daysNotElapsed;
     // Payable days before a manual LOP correction replaces them (a month split by a mid-month revision is paid
     // segment by segment from raw attendance, so the correction has to be carried into the segments as well).
     const computedPayableDays = attendanceSummary.payableDays;
-    if (options?.lopDaysOverride !== undefined) {
+    if (
+      options?.lopDaysOverride !== undefined ||
+      options?.lwpDaysOverride !== undefined
+    ) {
       // Inverse of computeAttendanceSummary's own lopDays formula —
-      // payableDays moves opposite LOP so everything downstream (formula
+      // payableDays moves opposite LOP and LWP so everything downstream (formula
       // proration, LOP_DAYS/PAYABLE_DAYS in formula-context.ts, statutory
       // and tax calculations) sees a fully consistent corrected summary.
-      attendanceSummary.lopDays = round(options.lopDaysOverride, 'nearest', 2);
+      if (options?.lopDaysOverride !== undefined) {
+        attendanceSummary.lopDays = round(options.lopDaysOverride, 'nearest', 2);
+      }
+      if (options?.lwpDaysOverride !== undefined) {
+        attendanceSummary.unpaidLeaveDays = round(options.lwpDaysOverride, 'nearest', 2);
+      }
       attendanceSummary.payableDays = Math.max(
         0,
         round(
@@ -888,13 +932,34 @@ export class PayrollService {
             totalDaysInMonth,
             roundAmount,
             payableDaysOverride:
-              options?.lopDaysOverride !== undefined
+              options?.lopDaysOverride !== undefined ||
+              options?.lwpDaysOverride !== undefined
                 ? {
                     computed: computedPayableDays,
                     corrected: attendanceSummary.payableDays,
                   }
                 : undefined,
           });
+
+    // What the days not paid took out of the earnings, split between Leave Without Pay and Absent / unmarked days by their
+    // share of the unpaid days, so the payslip can show it under Deductions (the earnings above are already reduced).
+    // The same earnings are resolved once more at full attendance; a month split by a mid-month revision is left out.
+    if (segments.length === 1 && attendanceProration < 1) {
+      const fullEarnings = this.resolveGroup(
+        earningComponents,
+        overridesByCode,
+        baseContext,
+        1,
+        roundAmount,
+      ).results;
+      const sum = (lines: { amount: number }[]) => lines.reduce((t, l) => t + l.amount, 0);
+      const cut = Math.max(0, sum(fullEarnings) - sum(earningsResults));
+      const unpaid = attendanceSummary.unpaidLeaveDays + attendanceSummary.lopDays;
+      if (cut > 0 && unpaid > 0) {
+        attendanceSummary.lwpPayCut = roundAmount((cut * attendanceSummary.unpaidLeaveDays) / unpaid);
+        attendanceSummary.lopPayCut = roundAmount(cut - attendanceSummary.lwpPayCut);
+      }
+    }
 
     const financialYear = getFinancialYear(
       month,
@@ -1287,7 +1352,7 @@ export class PayrollService {
           return ytdProfessionalTax + ptThisMonth * months;
         })(),
         ageAtFYEnd: ageOnFYEnd(
-          (employee.personalData as Record<string, unknown> | null)?.dob,
+          employeeDob(employee.personalData),
           financialYear,
         ),
         // Remaining months are projected from the regular monthly structure,
@@ -1531,8 +1596,7 @@ export class PayrollService {
                   : {}),
                 epsEligible: !(
                   (ageOnDate(
-                    (employee.personalData as Record<string, unknown> | null)
-                      ?.dob,
+                    employeeDob(employee.personalData),
                     periodDate,
                   ) ?? 0) >= EPS_PENSION_AGE
                 ),
@@ -1763,6 +1827,7 @@ export class PayrollService {
       select: {
         id: true,
         personalData: true,
+        joiningDate: true,
         workLocation: { select: { cityClass: true } },
         department: {
           select: { workLocation: { select: { cityClass: true } } },
@@ -1789,36 +1854,76 @@ export class PayrollService {
         reason: 'No salary structure is set up yet.',
       };
     }
-    // Yearly variable pay (paid outside the monthly figures) counts once, as one more month's pay.
-    const variableAnnual = rows
-      .filter(
-        (r) =>
-          r.isEnabled !== false &&
-          r.valueType === 'MANUAL' &&
-          r.amountBasis === 'ANNUAL',
-      )
-      .reduce((sum, r) => sum + Number(r.fixedAmount ?? 0), 0);
+    // Yearly variable pay (paid outside the monthly figures) counts once, as one more month's pay - at the share of it the
+    // year's approved performance rating earns, the same rule payroll pays it by (applyVariablePay): rating 3 = 50%, and
+    // 100% while no rating is approved.
+    // A yearly-paid component counts however its amount was entered (a monthly-basis amount on a yearly component is
+    // also paid in its month, and monthlyFiguresForStructure leaves it out of the monthly gross).
+    const frequencyByCode = new Map(
+      components.map((c) => [c.code, c.payFrequency]),
+    );
+    const variableFull = rows
+      .filter((r) => r.isEnabled !== false)
+      .reduce((sum, r) => {
+        if (r.valueType === 'MANUAL' && r.amountBasis === 'ANNUAL') {
+          return sum + Number(r.fixedAmount ?? 0);
+        }
+        const frequency =
+          frequencyByCode.get(r.componentCode) ?? PayFrequency.MONTHLY;
+        return (r.valueType === 'FIXED' || r.valueType === 'MANUAL') &&
+          frequency !== PayFrequency.MONTHLY
+          ? sum + Number(r.fixedAmount ?? 0) * (OCCURRENCES_PER_YEAR[frequency] || 1)
+          : sum;
+      }, 0);
+    const approvedRating =
+      variableFull > 0
+        ? await this.scopedPrisma.performanceRating.findFirst({
+            where: {
+              organizationId,
+              employeeId,
+              financialYear,
+              status: 'APPROVED',
+            },
+            select: { rating: true, payoutPercentage: true },
+          })
+        : null;
+    const variablePayoutPercent = approvedRating
+      ? approvedRating.payoutPercentage
+      : 100;
+    const variableAnnual = (variableFull * variablePayoutPercent) / 100;
 
     const declaration =
       await this.scopedPrisma.employeeTaxDeclaration.findFirst({
         where: { organizationId, employeeId, financialYear },
       });
-    const { ytdGross, ytdTDS, ytdMonths, ytdProfessionalTax } =
-      await this.getYtdFigures(
-        employeeId,
-        financialYear,
-        todayMonth,
-        todayYear,
-        organizationId,
-      );
+    const ytdFigures = await this.getYtdFigures(
+      employeeId,
+      financialYear,
+      todayMonth,
+      todayYear,
+      organizationId,
+    );
+    const { ytdTDS, ytdProfessionalTax } = ytdFigures;
     const remaining = monthsRemainingInFY(
       todayMonth,
       todayYear,
       settingsRow.financialYearStartMonth,
     );
+    // This is a what-if for the whole year, so months the system holds no pay for (they pre-date it) are taken at today's
+    // monthly salary instead of being left out - otherwise someone who joined in April would see only the months from now on.
+    const missing = missingPastMonths({
+      joiningDate: employee.joiningDate,
+      fyStartYear: Number(financialYear.slice(0, 4)),
+      fyStartMonth: settingsRow.financialYearStartMonth,
+      currentMonth: todayMonth,
+      currentYear: todayYear,
+      monthsAlreadyCounted: ytdFigures.ytdMonths,
+    });
+    const ytdMonths = ytdFigures.ytdMonths + missing;
+    const ytdGross = ytdFigures.ytdGross + missing * figures.gross;
     const employmentMonths = Math.min(12, ytdMonths + remaining);
     const ageAtFYEnd = ageOnFYEnd(
-      (employee.personalData as Record<string, unknown> | null)?.dob,
+      employeeDob(employee.personalData),
       financialYear,
     );
 
@@ -1892,7 +1997,21 @@ export class PayrollService {
         grossIncome: Math.round(t.grossAnnualIncome),
         deductionsAndExemptions: Math.round(deductionsTotal),
         rebate: Math.round(t.rebate),
-        monthlyTDS: t.monthlyTDS,
+        // A past month with no payroll yet is still to be processed, so its deduction is still to come: it counts as one of
+        // the pay months left (the run for it will find the same remaining tax and months).
+        monthlyTDS: Math.round(
+          Math.max(0, t.totalAnnualTax - t.ytdTDS - t.previousEmployerTDS) /
+            (t.remainingMonths + missing),
+        ),
+        // How the monthly figure is reached: tax for the year, less tax already withheld (payroll, opening balance and the
+        // previous employer), spread over the pay months still to come. They always add back up to the annual tax.
+        tdsDeducted: Math.round(t.ytdTDS + t.previousEmployerTDS),
+        remainingTax: Math.max(
+          0,
+          Math.round(t.totalAnnualTax - t.ytdTDS - t.previousEmployerTDS),
+        ),
+        remainingMonths: t.remainingMonths + missing,
+        averageMonthlyTax: Math.round(t.totalAnnualTax / 12),
       };
     };
     const [oldRegime, newRegime] = await Promise.all([
@@ -1916,6 +2035,39 @@ export class PayrollService {
       available: true as const,
       financialYear,
       current: declaration?.regimeChosen ?? TaxRegime.NEW,
+      // The salary the comparison starts from: what the employee earns in a month, and over a full year.
+      salary: {
+        monthlyGross: Math.round(figures.gross),
+        yearlyFixed: Math.round(figures.gross * 12),
+        // The variable pay the year's rating earns (what payroll will pay), with the full amount and the share for reference.
+        yearlyVariable: Math.round(variableAnnual),
+        yearlyVariableFull: Math.round(variableFull),
+        variablePayoutPercent,
+        variableRating: approvedRating?.rating ?? null,
+        yearlyGross: Math.round(figures.gross * 12 + variableAnnual),
+      },
+      // How "Income for the year" in the regime table is made up: months already paid count at what was actually paid
+      // (a salary change, overtime, arrears or unpaid days make it differ from today's salary), the rest at today's salary.
+      // The parts add up to grossIncome.
+      incomeBreakdown: {
+        paidMonths: ytdFigures.ytdMonths,
+        paidGross: Math.round(ytdFigures.ytdGross),
+        notInPayrollMonths: missing,
+        notInPayrollGross: Math.round(missing * figures.gross),
+        monthsLeft: remaining,
+        monthsLeftGross: Math.round(remaining * figures.gross),
+        variable: Math.round(variableAnnual),
+        // Previous employer's income, declared other income and employer NPS: whatever else the engine counts.
+        other: Math.max(
+          0,
+          newRegime.grossIncome -
+            Math.round(ytdFigures.ytdGross) -
+            Math.round(missing * figures.gross) -
+            Math.round(remaining * figures.gross) -
+            Math.round(variableAnnual),
+        ),
+        total: newRegime.grossIncome,
+      },
       old: oldRegime,
       new: newRegime,
       better,
@@ -1923,6 +2075,20 @@ export class PayrollService {
       // The Old regime only has figures to work with once something has been declared.
       hasDeclaration: !!declaration,
       tdsSoFar: ytdTDS,
+      remainingMonths: remaining + missing,
+      // Shown instead of silently guessing when the figures rest on an assumption.
+      warnings: [
+        ...(missing > 0
+          ? [
+              `${missing} earlier month${missing > 1 ? 's' : ''} of this year ${missing > 1 ? 'have' : 'has'} no payroll yet: ${missing > 1 ? 'they are' : 'it is'} counted at today's salary and ${missing > 1 ? 'their' : 'its'} TDS is still to be deducted, so ${missing > 1 ? 'they count' : 'it counts'} among the pay months left. If that tax was already deducted elsewhere, ask HR to add an opening balance.`,
+            ]
+          : []),
+        ...(ytdTDS === 0 && ytdMonths > 0
+          ? [
+              'No tax has been deducted so far this year, so the remaining tax is spread over the months left.',
+            ]
+          : []),
+      ],
     };
   }
 
@@ -2030,6 +2196,7 @@ export class PayrollService {
         data: missing.map((employee) => ({
           organizationId,
           employeeId: employee.id,
+          brandId: employee.brandId ?? null,
           month: dto.month,
           year: dto.year,
           status: PayrollRunStatus.DRAFT,
@@ -2202,6 +2369,23 @@ export class PayrollService {
         }
         return;
       }
+      // Already gone: their last working day is before this month, so nothing is earned in it (the exit month was
+      // paid by its regular run or the final settlement). The account stays open until the offboarding is completed,
+      // which is why they are still in this list.
+      const monthFirstDay = `${dto.year}-${String(dto.month).padStart(2, '0')}-01`;
+      if (!dto.employeeId && employee.exitDate && employee.exitDate < monthFirstDay) {
+        skipped.push({
+          employeeId: employee.id,
+          name: employee.name,
+          code: employee.employeeId,
+          reason: `Last working day (${employee.exitDate}) was before this month - nothing to pay. Final dues go through the final settlement.`,
+        });
+        const gone = existingRunByEmployeeId.get(employee.id);
+        if (gone && (gone.status === PayrollRunStatus.DRAFT || gone.status === PayrollRunStatus.CALCULATED)) {
+          await this.scopedPrisma.payrollRun.deleteMany({ where: { id: gone.id, organizationId } });
+        }
+        return;
+      }
       // Not employed yet: no payroll for a month that ended before the joining date.
       const notOnPayroll = notOnPayrollReason(
         employee.joiningDate,
@@ -2303,6 +2487,8 @@ export class PayrollService {
             ),
           ));
         const data = {
+          // The company name on the payslip: refreshed with each recalculation, frozen once the run is locked.
+          brandId: employee.brandId ?? null,
           financialYear: calc.financialYear,
           status: PayrollRunStatus.CALCULATED,
           payslipNumber,
@@ -2663,6 +2849,7 @@ export class PayrollService {
           data: {
             organizationId,
             employeeId: employee.id,
+            brandId: employee.brandId ?? null,
             month: dto.month,
             year: dto.year,
             runSequence,
@@ -2826,12 +3013,14 @@ export class PayrollService {
       try {
         const lop = (run.attendanceSummary as { lopDays?: number } | null)
           ?.lopDays;
+        const lwp = (run.attendanceSummary as { unpaidLeaveDays?: number } | null)
+          ?.unpaidLeaveDays;
         const recalculated = await this.calculatePayroll(
           dto.employeeId,
           run.month,
           run.year,
           organizationId,
-          lop === undefined ? undefined : { lopDaysOverride: lop },
+          lop === undefined ? undefined : { lopDaysOverride: lop, lwpDaysOverride: lwp },
         );
         const paidGross = recurring(run.earnings as never);
         const revisedGross = recurring(recalculated.earnings as never);
@@ -3126,6 +3315,76 @@ export class PayrollService {
 
   // Discards a supplementary run that has not been approved yet (wrong amount, wrong employee). Approved, locked or
   // paid ones are unlocked/reopened through the normal steps first.
+  // Statuses a run can be deleted from: nothing has been finalised yet (loans, claims and leave encashments are only
+  // settled when a run is LOCKED, and an unlock reverses that), so removing it leaves no side effects behind and the
+  // month can simply be run again. LOCKED / PAID runs must be unlocked first.
+  private static readonly DELETABLE_RUN_STATUSES: PayrollRunStatus[] = [
+    PayrollRunStatus.DRAFT,
+    PayrollRunStatus.CALCULATED,
+    PayrollRunStatus.VERIFIED,
+    PayrollRunStatus.APPROVED,
+  ];
+
+  /** Deletes one payroll run (not a final settlement) that has not been locked, so it can be calculated again. */
+  async removeRun(id: string, actor: Actor, organizationId: string) {
+    const run = await this.scopedPrisma.payrollRun.findFirst({ where: { id, organizationId } });
+    if (!run) throw new NotFoundException('Payroll run not found.');
+    if (run.isFinalSettlement) {
+      throw new BadRequestException('A final settlement payroll is managed from Settlements and cannot be deleted here.');
+    }
+    assertNotOwnPayroll(actor, run.employeeId, 'delete');
+    if (!PayrollService.DELETABLE_RUN_STATUSES.includes(run.status)) {
+      throw new BadRequestException('Locked or paid payroll cannot be deleted. Unlock it first, then delete it.');
+    }
+    const { count } = await this.scopedPrisma.payrollRun.deleteMany({
+      where: { id, organizationId, status: { in: PayrollService.DELETABLE_RUN_STATUSES } },
+    });
+    if (count === 0) throw new BadRequestException('This payroll changed status while you were deleting it. Reload and try again.');
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'PAYROLL_RUN_DELETED',
+      module: 'PAYROLL',
+      organizationId,
+      targetId: id,
+      details: { employeeId: run.employeeId, month: run.month, year: run.year, runSequence: run.runSequence, status: run.status },
+    });
+    return { id };
+  }
+
+  /** Deletes every not-yet-locked regular run of a month in one go, ready for a fresh Run Payroll. Locked/paid ones stay. */
+  async removeMonthRuns(month: number, year: number, actor: Actor, organizationId: string) {
+    const runs = await this.scopedPrisma.payrollRun.findMany({
+      where: {
+        organizationId,
+        month,
+        year,
+        runSequence: 0,
+        isFinalSettlement: false,
+        status: { in: PayrollService.DELETABLE_RUN_STATUSES },
+        // An HR user cannot delete their own payslip; an Admin can.
+        ...(actor.role !== Role.ADMIN ? { employeeId: { not: actor.id } } : {}),
+      },
+      select: { id: true },
+    });
+    const ids = runs.map((r) => r.id);
+    if (ids.length === 0) return { deleted: 0, kept: 0 };
+    const { count } = await this.scopedPrisma.payrollRun.deleteMany({
+      where: { id: { in: ids }, organizationId, status: { in: PayrollService.DELETABLE_RUN_STATUSES } },
+    });
+    const kept = await this.scopedPrisma.payrollRun.count({
+      where: { organizationId, month, year, runSequence: 0, isFinalSettlement: false },
+    });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'PAYROLL_MONTH_DELETED',
+      module: 'PAYROLL',
+      organizationId,
+      targetId: `${year}-${String(month).padStart(2, '0')}`,
+      details: { month, year, deleted: count, keptLocked: kept },
+    });
+    return { deleted: count, kept };
+  }
+
   async removeSupplementary(id: string, actor: Actor, organizationId: string) {
     const run = await this.scopedPrisma.payrollRun.findFirst({
       where: { id, organizationId },
@@ -3441,13 +3700,23 @@ export class PayrollService {
     // apply on top of that recalculation, same as they would on top of the
     // run's existing figures below.
     const recalculated =
-      dto.lopDaysOverride !== undefined
+      dto.lopDaysOverride !== undefined || dto.lwpDaysOverride !== undefined
         ? await this.calculatePayroll(
             run.employeeId,
             run.month,
             run.year,
             organizationId,
-            { lopDaysOverride: dto.lopDaysOverride },
+            {
+              // Whichever one was not corrected keeps the run's own figure.
+              lopDaysOverride:
+                dto.lopDaysOverride ??
+                (run.attendanceSummary as { lopDays?: number } | null)?.lopDays,
+              lwpDaysOverride:
+                dto.lwpDaysOverride ??
+                (dto.lopDaysOverride !== undefined
+                  ? undefined
+                  : (run.attendanceSummary as { unpaidLeaveDays?: number } | null)?.unpaidLeaveDays),
+            },
           )
         : null;
     const baselineEarnings = (recalculated?.earnings ??
@@ -3630,6 +3899,9 @@ export class PayrollService {
         ),
         ...(dto.lopDaysOverride !== undefined
           ? { lopDaysOverride: dto.lopDaysOverride }
+          : {}),
+        ...(dto.lwpDaysOverride !== undefined
+          ? { lwpDaysOverride: dto.lwpDaysOverride }
           : {}),
       },
     });
@@ -4067,7 +4339,46 @@ export class PayrollService {
         },
       );
     }
-    return { month, year, employeeCount: employees.length, checks };
+    // Requests still waiting for a decision that would change this month's pay.
+    const monthPrefix = monthStart.slice(0, 7);
+    const [pendingLeave, pendingOvertime, pendingRegularization] = await Promise.all([
+      this.scopedPrisma.leave.findMany({
+        where: { organizationId, employeeId: { in: ids }, status: 'PENDING', startDate: { lte: monthEnd }, endDate: { gte: monthStart } },
+        select: { employeeId: true },
+      }),
+      this.scopedPrisma.overtimeRecord.findMany({
+        where: { organizationId, employeeId: { in: ids }, status: 'PENDING', date: { startsWith: monthPrefix } },
+        select: { employeeId: true },
+      }),
+      this.scopedPrisma.attendance.findMany({
+        where: { organizationId, employeeId: { in: ids }, date: { startsWith: monthPrefix }, regularization: { path: ['status'], equals: 'pending' } },
+        select: { employeeId: true },
+      }),
+    ]);
+    const pendingBy = new Map<string, { leave: number; overtime: number; regularization: number }>();
+    const bump = (id: string, k: 'leave' | 'overtime' | 'regularization') => {
+      const row = pendingBy.get(id) ?? { leave: 0, overtime: 0, regularization: 0 };
+      row[k] += 1;
+      pendingBy.set(id, row);
+    };
+    pendingLeave.forEach((r) => bump(r.employeeId, 'leave'));
+    pendingOvertime.forEach((r) => bump(r.employeeId, 'overtime'));
+    pendingRegularization.forEach((r) => bump(r.employeeId, 'regularization'));
+    if (pendingBy.size > 0) {
+      const byId = new Map(employees.map((e) => [e.id, e]));
+      checks.splice(checks.findIndex((c) => c.level === 'info') === -1 ? checks.length : checks.findIndex((c) => c.level === 'info'), 0, {
+        key: 'approvals',
+        level: 'warning',
+        title: 'Requests still waiting for approval (leave, overtime, regularization)',
+        people: [...pendingBy.entries()].map(([id, n]) => ({
+          id,
+          name: byId.get(id)?.name ?? 'Unknown',
+          code: byId.get(id)?.employeeId ?? '',
+          detail: [n.leave && `${n.leave} leave`, n.overtime && `${n.overtime} overtime`, n.regularization && `${n.regularization} regularization`].filter(Boolean).join(', '),
+        })),
+      });
+    }
+    return { month, year, employeeCount: employees.length, checks, verdict: readinessVerdict(checks) };
   }
 
   // What to send the bank for a month: every locked, un-held, regular payslip with its account details, plus the ones
@@ -4097,6 +4408,23 @@ export class PayrollService {
           },
         })
       : [];
+    // The account the salary is paid from, if the company has saved it (Organization Settings > Policies).
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: { policies: true },
+    });
+    const policies = (org?.policies ?? {}) as {
+      salaryDebitAccountNumber?: unknown;
+      salaryDebitAccountIfsc?: unknown;
+    };
+    const payerAccount =
+      typeof policies.salaryDebitAccountNumber === 'string'
+        ? policies.salaryDebitAccountNumber.trim()
+        : '';
+    const payerIfsc =
+      typeof policies.salaryDebitAccountIfsc === 'string'
+        ? policies.salaryDebitAccountIfsc.trim().toUpperCase()
+        : '';
     const advice = buildBankAdvice(
       runs,
       new Map(
@@ -4109,8 +4437,37 @@ export class PayrollService {
           },
         ]),
       ),
+      payerIfsc || null,
     );
-    return { month, year, ...advice };
+    return {
+      month,
+      year,
+      ...advice,
+      payer: payerAccount ? { accountNumber: payerAccount, ifsc: payerIfsc } : null,
+    };
+  }
+
+  // Several locked or paid runs, one reason. Each goes through unlock() itself, so every rule of the single unlock holds for
+  // each run; the ones that cannot be unlocked are listed with why, and never stop the rest.
+  async bulkUnlock(
+    dto: BulkUnlockPayrollDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    const unlocked: PayrollRun[] = [];
+    const skipped: TransitionSkip[] = [];
+    for (const id of [...new Set(dto.ids)]) {
+      try {
+        unlocked.push(
+          (await this.unlock(id, { reason: dto.reason }, actor, organizationId)) as PayrollRun,
+        );
+      } catch (err) {
+        const response = (err as { response?: { message?: string | string[] } }).response;
+        const message = Array.isArray(response?.message) ? response.message.join(' ') : response?.message;
+        skipped.push({ id, status: 'unlock_refused', reason: message ?? (err as Error).message });
+      }
+    }
+    return { updatedCount: unlocked.length, skipped, runs: unlocked };
   }
 
   async unlock(
@@ -5471,7 +5828,7 @@ export class PayrollService {
       this.scopedPrisma.holiday.findMany({
         where: {
           organizationId,
-          isActive: true,
+          AND: [holidayInEffect],
           isOptional: false,
           date: { startsWith: monthPrefix },
         },

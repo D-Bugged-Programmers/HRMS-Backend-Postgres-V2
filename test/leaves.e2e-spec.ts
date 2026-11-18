@@ -435,6 +435,11 @@ describe('Leaves (e2e)', () => {
       d.setUTCDate(d.getUTCDate() - (day || 7));
       return d.toISOString().slice(0, 10);
     })();
+    // Joined before the day the comp-off is earned for (nothing is accepted for a day before joining).
+    await prisma.user.update({
+      where: { id: employeeId },
+      data: { joiningDate: new Date('2020-01-01T00:00:00.000Z') },
+    });
     const compOff = await request(app.getHttpServer())
       .post('/comp-offs')
       .set('Authorization', `Bearer ${employeeToken}`)
@@ -804,21 +809,27 @@ describe('Leaves (e2e)', () => {
       });
       expect(withinWindowRow.status).toBe('PENDING');
 
-      const year = new Date().getFullYear();
-      const balance = await prisma.leaveBalance.findFirstOrThrow({
-        where: { employeeId, leaveTypeId: autoTypeId, year },
-      });
+      // Each day is charged to its own leave year: run late in the year, the Friday can fall in January, so read the
+      // balance of the year each leave is in (the leave year starts on the calendar year here).
+      const yearOf = (days: number) => Number(offsetDate(days).slice(0, 4));
+      const balanceFor = (days: number) =>
+        prisma.leaveBalance.findFirstOrThrow({
+          where: { employeeId, leaveTypeId: autoTypeId, year: yearOf(days) },
+        });
       // The auto-approved day moved from pending to availed; the
       // still-pending one's hold is untouched.
-      expect(balance.availed).toBe(1);
-      expect(balance.pending).toBe(1);
+      const approvedYear = await balanceFor(wed);
+      const pendingYear = await balanceFor(fri);
+      expect(approvedYear.availed).toBe(1);
+      expect(pendingYear.pending).toBe(1);
+      if (yearOf(wed) !== yearOf(fri)) {
+        expect(approvedYear.pending).toBe(0);
+        expect(pendingYear.availed).toBe(0);
+      }
 
       // Running it again must not re-approve or double-credit anything.
       await leavesService.autoApprovePendingLeaves();
-      const balanceAgain = await prisma.leaveBalance.findFirstOrThrow({
-        where: { employeeId, leaveTypeId: autoTypeId, year },
-      });
-      expect(balanceAgain.availed).toBe(1);
+      expect((await balanceFor(wed)).availed).toBe(1);
     });
   });
 
@@ -1324,10 +1335,58 @@ describe('Leaves (e2e)', () => {
       );
       // The pending request is not shown to anyone.
       expect(asHr.data).toHaveLength(2);
-      const asEmployee = (await get(employeeToken)).body as {
-        data: { employeeId: string }[];
-      };
-      expect(asEmployee.data.map((r) => r.employeeId)).toEqual([employeeId]);
+      // Plain employees do not see who else is away.
+      await request(app.getHttpServer())
+        .get('/leaves/whos-out')
+        .query({ from: '2031-09-01', to: '2031-09-05' })
+        .set('Authorization', `Bearer ${employeeToken}`)
+        .expect(403);
+    });
+  });
+
+  it('a leave already taken in full offers no cancellation request, and one sent is refused; a running one still can be', async () => {
+    const emp = await prisma.user.findUniqueOrThrow({
+      where: { id: employeeId },
+    });
+    const make = (startDate: string, endDate: string) =>
+      prisma.leave.create({
+        data: {
+          organizationId: emp.organizationId,
+          employeeId,
+          leaveTypeId: elLeaveTypeId,
+          startDate,
+          endDate,
+          totalDays: 1,
+          status: 'APPROVED',
+        },
+      });
+    const taken = await make(offsetDate(-40), offsetDate(-40));
+    const running = await make(offsetDate(-1), offsetDate(1));
+    const list = await request(app.getHttpServer())
+      .get('/leaves')
+      .set('Authorization', `Bearer ${employeeToken}`)
+      .expect(200);
+    const rows = (
+      list.body as { data: (LeaveBody & { canRequestCancel?: boolean })[] }
+    ).data;
+    expect(rows.find((l) => l.id === taken.id)?.canRequestCancel).toBe(false);
+    expect(rows.find((l) => l.id === running.id)?.canRequestCancel).toBe(true);
+
+    const refused = await request(app.getHttpServer())
+      .post(`/leaves/${taken.id}/cancel-request`)
+      .set('Authorization', `Bearer ${employeeToken}`)
+      .send({ reason: 'Came back early' })
+      .expect(400);
+    expect((refused.body as { message: string }).message).toMatch(
+      /already been taken/,
+    );
+    await request(app.getHttpServer())
+      .post(`/leaves/${running.id}/cancel-request`)
+      .set('Authorization', `Bearer ${employeeToken}`)
+      .send({ reason: 'Came back early' })
+      .expect(201);
+    await prisma.leave.deleteMany({
+      where: { id: { in: [taken.id, running.id] } },
     });
   });
 });

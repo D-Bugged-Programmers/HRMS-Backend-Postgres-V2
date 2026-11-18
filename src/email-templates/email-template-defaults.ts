@@ -101,6 +101,8 @@ export const EMAIL_PREHEADERS: Record<string, string> = {
     'Your salary structure was revised, effective {{effectiveFrom}}. The updated document is attached.',
   EXIT_COMPLETED:
     'Your exit process is complete and your HRMS access is closed.',
+  EXIT_DOCUMENTS_PACK:
+    'Your last payslips and exit documents are attached, as your work account is now closed.',
   APPROVALS_DIGEST: '{{totalPending}} request(s) are waiting for your review.',
   PROBATION_ENDING: "{{subjectName}}'s probation ends in {{daysLeft}} days.",
   PAYROLL_CUTOFF_REMINDER:
@@ -114,12 +116,26 @@ export const EMAIL_PREHEADERS: Record<string, string> = {
     '{{missingCount}} required document(s) are still missing from your record.',
   MISSING_DOCUMENTS_SUMMARY:
     '{{employeeCount}} employee(s) have not uploaded all mandatory documents.',
+  HOLIDAY_CALENDAR_REMINDER:
+    "{{nextYear}}'s holiday calendar has {{holidayCount}} holiday(s) so far.",
   TAX_DECLARATION_REMINDER:
     'Submit your FY {{financialYear}} tax declaration by {{deadline}}.',
   EXIT_HANDOVER_REMINDER:
     'Your last working day is {{lastWorkingDay}} ({{when}}).',
   EXIT_CLEARANCE_REMINDER:
     "{{subjectName}}'s last working day is {{lastWorkingDay}}; clearance is still open.",
+  RESIGNATION_SUBMITTED:
+    '{{subjectName}} has submitted a resignation; requested last working day {{requestedLwd}}.',
+  PROBATION_DECISION: 'Your probation review is complete: {{outcome}}.',
+  RESIGNATION_DECISION: '{{detail}}',
+  ASSET_ALLOCATED: '{{assetName}} has been allocated to you.',
+  ASSET_RETURN_REMINDER: 'Please return {{assetCount}} item(s) before {{lastWorkingDay}}.',
+  LOAN_EMI_DUE: 'Your EMI of {{emiAmount}} is deducted from your {{month}} salary.',
+  LOAN_CLOSED: 'Your {{loanType}} loan is fully repaid.',
+  FORM16_AVAILABLE: 'Your Form 16 for FY {{financialYear}} is ready to download.',
+  ONBOARDING_REMINDER: 'A few steps are left to finish your onboarding.',
+  RESIGNATION_PENDING_REMINDER:
+    "{{subjectName}}'s resignation has been waiting {{daysWaiting}} days for a decision.",
 };
 
 // Shared shape for the many "your <thing> was <decision>" emails.
@@ -757,6 +773,32 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
     category: 'Exit',
   },
   {
+    // Fires from OffboardingAutomationService the morning after the last working day - sent to the PERSONAL email only,
+    // with the last six payslips attached, because sign-in to the work account ends that day.
+    occasionKey: 'EXIT_DOCUMENTS_PACK',
+    name: 'Exit Documents Pack',
+    subject: 'Your payslips and exit documents',
+    bodyHtml: emailBody({
+      category: 'Exit',
+      title: 'Your payslips and exit documents',
+      blocks: [
+        greet,
+        paragraph(
+          'Your last working day was {{lastWorkingDay}}, so sign-in to your work account has now ended. Your last payslips are attached to this email for your records.',
+        ),
+        infoCard([
+          row('Last working day', '{{lastWorkingDay}}'),
+          row('Payslips attached', '{{payslipCount}}'),
+        ]),
+        paragraph(
+          'Your relieving and experience letters are emailed to this address as soon as HR issues them. Please contact HR if anything is missing.',
+        ),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Exit',
+  },
+  {
     // Fires from ApprovalsDigestService (weekday mornings) — one email per approver, and only
     // when at least one request is waiting. Each count is '' when zero, which hides its row.
     occasionKey: 'APPROVALS_DIGEST',
@@ -999,6 +1041,30 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
     category: 'Documents',
   },
   {
+    // Fires from HolidayCalendarReminderService on 1 Nov, 1 Dec and 20 Dec to every active HR/Admin while next year's calendar
+    // is empty or has fewer holidays than this year.
+    occasionKey: 'HOLIDAY_CALENDAR_REMINDER',
+    name: 'Holiday Calendar Reminder (HR)',
+    subject: "Add {{nextYear}}'s holidays: {{holidayCount}} so far",
+    bodyHtml: emailBody({
+      category: 'Attendance',
+      title: 'Next year\'s holiday calendar',
+      blocks: [
+        hello,
+        paragraph(
+          "The {{nextYear}} holiday calendar has {{holidayCount}} holiday(s) so far. Until a holiday is added, attendance, leave and payroll treat that day as a working day, so please add {{nextYear}}'s holidays before the year starts.",
+        ),
+        infoCard([
+          row('Year', '{{nextYear}}'),
+          row('Holidays added', '{{holidayCount}}'),
+        ]),
+        button('{{reviewUrl}}', 'Open holiday calendar'),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Attendance',
+  },
+  {
     // Fires from TaxDeclarationReminderService on the day the declaration window opens and weekly until the
     // deadline, to employees who have not submitted a declaration for the current financial year.
     occasionKey: 'TAX_DECLARATION_REMINDER',
@@ -1063,4 +1129,185 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
     ccAllActive: false,
     category: 'Exit',
   },
+  {
+    // Fires from ResignationsService when a resignation is submitted (or recorded for someone): to the employee's reporting
+    // manager(s) and the HR / Admin who decide it.
+    occasionKey: 'RESIGNATION_SUBMITTED',
+    name: 'Resignation Submitted',
+    subject: 'Resignation submitted: {{subjectName}}',
+    bodyHtml: emailBody({
+      category: 'Exit',
+      title: 'A resignation needs a decision',
+      blocks: [
+        hello,
+        paragraph('{{subjectName}} has submitted a resignation. It is waiting for HR to approve.'),
+        infoCard([
+          row('Requested last working day', '{{requestedLwd}}'),
+          row('Reason', '{{reason}}'),
+        ]),
+        button('{{reviewUrl}}', 'Review the resignation'),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Exit',
+  },
+  {
+    // Fires from ResignationReminderService every 2 days while a resignation is still waiting for a decision.
+    occasionKey: 'RESIGNATION_PENDING_REMINDER',
+    name: 'Resignation Waiting for a Decision',
+    subject: 'Reminder: {{subjectName}}\'s resignation is still waiting',
+    bodyHtml: emailBody({
+      category: 'Exit',
+      title: 'Resignation still waiting for a decision',
+      blocks: [
+        hello,
+        paragraph("{{subjectName}}'s resignation has been waiting {{daysWaiting}} days for a decision."),
+        infoCard([row('Requested last working day', '{{requestedLwd}}')]),
+        button('{{reviewUrl}}', 'Review the resignation'),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Exit',
+  },
+  {
+    occasionKey: 'PROBATION_DECISION',
+    name: 'Probation Decision',
+    subject: 'Your probation has been {{outcome}}',
+    bodyHtml: decisionBody({
+      category: 'General',
+      title: 'Probation {{outcome}}',
+      message: 'Your probation review is complete and your probation has been {{outcome}}.',
+      rows: [
+        row('Outcome', status('{{outcome}}')),
+        row('{{dateLabel}}', '{{decisionDate}}'),
+      ],
+      commentsLabel: 'Comments',
+      commentsPlaceholder: '{{note}}',
+    }),
+    ccAllActive: false,
+    category: 'General',
+  },
+  {
+    occasionKey: 'RESIGNATION_DECISION',
+    name: 'Resignation Decision',
+    subject: 'Your resignation: {{decision}}',
+    bodyHtml: decisionBody({
+      category: 'Exit',
+      title: 'Resignation {{decision}}',
+      message: '{{detail}}',
+      rows: [
+        row('Decision', status('{{decision}}')),
+        row('Last working day', '{{lastWorkingDay}}'),
+      ],
+      commentsLabel: 'Comments',
+      commentsPlaceholder: '{{note}}',
+    }),
+    ccAllActive: false,
+    category: 'Exit',
+  },
+  {
+    occasionKey: 'ASSET_ALLOCATED',
+    name: 'Asset Allocated',
+    subject: 'Asset allocated: {{assetName}}',
+    bodyHtml: decisionBody({
+      category: 'General',
+      title: 'Asset allocated',
+      message: 'The following company asset has been allocated to you. Please look after it and report any issue to HR.',
+      rows: [
+        row('Asset', '{{assetName}}'),
+        row('Type', '{{assetType}}'),
+        row('Tag', '{{assetTag}}'),
+        row('Allocated on', '{{allocatedDate}}'),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'General',
+  },
+  {
+    occasionKey: 'ASSET_RETURN_REMINDER',
+    name: 'Asset Return Reminder',
+    subject: 'Please return your company assets',
+    bodyHtml: decisionBody({
+      category: 'Exit',
+      title: 'Please return your assets',
+      message: 'Your last working day is {{lastWorkingDay}}. Please return the items below to HR before then.',
+      rows: [
+        row('Items', '{{assetList}}'),
+        row('Number of items', '{{assetCount}}'),
+        row('Last working day', '{{lastWorkingDay}}'),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Exit',
+  },
+  {
+    occasionKey: 'LOAN_EMI_DUE',
+    name: 'Loan EMI Due',
+    subject: 'Loan EMI for {{month}}',
+    bodyHtml: decisionBody({
+      category: 'Payroll & Finance',
+      title: 'Loan EMI due',
+      message: 'Your {{loanType}} EMI will be deducted from your {{month}} salary. No action is needed.',
+      rows: [
+        row('Loan type', '{{loanType}}'),
+        row('EMI amount', '{{emiAmount}}'),
+        row('Outstanding balance', '{{outstanding}}'),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Payroll & Finance',
+  },
+  {
+    occasionKey: 'LOAN_CLOSED',
+    name: 'Loan Closed',
+    subject: 'Your {{loanType}} loan is closed',
+    bodyHtml: decisionBody({
+      category: 'Payroll & Finance',
+      title: 'Loan closed',
+      message: 'Your {{loanType}} loan has been fully repaid and is now closed. No further EMI will be deducted.',
+      rows: [
+        row('Loan type', '{{loanType}}'),
+        row('Amount', '{{amount}}'),
+        row('Closed on', '{{closedOn}}'),
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Payroll & Finance',
+  },
+  {
+    occasionKey: 'FORM16_AVAILABLE',
+    name: 'Form 16 Available',
+    subject: 'Your Form 16 for FY {{financialYear}} is ready',
+    bodyHtml: emailBody({
+      category: 'Payroll & Finance',
+      title: 'Your Form 16 is ready',
+      blocks: [
+        greet,
+        paragraph('Your Form 16 (tax certificate) for FY {{financialYear}} is ready to download from the HRMS.'),
+        button('{{downloadUrl}}', 'Open Tax Declaration'),
+        regards,
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Payroll & Finance',
+  },
+  {
+    occasionKey: 'ONBOARDING_REMINDER',
+    name: 'Complete Your Onboarding',
+    subject: 'Please complete your onboarding',
+    bodyHtml: emailBody({
+      category: 'Account & Access',
+      title: 'Complete your onboarding',
+      blocks: [
+        greet,
+        paragraph('Your profile is not complete yet. Please finish the steps below so HR can complete your onboarding.'),
+        infoCard([row('Still to do', '{{pendingItems}}')]),
+        button('{{profileUrl}}', 'Open my profile'),
+        regards,
+      ],
+    }),
+    ccAllActive: false,
+    category: 'Account & Access',
+  },
+
 ];

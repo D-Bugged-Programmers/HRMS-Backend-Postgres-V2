@@ -7,6 +7,11 @@
 // workArrangement/regularization fields owned by other write paths — see the inline comments throughout
 // for several other ported-behavior and concurrency-safety notes (e.g. sequential writes in
 // executeImportBatch even though Attendance has a unique constraint on (organizationId, employeeId, date)).
+import { keepModuleEnabled } from '../module-access/module-gate';
+import { LEAVE_TYPE_CODES } from '../common/reserved-codes';
+import { BulkManualPunchDto } from './dto/bulk-manual-punch.dto';
+import { MAX_BULK_MANUAL_PUNCHES, runInBatches } from './manual-punch-batch';
+import { holidayInEffect } from '../holidays/holiday-in-effect';
 import * as crypto from 'crypto';
 import {
   EMPLOYEE_RELATION_ORDER_BY,
@@ -47,6 +52,7 @@ import {
   User,
   WfhApprovalStatus,
   WorkArrangement,
+  Gender,
 } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
@@ -59,11 +65,24 @@ import {
 } from '../work-locations/geo-fence';
 import { paginate, skip } from '../common/pagination';
 import { mapWithConcurrency } from '../common/concurrency';
+import { ORG_SUSPENDED_MESSAGE } from '../common/org-status';
+import { isEmployedOn } from '../common/managers';
+import { alwaysPresentApplies, shiftMinutes } from './always-present';
+import { importSkipReason, isHalfLeaveStamp } from './import-protection';
+import { extraMinutesBeyondShift } from './day-detail';
 import { zonedWallTimeToUtc } from '../common/zoned-time';
 import {
+  assertManagerDeptScope,
   assertManagerScopeOrDelegate,
-  deptScopedEmployeeIds,
+  inReviewerScope,
+  reviewerScope,
 } from '../common/dept-scope';
+import { getLeaveYearConfig } from '../leave-balances/leave-year-config';
+import { ImportWfhDto } from './dto/import-wfh.dto';
+import { assertPayrollMonthsUnlocked } from '../payroll/payroll-period-guard';
+import { isValidCalendarDateString } from '../common/is-valid-calendar-date.validator';
+import { wfhDaysPerMonthOf } from '../organizations/org-wfh-policy';
+import { currentLeaveYear, leaveYearBounds } from '../leave-balances/leave-year';
 import { ApprovalDelegationService } from '../approval-delegation/approval-delegation.service';
 import {
   enumerateDateStrings,
@@ -102,12 +121,19 @@ import {
   monthsBetween,
 } from '../payroll/payroll-period-guard';
 import { AuditLogService } from '../audit-log/audit-log.service';
-import { getOvertimeRates } from '../overtime/overtime.service';
+import { getEffectiveOvertime } from '../overtime/overtime.service';
+import { shiftDepartmentFor, type ShiftRuleLite } from './shift-rules';
 import { isOvertimePayEnabled } from '../overtime/overtime-pay';
+import {
+  inNightWindow,
+  roundOvertimeHours,
+  thresholdsFor,
+} from '../overtime/overtime-policy';
 import {
   formatDateDisplay,
   formatDateTimeDisplay,
   resolveOrgDateTimeFormat,
+  dmyText,
 } from '../payroll/format-date';
 import {
   todayInOrgTz,
@@ -123,6 +149,26 @@ type Actor = Omit<User, 'password'>;
 // recalculateAttendanceForDay/the Leave-integration hooks run inside
 // whichever one the caller is already using.
 type Db = ExtendedPrismaClient | Prisma.TransactionClient;
+
+export interface ImportWfhRowResult {
+  row: number;
+  employeeId: string;
+  employeeName?: string;
+  fromDate: string;
+  toDate: string;
+  status: 'OK' | 'IMPORTED' | 'ERROR';
+  days?: number;
+  message?: string;
+}
+
+export interface ImportWfhResult {
+  dryRun: boolean;
+  total: number;
+  ok: number;
+  imported: number;
+  failed: number;
+  rows: ImportWfhRowResult[];
+}
 
 // Shared between list()'s two row sources (a real DB findMany, and
 // listWithSyntheticAbsences()'s synthetic rows) so both produce exactly the
@@ -349,7 +395,7 @@ async function assertPayrollPeriodUnlocked(
   });
   if (lockedRun) {
     throw new BadRequestException(
-      `This attendance date (${dateStr}) falls within the ${lockedRun.month}/${lockedRun.year} payroll period, which is already ${lockedRun.status.toLowerCase()}. Ask an Admin to unlock that payroll run before changing this attendance.`,
+      `This attendance date (${dmyText(dateStr)}) falls within the ${lockedRun.month}/${lockedRun.year} payroll period, which is already ${lockedRun.status.toLowerCase()}. Ask an Admin to unlock that payroll run before changing this attendance.`,
     );
   }
   // Any calculated run was built on the old attendance: mark it outdated (and send a signed-off one back to
@@ -452,6 +498,8 @@ type ImportExecutionResult = {
   // Pending overtime requests this import created (weekend / holiday work, or time past the shift end).
   overtimeRequests?: number;
   rowErrors: { row: number; error: string }[];
+  // Rows left out because the day is already marked, and why.
+  skippedRows?: { row: number; employeeId: string; date: string; reason: string }[];
 };
 
 // Selfies are stored as the storage relativeKey (POST /files/upload/selfies) — not servable as-is, so every read
@@ -462,6 +510,30 @@ function signSelfieKey(
 ): string | null {
   if (!key || /^(https?:\/\/|\/files\/)/i.test(key)) return key;
   return `/files/${signFileToken(organizationId, key)}`;
+}
+
+// A day with a Work From Home request in one of these states is taken: one request per day, so it is not asked for
+// again. Shared by the single-day request, the concurrent-write guard and the multi-day request.
+const WFH_TAKEN_STATUSES: WfhApprovalStatus[] = [
+  WfhApprovalStatus.PENDING,
+  WfhApprovalStatus.APPROVED,
+  WfhApprovalStatus.REJECTED,
+];
+
+function wfhAlreadyRequestedMessage(
+  dateStr: string,
+  status?: WfhApprovalStatus | null,
+): string {
+  const day = dmyText(dateStr);
+  const what =
+    status === WfhApprovalStatus.APPROVED
+      ? `Work From Home for ${day} is already approved.`
+      : status === WfhApprovalStatus.REJECTED
+        ? `Work From Home for ${day} was not approved.`
+        : status === WfhApprovalStatus.PENDING
+          ? `Work From Home for ${day} is already waiting for approval.`
+          : `Work From Home for ${day} is already requested.`;
+  return `${what} Only one request is allowed per day.`;
 }
 
 @Injectable()
@@ -495,7 +567,9 @@ export class AttendanceService {
     // for a day that is long past.
     // deferAbsenceNotice: the day is still written (so payroll and dashboards see it), but the "Marked Absent" notice and
     // e-mail are left for the morning job (sendMorningAbsenceNotices), so they land when people read them.
-    opts?: { quiet?: boolean; deferAbsenceNotice?: boolean },
+    // rejudgeStored: an imported or regularized day has no punches behind it, so it is normally left as it is. When the
+    // calendar or the shift changed, its status, hours and late / early flags are judged again from the times it stores.
+    opts?: { quiet?: boolean; deferAbsenceNotice?: boolean; rejudgeStored?: boolean },
   ) {
     const employee = await db.user.findFirst({
       where: { id: employeeId, organizationId },
@@ -526,7 +600,7 @@ export class AttendanceService {
         : employee.department;
 
     const shiftConfig = resolveShiftConfig(
-      departmentForShiftConfig,
+      shiftDepartmentFor(departmentForShiftConfig, employee, await this.shiftRulesOf(db, organizationId)),
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? DEFAULT_ORG_TIMEZONE,
     );
@@ -540,16 +614,47 @@ export class AttendanceService {
       orderBy: { punchTime: 'asc' },
     });
 
-    // A day set by a regularization or an Excel import has no punches behind it. Deriving it from punches again would
-    // turn it into an absence and erase the approved or imported times, so such a row is left exactly as it is until
-    // someone records a real punch for the day.
+    // A day set by a regularization or an Excel import is not derived from punches. Deriving it from punches again would
+    // erase the approved or imported times, so such a row is left exactly as it is until someone records a real punch
+    // for the day *after* it was set. A regularized day usually still has the punch that started it (a punch-in with no
+    // punch-out): that punch predates the approval, so it must not undo it. Without this, the 01:00 / 08:00 sweeps
+    // rebuilt an approved day from that lone punch-in and turned it back into Incomplete with no Out time.
+    const approvedReg = existing?.regularization as unknown as RegularizationState | null | undefined;
+    const decidedAt =
+      existing?.source === AttendanceSource.REGULARIZED && approvedReg?.status === 'approved' && approvedReg.reviewedAt
+        ? new Date(approvedReg.reviewedAt)
+        : null;
+    const noPunchSinceSet =
+      punches.length === 0 ||
+      (!!decidedAt && !Number.isNaN(decidedAt.getTime()) && punches.every((p) => p.createdAt <= decidedAt));
     if (
       existing &&
-      punches.length === 0 &&
+      noPunchSinceSet &&
       (existing.source === AttendanceSource.REGULARIZED ||
         existing.source === AttendanceSource.EXCEL_IMPORT)
     ) {
-      return existing;
+      if (!opts?.rejudgeStored || (!existing.inTime && !existing.outTime)) {
+        return existing;
+      }
+      const outcome = await this.deriveDayOutcome(db, {
+        organizationId,
+        employeeId,
+        employeeDepartmentId: employee.departmentId,
+        dateStr,
+        shiftConfig,
+        inTime: existing.inTime,
+        outTime: existing.outTime,
+      });
+      await db.attendance.updateMany({
+        where: { id: existing.id, organizationId },
+        data: {
+          status: outcome.status,
+          workDurationMinutes: outcome.workDurationMinutes,
+          isLate: outcome.isLate,
+          isEarlyOut: outcome.isEarlyOut,
+        },
+      });
+      return { ...existing, ...outcome };
     }
 
     let inTime: Date | null = null;
@@ -585,16 +690,31 @@ export class AttendanceService {
       }
     }
 
-    const { status, workDurationMinutes, isLate, isEarlyOut } =
-      await this.deriveDayOutcome(db, {
-        organizationId,
-        employeeId,
-        employeeDepartmentId: employee.departmentId,
-        dateStr,
-        shiftConfig,
-        inTime,
-        outTime,
-      });
+    const outcome = await this.deriveDayOutcome(db, {
+      organizationId,
+      employeeId,
+      employeeDepartmentId: employee.departmentId,
+      dateStr,
+      shiftConfig,
+      inTime,
+      outTime,
+    });
+    let { status, workDurationMinutes, isLate, isEarlyOut } = outcome;
+    // Marked always-present: a working day with no approved leave is Present, never Absent, and - with no punches - shows the
+    // person's own shift timings. A day of approved leave stays leave (balance and pay follow the normal leave rules). A real punch keeps its times. Weekly offs and holidays stay as the schedule says.
+    let autoPresent = false;
+    if (alwaysPresentApplies(employee, dateStr, status)) {
+      autoPresent = true;
+      status = AttendanceStatus.PRESENT;
+      isLate = false;
+      isEarlyOut = false;
+      if (punches.length === 0) {
+        const tz = shiftConfig.timezone ?? DEFAULT_ORG_TIMEZONE;
+        inTime = buildShiftDateTime(dateStr, shiftConfig.shiftStartTime, tz);
+        outTime = buildShiftDateTime(shiftConfig.crossesMidnight ? addDaysStr(dateStr, 1) : dateStr, shiftConfig.shiftEndTime, tz);
+        workDurationMinutes = shiftMinutes(shiftConfig.shiftStartTime, shiftConfig.shiftEndTime, shiftConfig.crossesMidnight, shiftConfig.breakMinutes);
+      }
+    }
 
     const fields = {
       status,
@@ -613,7 +733,7 @@ export class AttendanceService {
       isEarlyOut,
       // Reflects "how was this row last derived" — always FACE_API on
       // recalculation regardless of which punch source triggered it.
-      source: AttendanceSource.FACE_API,
+      source: autoPresent && punches.length === 0 ? AttendanceSource.SYSTEM : AttendanceSource.FACE_API,
     };
 
     if (existing) {
@@ -709,7 +829,7 @@ export class AttendanceService {
         : await db.holiday.findFirst({
             where: {
               organizationId,
-              isActive: true,
+              AND: [holidayInEffect],
               date: dateStr,
               OR: params.employeeDepartmentId
                 ? [
@@ -814,22 +934,25 @@ export class AttendanceService {
         : AttendanceStatus.ABSENT;
     }
 
-    // Overrides, in priority order — a holiday wins even over an
-    // approved-leave-derived status; weekly-off only overrides a bare
-    // ABSENT or INCOMPLETE (never on_leave/half_day), matching the old
-    // system exactly (INCOMPLETE is treated like ABSENT here — a stray
-    // single punch on a day off is still a day off, not something to
-    // regularize).
+    // Overrides, in priority order: a holiday wins even over an approved-leave-derived status. A weekly off with nothing
+    // worked (no punch, a stray single punch, or too little time) stays a Weekly Off; a day actually worked on it shows
+    // Present or Half Day, keeps its times and raises Weekend overtime (suggestOvertimeFromPunchOut), and approved leave
+    // stays leave. Either way there is no shift that day, so it is never late or early.
+    const weeklyOff = isWeeklyOff(dateStr, shiftConfig.weeklyOffs);
     if (holiday) {
       status = AttendanceStatus.HOLIDAY;
-    } else if (
-      isWeeklyOff(dateStr, shiftConfig.weeklyOffs) &&
-      (status === AttendanceStatus.ABSENT ||
+      isLate = false;
+      isEarlyOut = false;
+    } else if (weeklyOff) {
+      if (
+        status === AttendanceStatus.ABSENT ||
         status === AttendanceStatus.INCOMPLETE ||
-        // A stray single punch on a day off, shift still running: still a day off, as before.
-        (inProgress && status === AttendanceStatus.PRESENT))
-    ) {
-      status = AttendanceStatus.WEEKLY_OFF;
+        inProgress
+      ) {
+        status = AttendanceStatus.WEEKLY_OFF;
+      }
+      isLate = false;
+      isEarlyOut = false;
     }
 
     return { status, workDurationMinutes, isLate, isEarlyOut };
@@ -878,7 +1001,7 @@ export class AttendanceService {
           isActive: true,
           departmentId: { in: departmentIds },
         },
-        select: { id: true, departmentId: true, joiningDate: true },
+        select: { id: true, gender: true, departmentId: true, joiningDate: true, exitDate: true },
       });
       if (employees.length === 0) return { updated: 0 };
       const lockedRuns = await this.scopedPrisma.payrollRun.findMany({
@@ -894,6 +1017,7 @@ export class AttendanceService {
       const locked = new Set(lockedRuns.map((r) => r.employeeId));
       const eligible = employees.filter((e) => !locked.has(e.id));
       const employeeById = new Map(eligible.map((e) => [e.id, e]));
+      const shiftRules = await this.shiftRulesOf(this.scopedPrisma, organizationId);
       const departments = await this.scopedPrisma.department.findMany({
         where: { organizationId, id: { in: departmentIds } },
       });
@@ -907,6 +1031,7 @@ export class AttendanceService {
         },
       });
       let updated = 0;
+      const changedEmployees = new Set<string>();
       await mapWithConcurrency(rows, 8, async (row) => {
         const employee = employeeById.get(row.employeeId);
         if (!employee) return;
@@ -914,13 +1039,14 @@ export class AttendanceService {
           return;
         }
         if (row.date < utcDateStrOf(employee.joiningDate)) return;
+        if (!isEmployedOn(employee.exitDate, row.date)) return;
         const hasPunch = !!(row.inTime || row.outTime);
         if (row.date > yesterday && !hasPunch) return;
         const department = employee.departmentId
           ? (departmentById.get(employee.departmentId) ?? null)
           : null;
         const shiftConfig = resolveShiftConfig(
-          department,
+          shiftDepartmentFor(department, employee, shiftRules),
           org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
           org?.timezone ?? DEFAULT_ORG_TIMEZONE,
         );
@@ -951,7 +1077,12 @@ export class AttendanceService {
           },
         });
         updated += 1;
+        changedEmployees.add(row.employeeId);
       });
+      // Their days changed under the new schedule, so a payroll already calculated for this month is out of date.
+      for (const employeeId of changedEmployees) {
+        await markPayrollInputsChanged(this.scopedPrisma, organizationId, employeeId, [{ month, year }]);
+      }
       if (updated > 0 && actorId) {
         await this.auditLogService.log({
           actorId,
@@ -998,6 +1129,20 @@ export class AttendanceService {
     // Overtime Pay is off: overtime could never be paid, so don't suggest any (existing suggestions are left as they
     // are for HR to review).
     if (!(await isOvertimePayEnabled(db, organizationId))) return;
+    // The Admin's overtime policy: no suggestions when overtime is entered by hand only.
+    const person = await db.user.findFirst({
+      where: { id: employeeId, organizationId },
+      select: { id: true, departmentId: true, employeeType: true, designation: true },
+    });
+    const { policy, rates } = await getEffectiveOvertime(
+      db,
+      organizationId,
+      person ?? { id: employeeId },
+      dateStr,
+    );
+    if (policy.creationMode === 'SELF') return;
+    // Overtime does not apply to this person's role (their rule set says so).
+    if (!policy.eligible) return;
     // No real shift was worked — nothing to overshoot.
     if (
       status === AttendanceStatus.ABSENT ||
@@ -1018,7 +1163,11 @@ export class AttendanceService {
       isHolidayDay || isWeeklyOff(dateStr, shiftConfig.weeklyOffs);
     const overshootMinutes = isOffDay
       ? Math.max(0, workDurationMinutes - (shiftConfig.breakMinutes ?? 0))
-      : Math.round((outTime.getTime() - shiftEnd.getTime()) / 60000);
+      : Math.max(
+          0,
+          Math.round((outTime.getTime() - shiftEnd.getTime()) / 60000) -
+            policy.startAfterMinutes,
+        );
 
     // One day, one benefit: work already claimed as comp-off is not also suggested as overtime.
     if (isOffDay) {
@@ -1044,7 +1193,28 @@ export class AttendanceService {
     const existingAuto =
       existing && existing.source !== OvertimeSource.SELF ? existing : null;
 
-    if (overshootMinutes < AttendanceService.AUTO_OVERTIME_MIN_MINUTES) {
+    // By the calendar, not the attendance status: a weekly off is WEEKEND (2x), a holiday HOLIDAY, any other day
+    // REGULAR (1.5x) - or NIGHT when the person left inside the company's night window.
+    let type: OvertimeType = isHolidayDay
+      ? OvertimeType.HOLIDAY
+      : isOffDay
+        ? OvertimeType.WEEKEND
+        : OvertimeType.REGULAR;
+    if (type === OvertimeType.REGULAR && policy.nightStart && policy.nightEnd) {
+      const leftAt = new Intl.DateTimeFormat('en-GB', {
+        timeZone: tzOf(shiftConfig),
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(outTime);
+      if (inNightWindow(policy, leftAt)) type = OvertimeType.NIGHT;
+    }
+    // Below the Admin's "minimum hours worked to qualify" (for this kind of day) there is no overtime at all.
+    const threshold = thresholdsFor(policy, type);
+    const belowWorkedHours =
+      threshold.minWorkedHours !== null &&
+      workDurationMinutes < threshold.minWorkedHours * 60;
+    if (overshootMinutes < threshold.minMinutes || belowWorkedHours) {
       // A correction (e.g. a regularization) can shrink a day's punch span
       // below the threshold after an auto-suggestion was already created —
       // only ever clean up our own not-yet-reviewed suggestion, never a
@@ -1062,15 +1232,9 @@ export class AttendanceService {
     // so don't also create a second, auto-suggested one for the same day.
     if (existing && !existingAuto) return;
 
-    // By the calendar, not the attendance status: a weekly off with real punches is marked PRESENT, which used to
-    // make its overtime REGULAR (1.5x) instead of weekend (2x).
-    const type = isHolidayDay
-      ? OvertimeType.HOLIDAY
-      : isOffDay
-        ? OvertimeType.WEEKEND
-        : OvertimeType.REGULAR;
-    const hours = Math.round((overshootMinutes / 60) * 100) / 100;
-    const rateMultiplier = (await getOvertimeRates(db, organizationId))[type];
+    const hours = roundOvertimeHours(overshootMinutes / 60, policy);
+    if (hours <= 0) return;
+    const rateMultiplier = rates[type];
 
     if (existingAuto) {
       if (existingAuto.status !== OvertimeStatus.PENDING) return;
@@ -1217,6 +1381,14 @@ export class AttendanceService {
     return org?.timezone ?? 'Asia/Kolkata';
   }
 
+  // The company's active gender-wise shift rules (Work Schedules > Shift rules), laid over the department shift.
+  private async shiftRulesOf(
+    db: { shiftRule: { findMany: (a: { where: { organizationId: string; isActive: boolean } }) => Promise<ShiftRuleLite[]> } },
+    organizationId: string,
+  ): Promise<ShiftRuleLite[]> {
+    return db.shiftRule.findMany({ where: { organizationId, isActive: true } });
+  }
+
   private async resolveEmployeeShiftConfig(
     employeeId: string,
     organizationId: string,
@@ -1229,7 +1401,7 @@ export class AttendanceService {
       where: { id: organizationId },
     });
     return resolveShiftConfig(
-      employee?.department ?? null,
+      employee ? shiftDepartmentFor(employee.department, employee, await this.shiftRulesOf(this.scopedPrisma, organizationId)) ?? null : null,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? DEFAULT_ORG_TIMEZONE,
     );
@@ -1254,10 +1426,14 @@ export class AttendanceService {
       .digest('hex');
     const org = await this.scopedPrisma.organization.findFirst({
       where: { id: dto.organizationId, faceApiKeyHash: providedKeyHash },
-      select: { id: true },
+      select: { id: true, isActive: true },
     });
     if (!org) {
       throw new UnauthorizedException('Invalid or missing Face API key.');
+    }
+    // A company the platform has suspended or archived records nothing, device key or not.
+    if (!org.isActive) {
+      throw new ForbiddenException(ORG_SUSPENDED_MESSAGE);
     }
 
     const user = await this.scopedPrisma.user.findFirst({
@@ -1285,7 +1461,12 @@ export class AttendanceService {
     );
     if (attendanceDate < utcDateStrOf(user.joiningDate)) {
       throw new BadRequestException(
-        `The date ${attendanceDate} is before this employee's joining date (${utcDateStrOf(user.joiningDate)}).`,
+        `The date ${dmyText(attendanceDate)} is before this employee's joining date (${dmyText(utcDateStrOf(user.joiningDate))}).`,
+      );
+    }
+    if (!isEmployedOn(user.exitDate, attendanceDate)) {
+      throw new BadRequestException(
+        `The date ${dmyText(attendanceDate)} is after this employee's last working day (${dmyText(user.exitDate!)}).`,
       );
     }
     await assertPayrollPeriodUnlocked(
@@ -1431,7 +1612,12 @@ export class AttendanceService {
     }
     if (attendanceDate < utcDateStrOf(user.joiningDate)) {
       throw new BadRequestException(
-        `The date ${attendanceDate} is before this employee's joining date (${utcDateStrOf(user.joiningDate)}).`,
+        `The date ${dmyText(attendanceDate)} is before this employee's joining date (${dmyText(utcDateStrOf(user.joiningDate))}).`,
+      );
+    }
+    if (!isEmployedOn(user.exitDate, attendanceDate)) {
+      throw new BadRequestException(
+        `The date ${dmyText(attendanceDate)} is after this employee's last working day (${dmyText(user.exitDate!)}).`,
       );
     }
     await assertPayrollPeriodUnlocked(
@@ -1502,6 +1688,61 @@ export class AttendanceService {
     return { punch, ...(outPunch && { outPunch }), attendance };
   }
 
+  // The same In/Out for many people on many days, in one request (an HR back-entry). Each person-day goes through
+  // manualPunch, so every rule applies to it (active employee, joining and last working day, locked payroll, no future
+  // time); a day that is refused is listed with its reason and never stops the others.
+  async manualPunchBulk(
+    dto: BulkManualPunchDto,
+    organizationId: string,
+    actorId: string,
+  ) {
+    const total = dto.employeeIds.length * dto.punches.length;
+    if (total > MAX_BULK_MANUAL_PUNCHES) {
+      throw new BadRequestException(
+        `That is ${total} punches in one go. The most one request can add is ${MAX_BULK_MANUAL_PUNCHES} (people × days); please split it.`,
+      );
+    }
+    const people = await this.scopedPrisma.user.findMany({
+      where: { id: { in: dto.employeeIds }, organizationId },
+      select: { id: true, name: true, employeeId: true },
+    });
+    const byId = new Map(people.map((p) => [p.id, p]));
+    const jobs = dto.employeeIds.flatMap((employeeId) =>
+      dto.punches.map((p) => ({ employeeId, ...p })),
+    );
+    const outcomes = await runInBatches(jobs, (job) =>
+      this.manualPunch(
+        {
+          employeeId: job.employeeId,
+          punchTime: job.punchTime,
+          ...(job.outPunchTime ? { outPunchTime: job.outPunchTime } : {}),
+          ...(dto.location ? { location: dto.location } : {}),
+        },
+        organizationId,
+        actorId,
+      ),
+    );
+    const failures = outcomes.flatMap((o, i) =>
+      o.ok
+        ? []
+        : [
+            {
+              employeeId: jobs[i].employeeId,
+              employeeName: byId.get(jobs[i].employeeId)?.name ?? null,
+              employeeCode: byId.get(jobs[i].employeeId)?.employeeId ?? null,
+              punchTime: jobs[i].punchTime,
+              message: o.message,
+            },
+          ],
+    );
+    return {
+      total,
+      succeeded: total - failures.length,
+      failed: failures.length,
+      failures,
+    };
+  }
+
   async selfPunch(dto: SelfPunchDto, actor: Actor, organizationId: string) {
     const employee = await this.scopedPrisma.user.findFirst({
       where: { id: actor.id, organizationId },
@@ -1560,6 +1801,18 @@ export class AttendanceService {
       punchTime,
       selfShiftConfig,
     );
+    // Not before they have joined, and not after their last working day (the account stays open until the exit is
+    // completed, but they are no longer working).
+    if (employee && attendanceDate < utcDateStrOf(employee.joiningDate)) {
+      throw new BadRequestException(
+        `You can check in from your joining date (${dmyText(utcDateStrOf(employee.joiningDate))}).`,
+      );
+    }
+    if (employee && !isEmployedOn(employee.exitDate, attendanceDate)) {
+      throw new BadRequestException(
+        `Your last working day was ${dmyText(employee.exitDate!)}, so attendance can no longer be recorded.`,
+      );
+    }
 
     // Selfie at check-in/out: the employee's own setting, else the org's
     // (common/selfie-requirement.ts). Enforced here, not just in the app, so
@@ -1770,6 +2023,344 @@ export class AttendanceService {
     });
   }
 
+  // Migration of PAST Work From Home from a spreadsheet (Admin/HR): each row is a range of days one employee worked from
+  // home, recorded as already approved - by the importer, with no notification to the employee. The days count as
+  // Present (they were worked), so nobody loses pay for them; a day that already has real punches keeps them. Weekly
+  // offs, holidays and full-day leave inside a range are left out, like a normal request. dryRun (the default) only
+  // checks every row; a month whose payroll is already locked is refused, as for imported leave.
+  async importWfh(
+    dto: ImportWfhDto,
+    importer: Actor,
+    organizationId: string,
+  ): Promise<ImportWfhResult> {
+    const dryRun = dto.dryRun !== false;
+    const str = (v: unknown) =>
+      v === undefined || v === null ? '' : String(v).trim();
+    const todayStr = todayInOrgTz(await this.getOrgTimezone(organizationId));
+
+    const codes = new Set(
+      dto.rows.map((r) => str(r.employeeId).toLowerCase()).filter(Boolean),
+    );
+    const employees = codes.size
+      ? await this.scopedPrisma.user.findMany({
+          where: { organizationId },
+          omit: { password: true },
+        })
+      : [];
+    const byCode = new Map(
+      employees.map((e) => [e.employeeId.toLowerCase(), e]),
+    );
+    // Dates already given earlier in this same file, per employee: a repeated day is the same day, not a second request.
+    const seen = new Map<string, Set<string>>();
+
+    const results: ImportWfhRowResult[] = [];
+    for (const [i, row] of dto.rows.entries()) {
+      const from = str(row.fromDate);
+      const to = str(row.toDate) || from;
+      const out: ImportWfhRowResult = {
+        row: i + 1,
+        employeeId: str(row.employeeId),
+        fromDate: from,
+        toDate: to,
+        status: 'ERROR',
+      };
+      results.push(out);
+      try {
+        const employee = byCode.get(str(row.employeeId).toLowerCase());
+        if (!employee) throw new BadRequestException('Unknown employee ID.');
+        out.employeeName = employee.name;
+        // Same boundary as editing someone's personal data: only an Admin touches an HR or Admin employee's record.
+        if (
+          importer.role !== Role.ADMIN &&
+          (employee.role === Role.ADMIN || employee.role === Role.HR)
+        ) {
+          throw new ForbiddenException(
+            'Only an Admin can import Work From Home for an HR or Admin employee.',
+          );
+        }
+        if (
+          !isValidCalendarDateString(from) ||
+          !isValidCalendarDateString(to)
+        ) {
+          throw new BadRequestException(
+            'From and To must be real dates (DD-MM-YYYY).',
+          );
+        }
+        if (to < from) {
+          throw new BadRequestException('To cannot be before From.');
+        }
+        if (to > todayStr) {
+          throw new BadRequestException(
+            'Only past days can be imported - the To date cannot be after today. Employees request upcoming days themselves.',
+          );
+        }
+        if (from < utcDateStrOf(employee.joiningDate)) {
+          throw new BadRequestException(
+            `The date is before the employee's joining date (${dmyText(utcDateStrOf(employee.joiningDate))}).`,
+          );
+        }
+        if (calendarSpan(from, to) > MAX_WFH_RANGE_DAYS) {
+          throw new BadRequestException(
+            `A row can cover at most ${MAX_WFH_RANGE_DAYS} days - split a longer period over several rows.`,
+          );
+        }
+        const { days: candidates, skipped } = await this.wfhDaysFor(
+          employee,
+          organizationId,
+          from,
+          to,
+        );
+        const taken = seen.get(employee.id) ?? new Set<string>();
+        const days = candidates.filter((d) => !taken.has(d));
+        const repeated = candidates.length - days.length;
+        if (days.length === 0) {
+          throw new BadRequestException(
+            candidates.length > 0
+              ? 'Every day of this row is already given by an earlier row of the file.'
+              : 'There is no working day to record in that range (weekly offs, holidays, leave and days that already have Work From Home are not included).',
+          );
+        }
+        // The payroll month must still be open: the day becomes Present and the month's attendance changes.
+        await assertPayrollMonthsUnlocked(
+          this.scopedPrisma,
+          organizationId,
+          employee.id,
+          [
+            ...new Map(
+              days.map((d) => [
+                d.slice(0, 7),
+                { month: Number(d.slice(5, 7)), year: Number(d.slice(0, 4)) },
+              ]),
+            ).values(),
+          ],
+          'Work From Home',
+        );
+        out.days = days.length;
+        const left = skipped.length + repeated;
+        const note = left > 0 ? ` (${left} other day(s) in the range left out)` : '';
+        if (dryRun) {
+          out.status = 'OK';
+          out.message = `Would record ${days.length} day(s)${note}.`;
+        } else {
+          await this.recordImportedWfh(
+            employee,
+            importer,
+            organizationId,
+            days,
+            str(row.reason),
+          );
+          out.status = 'IMPORTED';
+          out.message = `Recorded ${days.length} day(s)${note}.`;
+        }
+        days.forEach((d) => taken.add(d));
+        seen.set(employee.id, taken);
+      } catch (err) {
+        out.status = 'ERROR';
+        out.message =
+          err instanceof Error
+            ? err.message
+            : 'The row could not be processed.';
+      }
+    }
+
+    const imported = results.filter((r) => r.status === 'IMPORTED').length;
+    const ok = results.filter((r) => r.status === 'OK').length;
+    const failed = results.filter((r) => r.status === 'ERROR').length;
+    if (!dryRun) {
+      await this.auditLogService.log({
+        actorId: importer.id,
+        action: 'WFH_IMPORT_RUN',
+        module: 'ATTENDANCE',
+        organizationId,
+        details: { rows: results.length, imported, failed },
+      });
+    }
+    return { dryRun, total: results.length, ok, imported, failed, rows: results };
+  }
+
+  // Writes one imported row: every day becomes an approved Work From Home day (approved by the importer, one request id
+  // for a multi-day row) and a Present day, in one transaction so a row is all or nothing.
+  private async recordImportedWfh(
+    employee: { id: string; name: string; employeeId: string },
+    importer: Actor,
+    organizationId: string,
+    days: string[],
+    reason: string,
+  ) {
+    const requestId = days.length > 1 ? crypto.randomUUID() : null;
+    await this.scopedPrisma.$transaction(async (tx) => {
+      for (const day of days) {
+        // Marks a payroll run already calculated for the month as outdated (it is recalculated before it can be approved).
+        await assertPayrollPeriodUnlocked(
+          tx,
+          organizationId,
+          employee.id,
+          day,
+        );
+        const fields = {
+          workArrangement: WorkArrangement.WFH,
+          workArrangementStatus: WfhApprovalStatus.APPROVED,
+          workArrangementReviewedById: importer.id,
+          workArrangementReviewedAt: new Date(),
+          workArrangementReviewComments: `Imported${reason ? `: ${reason}` : ''}`,
+          wfhRequestId: requestId,
+        };
+        const existing = await tx.attendance.findFirst({
+          where: { organizationId, employeeId: employee.id, date: day },
+        });
+        if (existing) {
+          // The day was worked: an Absent / Incomplete day becomes Present; one with real punches, a half day or leave
+          // keeps what it is.
+          const becomesPresent =
+            existing.status === AttendanceStatus.ABSENT ||
+            existing.status === AttendanceStatus.INCOMPLETE;
+          await tx.attendance.updateMany({
+            where: { id: existing.id, organizationId },
+            data: {
+              ...fields,
+              ...(becomesPresent
+                ? {
+                    status: AttendanceStatus.PRESENT,
+                    source: AttendanceSource.EXCEL_IMPORT,
+                  }
+                : {}),
+            },
+          });
+        } else {
+          await tx.attendance.create({
+            data: {
+              organizationId,
+              employeeId: employee.id,
+              date: day,
+              status: AttendanceStatus.PRESENT,
+              source: AttendanceSource.EXCEL_IMPORT,
+              ...fields,
+            },
+          });
+        }
+      }
+    });
+    const label =
+      days.length === 1
+        ? days[0]
+        : `${days[0]} to ${days[days.length - 1]} (${days.length} days)`;
+    await this.timelineService.logEvent({
+      organizationId,
+      employeeId: employee.id,
+      eventKey: 'WFH_APPROVED',
+      performedById: importer.id,
+      description: `Imported Work From Home for ${label}${reason ? `: ${reason}` : ''}.`,
+      metadata: { wfhRequestId: requestId, days, imported: true },
+    });
+    await this.auditLogService.log({
+      actorId: importer.id,
+      action: 'WFH_IMPORTED',
+      module: 'ATTENDANCE',
+      organizationId,
+      targetId: employee.id,
+      details: { employeeCode: employee.employeeId, days, requestId },
+    });
+  }
+
+  // WFH "balance" for the employee profile. Work From Home has no quota in this system (no allowance to count down
+  // from), so this is the usage side: approved WFH days in the leave year so far and in this month, approved days still
+  // to come, and days awaiting approval. An employee sees their own; Admin/HR anyone; a Manager their department.
+  async getWfhSummary(
+    employeeIdParam: string | undefined,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    let employeeId = actor.id;
+    if (employeeIdParam && employeeIdParam !== actor.id) {
+      if (
+        actor.role !== Role.ADMIN &&
+        actor.role !== Role.HR &&
+        actor.role !== Role.MANAGER
+      ) {
+        throw new ForbiddenException(
+          "You cannot view another employee's Work From Home balance.",
+        );
+      }
+      const exists = await this.scopedPrisma.user.findFirst({
+        where: { id: employeeIdParam, organizationId },
+        select: { id: true },
+      });
+      if (!exists) throw new NotFoundException('Employee not found.');
+      await assertManagerDeptScope(
+        this.scopedPrisma,
+        actor,
+        organizationId,
+        employeeIdParam,
+      );
+      employeeId = employeeIdParam;
+    }
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: { timezone: true, enableWFH: true, policies: true },
+    });
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const cfg = await getLeaveYearConfig(this.scopedPrisma, organizationId);
+    const year = leaveYearBounds(currentLeaveYear(today, cfg), cfg);
+    const monthStart = `${today.slice(0, 7)}-01`;
+    const monthEnd = `${today.slice(0, 7)}-${String(
+      new Date(
+        Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)), 0),
+      ).getUTCDate(),
+    ).padStart(2, '0')}`;
+    const wfh = {
+      organizationId,
+      employeeId,
+      workArrangement: WorkArrangement.WFH,
+    };
+    const count = (
+      status: WfhApprovalStatus,
+      date: { gte?: string; lte?: string },
+    ) =>
+      this.scopedPrisma.attendance.count({
+        where: { ...wfh, workArrangementStatus: status, date },
+      });
+    const [usedThisYear, usedThisMonth, upcoming, pending] = await Promise.all(
+      [
+        count(WfhApprovalStatus.APPROVED, {
+          gte: year.start,
+          lte: today < year.end ? today : year.end,
+        }),
+        count(WfhApprovalStatus.APPROVED, {
+          gte: monthStart,
+          lte: today < monthEnd ? today : monthEnd,
+        }),
+        // Approved days after today (a request is approved before its day arrives).
+        this.scopedPrisma.attendance.count({
+          where: {
+            ...wfh,
+            workArrangementStatus: WfhApprovalStatus.APPROVED,
+            date: { gt: today },
+          },
+        }),
+        this.scopedPrisma.attendance.count({
+          where: {
+            ...wfh,
+            workArrangementStatus: WfhApprovalStatus.PENDING,
+            date: { gte: year.start },
+          },
+        }),
+      ],
+    );
+    return {
+      enabled: org?.enableWFH !== false,
+      // The company's WFH days allowed per month (null = no limit): what usedThisMonth is shown "out of".
+      allowedPerMonth: wfhDaysPerMonthOf(
+        (org?.policies as { wfhDaysPerMonth?: unknown } | null)?.wfhDaysPerMonth,
+      ),
+      yearStart: year.start,
+      yearEnd: year.end,
+      usedThisYear,
+      usedThisMonth,
+      upcoming,
+      pending,
+    };
+  }
+
   async getTodayPunchCount(actor: Actor, organizationId: string) {
     const orgTimezone = await this.getOrgTimezone(organizationId);
     const punchCount = await this.scopedPrisma.punch.count({
@@ -1813,7 +2404,8 @@ export class AttendanceService {
       workArrangementReviewedById: null,
       workArrangementReviewedAt: null,
       workArrangementReviewComments: null,
-      workArrangementReason: isWfh ? dto.reason?.trim() || null : null,
+      // Belongs to the request: any other arrangement (a withdrawal included) clears it.
+      workArrangementReason: isWfh ? (dto.reason ?? null) : null,
       // A single day stands alone; a group id left from an earlier multi-day request must not stick to it.
       wfhRequestId: null,
     };
@@ -1845,7 +2437,7 @@ export class AttendanceService {
       });
       if (me && dateStr < utcDateStrOf(me.joiningDate)) {
         throw new BadRequestException(
-          `The date is before your joining date (${utcDateStrOf(me.joiningDate)}).`,
+          `The date is before your joining date (${dmyText(utcDateStrOf(me.joiningDate))}).`,
         );
       }
       await assertPayrollPeriodUnlocked(
@@ -1855,24 +2447,81 @@ export class AttendanceService {
         dateStr,
       );
     }
+    const meEmployment = await this.scopedPrisma.user.findFirst({
+      where: { id: actor.id, organizationId },
+      select: { joiningDate: true, exitDate: true },
+    });
+    if (meEmployment && dateStr < utcDateStrOf(meEmployment.joiningDate)) {
+      throw new BadRequestException(
+        `The date is before your joining date (${dmyText(utcDateStrOf(meEmployment.joiningDate))}).`,
+      );
+    }
+    if (meEmployment && !isEmployedOn(meEmployment.exitDate, dateStr)) {
+      throw new BadRequestException(
+        `The date is after your last working day (${dmyText(meEmployment.exitDate!)}).`,
+      );
+    }
     const existing = await this.scopedPrisma.attendance.findFirst({
       where: { organizationId, employeeId: actor.id, date: dateStr },
     });
+    // One Work From Home request per day: a day already requested - waiting, approved or turned down - is not asked
+    // for again (same rule as a multi-day request, which leaves such days out).
+    const takenWfh =
+      existing?.workArrangement === WorkArrangement.WFH &&
+      WFH_TAKEN_STATUSES.includes(existing.workArrangementStatus)
+        ? existing.workArrangementStatus
+        : null;
+    if (isWfh && takenWfh) {
+      throw new ConflictException(wfhAlreadyRequestedMessage(dateStr, takenWfh));
+    }
+    // Back to the office on a day whose request was turned down: nothing to withdraw, and resetting it would free the
+    // day for a second request.
+    if (!isWfh && takenWfh === WfhApprovalStatus.REJECTED) {
+      return existing!;
+    }
+    // A waiting or approved request being withdrawn (switching to another arrangement).
+    const liveWfh = takenWfh === WfhApprovalStatus.REJECTED ? null : takenWfh;
 
     if (existing) {
-      await this.scopedPrisma.attendance.updateMany({
-        where: { id: existing.id, organizationId },
+      // The check is part of the write, so two requests sent at the same moment (a double tap, a retry) cannot both
+      // go through.
+      const { count } = await this.scopedPrisma.attendance.updateMany({
+        where: {
+          id: existing.id,
+          organizationId,
+          ...(isWfh && {
+            NOT: {
+              workArrangement: WorkArrangement.WFH,
+              workArrangementStatus: { in: WFH_TAKEN_STATUSES },
+            },
+          }),
+        },
         data: workArrangementFields,
       });
+      if (isWfh && count === 0) {
+        throw new ConflictException(wfhAlreadyRequestedMessage(dateStr));
+      }
     } else {
-      await this.scopedPrisma.attendance.create({
-        data: {
-          organizationId,
-          employeeId: actor.id,
-          date: dateStr,
-          ...workArrangementFields,
-        },
-      });
+      try {
+        await this.scopedPrisma.attendance.create({
+          data: {
+            organizationId,
+            employeeId: actor.id,
+            date: dateStr,
+            ...workArrangementFields,
+          },
+        });
+      } catch (err) {
+        // The other of two simultaneous requests created the day first.
+        if (
+          isWfh &&
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === 'P2002'
+        ) {
+          throw new ConflictException(wfhAlreadyRequestedMessage(dateStr));
+        }
+        throw err;
+      }
     }
 
     if (isWfh) {
@@ -1888,6 +2537,28 @@ export class AttendanceService {
         description: `Requested Work From Home for ${formatDateDisplay(dateStr, '', dateFormat, timeZone)}.`,
       });
       await this.notifyWfhRequested(actor, dateStr, organizationId);
+    } else if (liveWfh) {
+      // Back to the office on a day with a waiting or approved Work From Home: the request is withdrawn, so the
+      // approver hears of it instead of the request just disappearing from their list.
+      const day = dmyText(dateStr);
+      const pending = liveWfh === WfhApprovalStatus.PENDING;
+      await this.timelineService.logEvent({
+        organizationId,
+        employeeId: actor.id,
+        eventKey: 'WFH_WITHDRAWN',
+        performedById: actor.id,
+        description: `Withdrew the ${pending ? 'pending' : 'approved'} Work From Home for ${day}; working from the office instead.`,
+      });
+      await this.notificationsService.notifyReviewers({
+        organizationId,
+        requester: actor,
+        title: 'Work From Home Withdrawn',
+        message: pending
+          ? `${actor.name} will work from the office on ${day} instead. Their Work From Home request for that day is withdrawn - nothing to approve.`
+          : `${actor.name} will work from the office on ${day} instead of the approved Work From Home.`,
+        category: NotificationCategory.ATTENDANCE,
+        managerFirst: true,
+      });
     }
 
     return this.scopedPrisma.attendance.findFirstOrThrow({
@@ -1921,7 +2592,7 @@ export class AttendanceService {
       this.scopedPrisma.holiday.findMany({
         where: {
           organizationId,
-          isActive: true,
+          AND: [holidayInEffect],
           isOptional: false,
           date: { gte: from, lte: to },
           OR: employee?.departmentId
@@ -1947,9 +2618,7 @@ export class AttendanceService {
           employeeId: actor.id,
           date: { gte: from, lte: to },
           workArrangement: WorkArrangement.WFH,
-          workArrangementStatus: {
-            in: [WfhApprovalStatus.PENDING, WfhApprovalStatus.APPROVED],
-          },
+          workArrangementStatus: { in: WFH_TAKEN_STATUSES },
         },
         select: { date: true },
       }),
@@ -1960,14 +2629,18 @@ export class AttendanceService {
       const end = l.endDate < to ? l.endDate : to;
       for (let d = start; d <= end; d = addDaysStr(d, 1)) leaveDates.add(d);
     }
+    // Only days they are employed: not before joining, not after the last working day.
+    const joinedStr = employee ? utcDateStrOf(employee.joiningDate) : from;
+    const effFrom = from < joinedStr ? joinedStr : from;
+    const effTo = employee?.exitDate && employee.exitDate < to ? employee.exitDate : to;
     const result = wfhRequestDays({
-      from,
-      to,
+      from: effFrom,
+      to: effTo,
       isWeeklyOff: (date) => isWeeklyOff(date, weeklyOffs),
       holidayDates: new Set(holidays.map((h) => h.date)),
       leaveDates,
     });
-    // A day that is already requested or approved is not asked for again (that would reset its review).
+    // A day already requested - waiting, approved or turned down - is not asked for again (one request per day).
     const already = new Set(existing.map((e) => e.date));
     if (already.size === 0) return result;
     return {
@@ -2050,7 +2723,7 @@ export class AttendanceService {
     });
     if (me && from < utcDateStrOf(me.joiningDate)) {
       throw new BadRequestException(
-        `The date is before your joining date (${utcDateStrOf(me.joiningDate)}).`,
+        `The date is before your joining date (${dmyText(utcDateStrOf(me.joiningDate))}).`,
       );
     }
     const { days, skipped } = await this.wfhDaysFor(
@@ -2079,7 +2752,7 @@ export class AttendanceService {
       workArrangementReviewedById: null,
       workArrangementReviewedAt: null,
       workArrangementReviewComments: null,
-      workArrangementReason: dto.reason?.trim() || null,
+      workArrangementReason: dto.reason ?? null,
       wfhRequestId: requestId,
     };
     for (const day of days) {
@@ -2148,18 +2821,9 @@ export class AttendanceService {
       workArrangementStatus: WfhApprovalStatus.PENDING,
     };
 
-    if (actor.role === Role.MANAGER) {
-      // deptScopedEmployeeIds scopes a departmentless manager to nobody —
-      // a raw `departmentId: actor.departmentId` filter would turn into
-      // `IS NULL` and match every unassigned employee in the org.
-      where.employeeId = {
-        in: await deptScopedEmployeeIds(
-          this.scopedPrisma,
-          actor,
-          organizationId,
-        ),
-      };
-    }
+    // A department head (MANAGER, or HR who heads departments) sees only the people they look after.
+    const scope = await reviewerScope(this.scopedPrisma, actor, organizationId);
+    if (scope) where.employeeId = { in: scope };
 
     return this.scopedPrisma.attendance.findMany({
       where,
@@ -2168,6 +2832,53 @@ export class AttendanceService {
       },
       orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { date: 'desc' }],
     });
+  }
+
+  // Decided Work From Home days (same scoping as the pending queue), newest first, each with the reviewer's name.
+  async listDecidedWfhRequests(
+    actor: Actor,
+    organizationId: string,
+    query: { status?: 'approved' | 'rejected' | 'decided'; from?: string },
+  ) {
+    const statuses =
+      query.status === 'approved'
+        ? [WfhApprovalStatus.APPROVED]
+        : query.status === 'rejected'
+          ? [WfhApprovalStatus.REJECTED]
+          : [WfhApprovalStatus.APPROVED, WfhApprovalStatus.REJECTED];
+    const where: Prisma.AttendanceWhereInput = {
+      organizationId,
+      workArrangement: WorkArrangement.WFH,
+      workArrangementStatus: { in: statuses },
+    };
+    if (query.from) where.date = { gte: query.from };
+    const scope = await reviewerScope(this.scopedPrisma, actor, organizationId);
+    if (scope) where.employeeId = { in: scope };
+    const rows = await this.scopedPrisma.attendance.findMany({
+      where,
+      include: {
+        employee: { select: { id: true, name: true, employeeId: true } },
+      },
+      orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { date: 'desc' }],
+    });
+    const reviewerIds = [
+      ...new Set(
+        rows.map((r) => r.workArrangementReviewedById).filter(Boolean),
+      ),
+    ] as string[];
+    const reviewers = reviewerIds.length
+      ? await this.scopedPrisma.user.findMany({
+          where: { id: { in: reviewerIds }, organizationId },
+          select: { id: true, name: true },
+        })
+      : [];
+    const nameById = new Map(reviewers.map((u) => [u.id, u.name]));
+    return rows.map((r) => ({
+      ...r,
+      workArrangementReviewedByName: r.workArrangementReviewedById
+        ? (nameById.get(r.workArrangementReviewedById) ?? null)
+        : null,
+    }));
   }
 
   // `id` is the Attendance row's id, same convention as
@@ -2391,20 +3102,53 @@ export class AttendanceService {
     return { geoFence: fence };
   }
 
+  // One employee's day for the Attendance Tracker popup: the attendance record, any overtime logged for it, the person's shift and how long
+  // they worked beyond it. ADMIN/HR may open anyone; a MANAGER only their department; an employee only themself.
+  async getDayDetail(employeeId: string, date: string, actor: Actor, organizationId: string) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new BadRequestException('date must be YYYY-MM-DD.');
+    if (actor.role === Role.EMPLOYEE && actor.id !== employeeId) throw new ForbiddenException('You can only view your own attendance.');
+    if (actor.role !== Role.EMPLOYEE && !(await inReviewerScope(this.scopedPrisma, actor, organizationId, employeeId))) {
+      throw new ForbiddenException('You can only view attendance for the people you look after.');
+    }
+    const employee = await this.scopedPrisma.user.findFirst({ where: { id: employeeId, organizationId }, include: { department: true } });
+    if (!employee) throw new NotFoundException('Employee not found.');
+    const [record, overtime, org] = await Promise.all([
+      this.scopedPrisma.attendance.findFirst({ where: { organizationId, employeeId, date } }),
+      this.scopedPrisma.overtimeRecord.findMany({ where: { organizationId, employeeId, date }, orderBy: { createdAt: 'asc' } }),
+      this.prisma.organization.findUnique({ where: { id: organizationId } }),
+    ]);
+    const shift = resolveShiftConfig(shiftDepartmentFor(employee.department, employee, await this.shiftRulesOf(this.scopedPrisma, organizationId)), org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null, org?.timezone ?? DEFAULT_ORG_TIMEZONE);
+    const shiftNetMinutes = shiftMinutes(shift.shiftStartTime, shift.shiftEndTime, shift.crossesMidnight, shift.breakMinutes);
+    return {
+      date,
+      record,
+      overtime,
+      shift: { startTime: shift.shiftStartTime, endTime: shift.shiftEndTime, minutes: shiftNetMinutes },
+      extraMinutes: extraMinutesBeyondShift(record?.workDurationMinutes ?? 0, shiftNetMinutes),
+    };
+  }
+
   async list(query: QueryAttendanceDto, actor: Actor, organizationId: string) {
     const where: Prisma.AttendanceWhereInput = { organizationId };
+    const scope = actor.role === Role.EMPLOYEE ? null : await reviewerScope(this.scopedPrisma, actor, organizationId);
 
     if (actor.role === Role.EMPLOYEE) {
       where.employeeId = actor.id;
-    } else if (actor.role === Role.MANAGER) {
-      // Same null-department guard as listPendingWfhRequests.
-      const deptEmployeeIds = new Set(
-        await deptScopedEmployeeIds(this.scopedPrisma, actor, organizationId),
-      );
+    } else if (scope) {
+      const scoped = new Set(scope);
+      // A department picked in the filter narrows the reviewer's own people; it never widens them.
+      const inDept = query.department
+        ? (
+            await this.scopedPrisma.user.findMany({
+              where: { organizationId, departmentId: query.department, id: { in: scope } },
+              select: { id: true },
+            })
+          ).map((e) => e.id)
+        : scope;
       where.employeeId =
-        query.employeeId && deptEmployeeIds.has(query.employeeId)
+        query.employeeId && scoped.has(query.employeeId)
           ? query.employeeId
-          : { in: [...deptEmployeeIds] };
+          : { in: inDept };
     } else if (query.employeeId) {
       // Not an employee of this organisation: "not found", like every other employee endpoint, rather than an empty list.
       const exists = await this.scopedPrisma.user.findFirst({
@@ -2434,6 +3178,17 @@ export class AttendanceService {
         equals: query.regularizationStatus,
       };
     }
+
+    // No record is shown for a day before the employee joined (an import, a manual entry or an old row can carry
+    // one): rows dated before that person's joining date are left out of the list, the count and the summary.
+    const beforeJoining = await this.rowsBeforeJoining(
+      where.employeeId as Prisma.UserWhereInput['id'] | undefined,
+      query.from,
+      query.to,
+      organizationId,
+    );
+    if (beforeJoining)
+      where.AND = [...((where.AND as []) ?? []), beforeJoining];
 
     // A bounded date range (≤31 days — the Attendance Records page's own
     // Month filter sends exactly this) gets the same "no row = Absent (or
@@ -2509,7 +3264,7 @@ export class AttendanceService {
         ? this.scopedPrisma.holiday.findMany({
             where: {
               organizationId,
-              isActive: true,
+              AND: [holidayInEffect],
               date: { in: holidayDates },
             },
           })
@@ -2601,6 +3356,12 @@ export class AttendanceService {
         }
 
         let leaveTypeName: string | undefined;
+        // 'COMP_OFF' / 'LWP' when the leave on this day is a comp-off or Leave Without Pay, so clients can tell them
+        // apart from other leave (the Attendance Tracker grid and the mobile calendar do).
+        let leaveKind: 'COMP_OFF' | 'LWP' | undefined;
+        // Whether that leave is paid (Leave Without Pay and other unpaid types are not), so a summary can count unpaid
+        // days as absent days, the way payroll does.
+        let leavePaid: boolean | undefined;
         if (
           record.status === AttendanceStatus.ON_LEAVE ||
           record.status === AttendanceStatus.HALF_DAY
@@ -2609,6 +3370,12 @@ export class AttendanceService {
             (l) => l.startDate <= record.date && l.endDate >= record.date,
           );
           leaveTypeName = matching?.leaveType.name;
+          if (matching) {
+            leavePaid =
+              matching.leaveType.isPaid && matching.leaveType.code !== 'LWP';
+          }
+          if (matching?.leaveType.code === LEAVE_TYPE_CODES.COMPOFF) leaveKind = 'COMP_OFF';
+          else if (matching?.leaveType.code === 'LWP') leaveKind = 'LWP';
         }
 
         return {
@@ -2637,9 +3404,46 @@ export class AttendanceService {
             !record.outTime,
           ...(holidayName !== undefined && { holidayName }),
           ...(leaveTypeName !== undefined && { leaveTypeName }),
+          ...(leaveKind !== undefined && { leaveKind }),
+          ...(leavePaid !== undefined && { leavePaid }),
         };
       }),
     };
+  }
+
+  // A where-fragment that leaves out rows dated before the employee's own joining date (an import, a manual entry or
+  // an old row can carry one), or undefined when there are none. Found with one SQL join, so it is exact for any
+  // number of employees; such rows are anomalies, so the id list stays small (capped at 5,000, the most that can be
+  // excluded this way - the list is paged and the automatic rows already respect the joining date).
+  private async rowsBeforeJoining(
+    employeeIdFilter: Prisma.UserWhereInput['id'] | undefined,
+    from: string | undefined,
+    to: string | undefined,
+    organizationId: string,
+  ): Promise<Prisma.AttendanceWhereInput | undefined> {
+    const scopeIds =
+      typeof employeeIdFilter === 'string'
+        ? [employeeIdFilter]
+        : employeeIdFilter &&
+            typeof employeeIdFilter === 'object' &&
+            'in' in employeeIdFilter
+          ? (employeeIdFilter.in as string[] | undefined)
+          : undefined;
+    if (scopeIds && scopeIds.length === 0) return undefined;
+    const rows = await this.prisma.$queryRaw<{ id: string }[]>(Prisma.sql`
+      SELECT a.id
+      FROM attendances a
+      JOIN users u ON u.id = a."employeeId"
+      WHERE a."organizationId" = ${organizationId}
+        AND (a.date < to_char(u."joiningDate" AT TIME ZONE 'UTC', 'YYYY-MM-DD')
+          OR (u."exitDate" IS NOT NULL AND a.date > u."exitDate"))
+        ${from ? Prisma.sql`AND a.date >= ${from}` : Prisma.empty}
+        ${to ? Prisma.sql`AND a.date <= ${to}` : Prisma.empty}
+        ${scopeIds ? Prisma.sql`AND a."employeeId" = ANY(${scopeIds}::text[])` : Prisma.empty}
+      LIMIT 5000
+    `);
+    if (rows.length === 0) return undefined;
+    return { id: { notIn: rows.map((r) => r.id) } };
   }
 
   // list()'s bounded-range path: fetches whatever real Attendance rows
@@ -2677,9 +3481,11 @@ export class AttendanceService {
         },
         select: {
           ...ATTENDANCE_LIST_EMPLOYEE_SELECT,
+          gender: true,
           joiningDate: true,
           departmentId: true,
           createdAt: true,
+          exitDate: true,
         },
       }),
       this.scopedPrisma.attendance.findMany({
@@ -2689,6 +3495,22 @@ export class AttendanceService {
     ]);
 
     const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    // One person's list (their own calendar) also shows the holidays still to come this period, taken from the holiday
+    // calendar, so an employee sees "Holiday" on the day before it arrives. A list of many people stays limited to days
+    // that have happened - upcoming holidays are not spread across every row of a table.
+    const upcomingDays = rangeDays.filter((d) => d >= today);
+    const upcomingHolidays =
+      employees.length === 1 && upcomingDays.length > 0
+        ? await this.scopedPrisma.holiday.findMany({
+            where: {
+              organizationId,
+              AND: [holidayInEffect],
+              isOptional: false,
+              date: { in: upcomingDays },
+            },
+            select: { date: true, departmentId: true },
+          })
+        : [];
     const orgPrefs = (org?.attendancePayrollPrefs ??
       null) as OrganizationAttendancePrefs | null;
     const existingKeys = new Set(
@@ -2696,6 +3518,7 @@ export class AttendanceService {
     );
 
     const synthetic: AttendanceListRow[] = [];
+    const listShiftRules = await this.shiftRulesOf(this.scopedPrisma, organizationId);
     for (const employee of employees) {
       const joiningDateStr = employee.joiningDate.toISOString().slice(0, 10);
       // Blank rows start on the day the employee was added to the system, never earlier: an employee added today
@@ -2706,7 +3529,7 @@ export class AttendanceService {
         employee.createdAt,
       );
       const shiftConfig = resolveShiftConfig(
-        employee.department,
+        shiftDepartmentFor(employee.department, employee, listShiftRules),
         orgPrefs,
         org?.timezone ?? DEFAULT_ORG_TIMEZONE,
       );
@@ -2716,17 +3539,31 @@ export class AttendanceService {
         joiningDate: _joiningDate,
         departmentId: _departmentId,
         createdAt: _createdAt,
+        exitDate: _exitDate,
         ...publicEmployee
       } = employee;
       void _joiningDate;
       void _departmentId;
       void _createdAt;
+      void _exitDate;
+      const exitDate = employee.exitDate;
 
       for (const dateStr of rangeDays) {
         if (existingKeys.has(`${employee.id}|${dateStr}`)) continue;
-        if (dateStr >= today) continue; // today isn't over; future never touched
         if (dateStr < joiningDateStr) continue; // not yet an employee
-        if (dateStr < addedDateStr) continue; // added to the system later than this day
+        if (!isEmployedOn(exitDate, dateStr)) continue; // past their last working day
+        if (dateStr >= today) {
+          // Today and later: only a holiday from the calendar is shown (nothing else about those days is known yet).
+          const isHoliday = upcomingHolidays.some(
+            (h) =>
+              h.date === dateStr &&
+              (h.departmentId === null ||
+                h.departmentId === employee.departmentId),
+          );
+          if (!isHoliday) continue;
+        } else if (dateStr < addedDateStr) {
+          continue; // added to the system later than this day
+        }
 
         const { status, workDurationMinutes, isLate, isEarlyOut } =
           await this.deriveDayOutcome(this.scopedPrisma, {
@@ -2766,6 +3603,7 @@ export class AttendanceService {
           workArrangementReviewedById: null,
           workArrangementReviewedAt: null,
           workArrangementReviewComments: null,
+          workArrangementReason: null,
           // Same shape as the column's own schema default — never persisted,
           // just matching what a real never-touched row would carry.
           regularization: {
@@ -2807,12 +3645,16 @@ export class AttendanceService {
     tx: Prisma.TransactionClient,
     leave: Leave,
     organizationId: string,
+    // The days the leave is charged for, when that is fewer than every date in its range (a holiday or weekly off inside it that
+    // the leave type's sandwich rule leaves out keeps its own status). Omitted = every date in the range.
+    onlyDates?: string[],
   ) {
     const status = leave.isHalfDay
       ? AttendanceStatus.HALF_DAY
       : AttendanceStatus.ON_LEAVE;
 
-    const dates = enumerateDateStrings(leave.startDate, leave.endDate);
+    const dates = onlyDates ?? enumerateDateStrings(leave.startDate, leave.endDate);
+    if (dates.length === 0) return;
     // One findMany + one updateMany + one createMany instead of a
     // findFirst+update/create pair per date — a leave range is usually
     // short, but this is free to batch regardless.
@@ -2970,7 +3812,7 @@ export class AttendanceService {
     }
     if (requester && dto.date < utcDateStrOf(requester.joiningDate)) {
       throw new BadRequestException(
-        `The date ${dto.date} is before your joining date (${utcDateStrOf(requester.joiningDate)}).`,
+        `The date ${dmyText(dto.date)} is before your joining date (${dmyText(utcDateStrOf(requester.joiningDate))}).`,
       );
     }
     if (dto.evidenceUrl !== undefined && dto.evidenceUrl !== '') {
@@ -3048,6 +3890,32 @@ export class AttendanceService {
           ? 'A regularization request for this date is already pending review.'
           : 'This date has already been regularized and approved.',
       );
+    }
+
+    // The Admin-set caps (blank = no limit). An Admin's own request is exempt: it is approved on the spot and there is
+    // no one above them to be asked twice.
+    if (actor.role !== Role.ADMIN) {
+      const usage = await this.getRegularizationUsage(
+        actor.id,
+        dto.date,
+        organizationId,
+      );
+      if (
+        usage.resubmitLimit !== null &&
+        usage.rejectedForDate > usage.resubmitLimit
+      ) {
+        throw new BadRequestException(
+          `This date was rejected ${usage.rejectedForDate} time${usage.rejectedForDate === 1 ? '' : 's'} and can be re-sent at most ${usage.resubmitLimit} time${usage.resubmitLimit === 1 ? '' : 's'}. Please speak to HR.`,
+        );
+      }
+      if (
+        usage.monthlyLimit !== null &&
+        usage.usedThisMonth >= usage.monthlyLimit
+      ) {
+        throw new BadRequestException(
+          `You have used all ${usage.monthlyLimit} regularization request${usage.monthlyLimit === 1 ? '' : 's'} allowed for ${usage.month}. Please speak to HR.`,
+        );
+      }
     }
 
     // Admin is above HR/Manager in the review chain — reviewRegularization
@@ -3202,8 +4070,79 @@ export class AttendanceService {
 
   // What the request form needs to know before the employee fills it in.
   async getRegularizationSettings(organizationId: string) {
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: {
+        regularizationMonthlyLimit: true,
+        regularizationResubmitLimit: true,
+      },
+    });
     return {
       windowDays: await this.getRegularizationWindowDays(organizationId),
+      monthlyLimit: org?.regularizationMonthlyLimit ?? null,
+      resubmitLimit: org?.regularizationResubmitLimit ?? null,
+    };
+  }
+
+  // An employee's standing against the Admin-set caps for the month of `date` (and for that date itself): what the
+  // limits are (null = none), how many requests they have made for that month - every one submitted counts except a
+  // withdrawn one - and how many times this date was rejected. The request form shows it; requestRegularization enforces it.
+  async getRegularizationUsage(
+    employeeId: string,
+    date: string,
+    organizationId: string,
+  ) {
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: {
+        regularizationMonthlyLimit: true,
+        regularizationResubmitLimit: true,
+      },
+    });
+    const monthKey = date.slice(0, 7);
+    const [usedThisMonth, rejectedForDate] = await Promise.all([
+      this.scopedPrisma.attendanceRegularizationRequest.count({
+        where: {
+          organizationId,
+          employeeId,
+          date: { startsWith: monthKey },
+          status: { not: RegularizationRequestStatus.CANCELLED },
+        },
+      }),
+      this.scopedPrisma.attendanceRegularizationRequest.count({
+        where: {
+          organizationId,
+          employeeId,
+          date,
+          status: RegularizationRequestStatus.REJECTED,
+        },
+      }),
+    ]);
+    const monthlyLimit = org?.regularizationMonthlyLimit ?? null;
+    const resubmitLimit = org?.regularizationResubmitLimit ?? null;
+    const monthDate = new Date(`${monthKey}-01T00:00:00Z`);
+    return {
+      date,
+      month: monthDate.toLocaleDateString('en-GB', {
+        month: 'long',
+        year: 'numeric',
+        timeZone: 'UTC',
+      }),
+      monthlyLimit,
+      usedThisMonth,
+      remainingThisMonth:
+        monthlyLimit === null
+          ? null
+          : Math.max(0, monthlyLimit - usedThisMonth),
+      resubmitLimit,
+      rejectedForDate,
+      // How many more times this date can be sent again after a rejection (null = unlimited).
+      remainingResubmits:
+        resubmitLimit === null
+          ? null
+          : rejectedForDate === 0
+            ? resubmitLimit
+            : Math.max(0, resubmitLimit - rejectedForDate + 1),
     };
   }
 
@@ -3310,6 +4249,12 @@ export class AttendanceService {
     if (actor.role === Role.EMPLOYEE && row.employeeId !== actor.id) {
       throw new ForbiddenException('Not authorized to view this record.');
     }
+    if (
+      actor.role === Role.HR &&
+      !(await inReviewerScope(this.scopedPrisma, actor, organizationId, row.employeeId))
+    ) {
+      throw new ForbiddenException('Not authorized to view this record.');
+    }
     if (actor.role === Role.MANAGER && row.employeeId !== actor.id) {
       await assertManagerScopeOrDelegate(
         this.scopedPrisma,
@@ -3402,7 +4347,7 @@ export class AttendanceService {
           })
         : (employee?.department ?? null);
     const shiftConfig = resolveShiftConfig(
-      department,
+      shiftDepartmentFor(department, employee ?? {}, await this.shiftRulesOf(this.scopedPrisma, organizationId)),
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? DEFAULT_ORG_TIMEZONE,
     );
@@ -3756,7 +4701,7 @@ export class AttendanceService {
       ) {
         failed.push({
           row: rowNum,
-          error: 'Invalid or missing date (expected YYYY-MM-DD)',
+          error: 'Invalid or missing date (expected DD-MM-YYYY)',
         });
         return;
       }
@@ -3803,7 +4748,7 @@ export class AttendanceService {
       if (badTime) {
         failed.push({
           row: rowNum,
-          error: `Invalid ${badTime} (expected YYYY-MM-DD HH:mm:ss, read as ${importZone ?? 'UTC'} time)`,
+          error: `Invalid ${badTime} (expected DD-MM-YYYY HH:mm:ss, read as ${importZone ?? 'UTC'} time)`,
         });
         return;
       }
@@ -4011,11 +4956,13 @@ export class AttendanceService {
           select: {
             id: true,
             employeeId: true,
+            gender: true,
             departmentId: true,
             department: true,
           },
         })
       : [];
+    const importShiftRules = await this.shiftRulesOf(this.scopedPrisma, organizationId);
     const byCode = new Map(employees.map((e) => [e.employeeId, e.id]));
     const employeeById = new Map(employees.map((e) => [e.id, e]));
 
@@ -4049,6 +4996,7 @@ export class AttendanceService {
     let skipped = 0;
     let errors = 0;
     const rowErrors: { row: number; error: string }[] = [];
+    const skippedRows: NonNullable<ImportExecutionResult['skippedRows']> = [];
 
     // Attendance has a unique constraint on (organizationId, employeeId,
     // date), but two rows sharing a key still can't safely run concurrently
@@ -4104,7 +5052,7 @@ export class AttendanceService {
         ? await this.scopedPrisma.holiday.findMany({
             where: {
               organizationId,
-              isActive: true,
+              AND: [holidayInEffect],
               date: { in: importDates },
               OR: [
                 { departmentId: null },
@@ -4162,12 +5110,11 @@ export class AttendanceService {
 
       try {
         const existing = existingByKey.get(`${empId}:${date}`) ?? null;
-        if (
-          existing &&
-          existing.source === AttendanceSource.FACE_API &&
-          existing.inTime
-        ) {
+        // What is already marked stays as it is (see import-protection.ts).
+        const skipReason = importSkipReason(existing, approvedLeaveFor(empId, date));
+        if (skipReason) {
           skipped += 1;
+          skippedRows.push({ row: rowNum, employeeId: empCode, date, reason: skipReason });
           continue;
         }
 
@@ -4204,7 +5151,7 @@ export class AttendanceService {
             ? await departmentFor(existing.departmentId)
             : (employee?.department ?? null);
         const shiftConfig = resolveShiftConfig(
-          departmentForShiftConfig,
+          shiftDepartmentFor(departmentForShiftConfig, employee ?? {}, importShiftRules),
           orgPrefs,
           org?.timezone ?? DEFAULT_ORG_TIMEZONE,
         );
@@ -4233,7 +5180,22 @@ export class AttendanceService {
           checkoutLocation: row.outLocation ? asString(row.outLocation) : null,
         };
 
-        if (existing) {
+        if (existing && isHalfLeaveStamp(existing)) {
+          // A half day of leave stays a half day of leave. The other half was worked: its times go on the day, and what it
+          // came to is remembered under the leave, which is what pays that half and what cancelling the leave restores.
+          const underLeave = {
+            inTime,
+            outTime,
+            workDurationMinutes: outcome.workDurationMinutes,
+            leaveOverriddenStatus: outcome.status,
+            leaveOverriddenSource: AttendanceSource.EXCEL_IMPORT,
+          };
+          await this.scopedPrisma.attendance.updateMany({
+            where: { id: existing.id, organizationId },
+            data: underLeave,
+          });
+          existingByKey.set(`${empId}:${date}`, { ...existing, ...underLeave });
+        } else if (existing) {
           await this.scopedPrisma.attendance.updateMany({
             where: { id: existing.id, organizationId },
             data: fields,
@@ -4286,7 +5248,7 @@ export class AttendanceService {
       }
     }
 
-    return { imported, skipped, errors, rowErrors };
+    return { imported, skipped, errors, rowErrors, skippedRows };
   }
 
   async rejectImportBatch(id: string, actor: Actor, organizationId: string) {
@@ -4357,7 +5319,7 @@ export class AttendanceService {
     const date = dto.date ?? yesterday;
     if (date > yesterday) {
       throw new BadRequestException(
-        `Absence alerts can only be sent for a day that has finished. The latest date allowed is yesterday (${yesterday}).`,
+        `Absence alerts can only be sent for a day that has finished. The latest date allowed is yesterday (${dmyText(yesterday)}).`,
       );
     }
 
@@ -4370,7 +5332,7 @@ export class AttendanceService {
         // holidays went unpaid. An Admin is on payroll like anyone else, so is swept too.
         role: { in: [Role.EMPLOYEE, Role.MANAGER, Role.HR, Role.ADMIN] },
       },
-      select: { id: true },
+      select: { id: true, exitDate: true, joiningDate: true },
     });
 
     // Attendance of a payroll month that is already locked or paid is never rewritten by a sweep: a payslip was issued
@@ -4393,6 +5355,9 @@ export class AttendanceService {
     const employeeIds: string[] = [];
     await mapWithConcurrency(employees, 8, async (employee) => {
       if (lockedEmployees.has(employee.id)) return;
+      // Serving out notice is over after the last working day: no Absent row (or alert) for days they were not employed.
+      if (!isEmployedOn(employee.exitDate, date)) return;
+      if (date < utcDateStrOf(employee.joiningDate)) return; // not yet joined
       const row = await this.recalculateAttendanceForDay(
         this.scopedPrisma,
         employee.id,
@@ -4413,6 +5378,138 @@ export class AttendanceService {
     };
   }
 
+  // A holiday was added, moved, (de)activated or deleted after the fact: the attendance already written for those dates
+  // is judged again under the calendar as it now stands (a working day becomes Holiday, or a Holiday goes back to a
+  // working day - Present, Absent, leave). Only days up to today that already have a row are touched (later days, and
+  // past days with no row, are worked out from the calendar when they are read). departmentIds: the departments the
+  // holiday applies to, null for company-wide. An employee whose payroll for that month is locked or paid is left as
+  // they are and named in the result, so the caller can warn. Quiet: no notification or e-mail.
+  async recalculateForHolidayChange(
+    organizationId: string,
+    dates: string[],
+    departmentIds: (string | null)[],
+  ): Promise<{ updated: number; locked: { name: string; date: string }[] }> {
+    const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
+    const days = [...new Set(dates)].filter((d) => d <= today);
+    if (days.length === 0) return { updated: 0, locked: [] };
+    const companyWide = departmentIds.includes(null);
+    const deptIds = departmentIds.filter((d): d is string => d !== null);
+    const rows = await this.scopedPrisma.attendance.findMany({
+      where: {
+        organizationId,
+        date: { in: days },
+        ...(companyWide ? {} : { employee: { departmentId: { in: deptIds } } }),
+      },
+      select: { employeeId: true, date: true, employee: { select: { name: true } } },
+    });
+    const lockedByMonth = new Map<string, Set<string>>();
+    for (const monthKey of new Set(rows.map((r) => r.date.slice(0, 7)))) {
+      const [y, m] = monthKey.split('-').map(Number);
+      lockedByMonth.set(
+        monthKey,
+        await lockedEmployeeIdsForMonth(this.scopedPrisma, organizationId, y, m),
+      );
+    }
+    let updated = 0;
+    const locked: { name: string; date: string }[] = [];
+    for (const row of rows) {
+      if (lockedByMonth.get(row.date.slice(0, 7))?.has(row.employeeId)) {
+        locked.push({ name: row.employee.name, date: row.date });
+        continue;
+      }
+      if (await this.rejudgeDay(row.employeeId, row.date, organizationId)) updated += 1;
+    }
+    return { updated, locked };
+  }
+
+  // Judges one written day again after the calendar or a shift changed, imported and regularized days included. Quiet:
+  // no notice or overtime suggestion. True when the day actually changed, so a count says what really happened; a
+  // payroll already calculated for that month is then marked out of date.
+  private async rejudgeDay(
+    employeeId: string,
+    date: string,
+    organizationId: string,
+  ): Promise<boolean> {
+    const before = await this.scopedPrisma.attendance.findFirst({
+      where: { organizationId, employeeId, date },
+      select: { status: true, workDurationMinutes: true, isLate: true, isEarlyOut: true },
+    });
+    const after = await this.recalculateAttendanceForDay(
+      this.scopedPrisma,
+      employeeId,
+      date,
+      organizationId,
+      { quiet: true, rejudgeStored: true },
+    );
+    const changed =
+      before?.status !== after.status ||
+      before?.workDurationMinutes !== after.workDurationMinutes ||
+      before?.isLate !== after.isLate ||
+      before?.isEarlyOut !== after.isEarlyOut;
+    if (changed) {
+      await markPayrollInputsChanged(this.scopedPrisma, organizationId, employeeId, [
+        { month: Number(date.slice(5, 7)), year: Number(date.slice(0, 4)) },
+      ]);
+    }
+    return changed;
+  }
+
+  // A gender-wise shift rule was added, changed or removed: the attendance already written from `from` up to today for the
+  // people it covers is judged again under the shift as it now stands (late, early-out, hours, overtime suggestion).
+  // genders: who the rule covers; departmentIds: empty = every department. A person whose payroll for that month is
+  // locked or paid is left as they are and named in the result. Quiet: no notification or e-mail.
+  async recalculateForShiftRule(
+    organizationId: string,
+    from: string,
+    genders: Gender[],
+    departmentIds: string[],
+    employeeIds: string[] = [],
+  ): Promise<{ updated: number; locked: { name: string; date: string }[] }> {
+    const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
+    if (from > today || (genders.length === 0 && employeeIds.length === 0)) {
+      return { updated: 0, locked: [] };
+    }
+    const rows = await this.scopedPrisma.attendance.findMany({
+      where: {
+        organizationId,
+        date: { gte: from, lte: today },
+        OR: [
+          ...(genders.length
+            ? [
+                {
+                  employee: {
+                    gender: { in: genders },
+                    ...(departmentIds.length ? { departmentId: { in: departmentIds } } : {}),
+                  },
+                },
+              ]
+            : []),
+          ...(employeeIds.length ? [{ employeeId: { in: employeeIds } }] : []),
+        ],
+      },
+      select: { employeeId: true, date: true, employee: { select: { name: true } } },
+      take: 20000,
+    });
+    const lockedByMonth = new Map<string, Set<string>>();
+    for (const monthKey of new Set(rows.map((r) => r.date.slice(0, 7)))) {
+      const [y, m] = monthKey.split('-').map(Number);
+      lockedByMonth.set(
+        monthKey,
+        new Set(await lockedEmployeeIdsForMonth(this.scopedPrisma, organizationId, y, m)),
+      );
+    }
+    let updated = 0;
+    const locked: { name: string; date: string }[] = [];
+    await mapWithConcurrency(rows, 8, async (row) => {
+      if (lockedByMonth.get(row.date.slice(0, 7))?.has(row.employeeId)) {
+        locked.push({ name: row.employee.name, date: row.date });
+        return;
+      }
+      if (await this.rejudgeDay(row.employeeId, row.date, organizationId)) updated += 1;
+    });
+    return { updated, locked };
+  }
+
   // One-off repair for the gap the nightly sweep used to leave: HR users were never swept, so on any day they did not
   // punch in there is no attendance row, and payroll counts a day with no row as unpaid (weekends and holidays
   // included). This creates the rows that are MISSING for active HR users between startDate and endDate, using the
@@ -4421,6 +5518,116 @@ export class AttendanceService {
   // Safety: it never touches a day that already has a row; skips dates before the person joined; only runs for past
   // days (up to yesterday); and is a dry run unless dryRun is explicitly false. It does NOT recalculate payroll —
   // recalculate the affected, still-open months afterwards. Inactive users are skipped (no exit date is stored).
+  // Reference holidays (a past-dated holiday calendar upload) are real holidays for attendance, so a day that is only
+  // an empty Absent row on one of them - typically from an attendance import done before the holiday was known - is
+  // turned into Holiday. Rows with any punch / time, rows on or before nothing special, rows before the person joined,
+  // and months whose payroll is locked or paid are left exactly as they are. Quiet: no notification or e-mail.
+  async applyReferenceHolidays(
+    organizationId: string,
+    actorId?: string,
+  ): Promise<{ updated: number; skippedLocked: number }> {
+    const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
+    const holidays = await this.scopedPrisma.holiday.findMany({
+      where: {
+        organizationId,
+        isReference: true,
+        isOptional: false,
+        date: { lt: today },
+      },
+      select: { date: true },
+    });
+    const dates = [...new Set(holidays.map((h) => h.date))];
+    if (dates.length === 0) return { updated: 0, skippedLocked: 0 };
+
+    const rows = await this.scopedPrisma.attendance.findMany({
+      where: {
+        organizationId,
+        date: { in: dates },
+        status: AttendanceStatus.ABSENT,
+        inTime: null,
+        outTime: null,
+      },
+      take: 20000,
+    });
+    if (rows.length === 0) return { updated: 0, skippedLocked: 0 };
+
+    const org = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+    });
+    const employees = await this.scopedPrisma.user.findMany({
+      where: {
+        organizationId,
+        id: { in: [...new Set(rows.map((r) => r.employeeId))] },
+      },
+      include: { department: true },
+    });
+    const employeeById = new Map(employees.map((e) => [e.id, e]));
+    const recalcShiftRules = await this.shiftRulesOf(this.scopedPrisma, organizationId);
+
+    const lockedByMonth = new Map<string, Set<string>>();
+    for (const monthKey of new Set(rows.map((r) => r.date.slice(0, 7)))) {
+      const [y, m] = monthKey.split('-').map(Number);
+      lockedByMonth.set(
+        monthKey,
+        new Set(
+          await lockedEmployeeIdsForMonth(
+            this.scopedPrisma,
+            organizationId,
+            y,
+            m,
+          ),
+        ),
+      );
+    }
+
+    let updated = 0;
+    let skippedLocked = 0;
+    await mapWithConcurrency(rows, 8, async (row) => {
+      const employee = employeeById.get(row.employeeId);
+      if (!employee) return;
+      if (lockedByMonth.get(row.date.slice(0, 7))?.has(row.employeeId)) {
+        skippedLocked += 1;
+        return;
+      }
+      if (row.date < utcDateStrOf(employee.joiningDate)) return;
+      const shiftConfig = resolveShiftConfig(
+        shiftDepartmentFor(employee.department, employee, recalcShiftRules),
+        org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
+        org?.timezone ?? DEFAULT_ORG_TIMEZONE,
+      );
+      const outcome = await this.deriveDayOutcome(this.scopedPrisma, {
+        organizationId,
+        employeeId: row.employeeId,
+        employeeDepartmentId: employee.departmentId,
+        dateStr: row.date,
+        shiftConfig,
+        inTime: null,
+        outTime: null,
+      });
+      if (outcome.status === AttendanceStatus.ABSENT) return;
+      await this.scopedPrisma.attendance.updateMany({
+        where: { id: row.id, organizationId },
+        data: {
+          status: outcome.status,
+          workDurationMinutes: outcome.workDurationMinutes,
+          isLate: outcome.isLate,
+          isEarlyOut: outcome.isEarlyOut,
+        },
+      });
+      updated += 1;
+    });
+    if (updated > 0 && actorId) {
+      await this.auditLogService.log({
+        actorId,
+        action: 'ATTENDANCE_REFERENCE_HOLIDAYS_APPLIED',
+        module: 'ATTENDANCE',
+        organizationId,
+        details: { updated, skippedLocked },
+      });
+    }
+    return { updated, skippedLocked };
+  }
+
   async backfillMissingAttendance(
     dto: BackfillAttendanceDto,
     actor: Actor,
@@ -4436,7 +5643,7 @@ export class AttendanceService {
     }
     if (dto.endDate > yesterday) {
       throw new BadRequestException(
-        `endDate cannot be later than yesterday (${yesterday}).`,
+        `endDate cannot be later than yesterday (${dmyText(yesterday)}).`,
       );
     }
     const dates = enumerateDateStrings(dto.startDate, dto.endDate);
@@ -4461,7 +5668,7 @@ export class AttendanceService {
     const holidays = await this.scopedPrisma.holiday.findMany({
       where: {
         organizationId,
-        isActive: true,
+        AND: [holidayInEffect],
         date: { gte: dto.startDate, lte: dto.endDate },
       },
       select: { date: true, departmentId: true },
@@ -4492,6 +5699,7 @@ export class AttendanceService {
       created: Record<string, number>;
     }[] = [];
 
+    const backfillShiftRules = await this.shiftRulesOf(this.scopedPrisma, organizationId);
     for (const user of users) {
       const joined = user.joiningDate.toISOString().slice(0, 10);
       const existing = new Set(
@@ -4519,7 +5727,7 @@ export class AttendanceService {
           lockedMonths.has(`${user.id}:${d.slice(0, 7)}`),
       ).length;
       const shiftConfig = resolveShiftConfig(
-        user.department,
+        shiftDepartmentFor(user.department, user, backfillShiftRules),
         orgPrefs,
         org?.timezone ?? DEFAULT_ORG_TIMEZONE,
       );
@@ -4599,10 +5807,12 @@ export class AttendanceService {
   @Cron('0 1 * * *')
   async markYesterdayAbsences() {
     const now = new Date();
-    const organizations = await this.scopedPrisma.organization.findMany({
+    const allOrganizations = await this.scopedPrisma.organization.findMany({
       where: { isActive: true },
       select: { id: true, timezone: true },
     });
+    // Skip companies whose Super Admin switched this module off.
+    const organizations = await keepModuleEnabled(allOrganizations, 'module.attendance');
     for (const org of organizations) {
       try {
         // Each org's own "yesterday", not one UTC-derived date shared
@@ -4621,6 +5831,54 @@ export class AttendanceService {
     }
   }
 
+  // Nightly safety net for the reference-holiday repair: an attendance import (or any other write) that landed after a
+  // past-dated holiday was known leaves empty Absent rows on it, so every organization is swept once a night. Idempotent,
+  // quiet, and it never touches locked / paid payroll months (see applyReferenceHolidays).
+  @Cron('30 2 * * *')
+  async applyReferenceHolidaysNightly() {
+    const allOrganizations = await this.scopedPrisma.organization.findMany({
+      where: { isActive: true },
+      select: { id: true },
+    });
+    // Skip companies whose Super Admin switched this module off.
+    const organizations = await keepModuleEnabled(allOrganizations, 'module.attendance');
+    for (const org of organizations) {
+      try {
+        await this.applyReferenceHolidays(org.id);
+      } catch (err) {
+        this.logger.error(
+          `applyReferenceHolidays failed for org ${org.id}`,
+          err instanceof Error ? err.stack : String(err),
+        );
+      }
+    }
+  }
+
+  // Writes (or rewrites) the Present days of an always-present employee from `from` up to yesterday, so turning the setting on today
+  // also fixes the days since the effective date. Skips months whose payroll is locked or paid, days before joining and after the last
+  // working day, and goes back at most 92 days. Returns how many days were written.
+  async backfillAlwaysPresent(employeeId: string, from: string, organizationId: string): Promise<number> {
+    const employee = await this.scopedPrisma.user.findFirst({ where: { id: employeeId, organizationId }, select: { joiningDate: true, exitDate: true } });
+    if (!employee) return 0;
+    const yesterday = yesterdayInOrgTz(await this.getOrgTimezone(organizationId), new Date());
+    const earliest = addDaysStr(yesterday, -92);
+    let day = [from, utcDateStrOf(employee.joiningDate), earliest].sort().pop() as string;
+    const locked = new Map<string, boolean>();
+    let written = 0;
+    for (; day <= yesterday; day = addDaysStr(day, 1)) {
+      if (!isEmployedOn(employee.exitDate, day)) break;
+      const monthKey = day.slice(0, 7);
+      if (!locked.has(monthKey)) {
+        const ids = await lockedEmployeeIdsForMonth(this.scopedPrisma, organizationId, Number(day.slice(0, 4)), Number(day.slice(5, 7)));
+        locked.set(monthKey, ids.has(employeeId));
+      }
+      if (locked.get(monthKey)) continue;
+      await this.recalculateAttendanceForDay(this.scopedPrisma, employeeId, day, organizationId, { quiet: true });
+      written += 1;
+    }
+    return written;
+  }
+
   // Tells employees about yesterday's absence at 08:00 in their organization's own timezone, instead of at 01:00 when the
   // mail would sit unread overnight. Runs hourly and acts only for orgs whose local hour is 8, so each org is handled
   // once a day. The day is recalculated first, so a night shift that ended after the 01:00 sweep, a late regularization
@@ -4629,10 +5887,12 @@ export class AttendanceService {
   @Cron('0 * * * *')
   async sendMorningAbsenceNotices() {
     const now = new Date();
-    const organizations = await this.scopedPrisma.organization.findMany({
+    const allOrganizations = await this.scopedPrisma.organization.findMany({
       where: { isActive: true },
       select: { id: true, timezone: true },
     });
+    // Skip companies whose Super Admin switched this module off.
+    const organizations = await keepModuleEnabled(allOrganizations, 'module.attendance');
     for (const org of organizations) {
       try {
         const localHour = Number(
@@ -4672,10 +5932,12 @@ export class AttendanceService {
   @Cron('*/5 * * * *')
   async remindUpcomingPunchOuts() {
     const now = new Date();
-    const organizations = await this.scopedPrisma.organization.findMany({
+    const allOrganizations = await this.scopedPrisma.organization.findMany({
       where: { isActive: true },
       select: { id: true },
     });
+    // Skip companies whose Super Admin switched this module off.
+    const organizations = await keepModuleEnabled(allOrganizations, 'module.attendance');
     for (const org of organizations) {
       try {
         await this.remindUpcomingPunchOutsForOrg(org.id, now);
@@ -4718,9 +5980,10 @@ export class AttendanceService {
     const orgPrefs =
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null;
 
+    const openShiftRules = await this.shiftRulesOf(this.scopedPrisma, organizationId);
     for (const row of openRows) {
       const shiftConfig = resolveShiftConfig(
-        row.employee.department,
+        shiftDepartmentFor(row.employee.department, row.employee, openShiftRules),
         orgPrefs,
         org?.timezone ?? DEFAULT_ORG_TIMEZONE,
       );
@@ -4766,7 +6029,7 @@ export class AttendanceService {
   // the leave sweep.
   @Cron('*/15 * * * *')
   async autoApprovePendingWorkArrangementsAndRegularizations() {
-    const organizations = await this.scopedPrisma.organization.findMany({
+    const allOrganizations = await this.scopedPrisma.organization.findMany({
       where: {
         isActive: true,
         OR: [
@@ -4782,6 +6045,8 @@ export class AttendanceService {
         regularizationAutoApproveHours: true,
       },
     });
+    // Skip companies whose Super Admin switched this module off.
+    const organizations = await keepModuleEnabled(allOrganizations, 'module.attendance');
     for (const org of organizations) {
       try {
         if (org.wfhAutoApproveIfNoAction) {

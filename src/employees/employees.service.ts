@@ -8,6 +8,21 @@
 // (history only — the new values still apply immediately, never on a future effectiveDate). update() writes via updateMany (not update) so the write itself is organizationId-scoped, not
 // just pre-checked by findByIdOrThrow — closing an actual tenant-isolation gap, not just a defensive
 // pre-check.
+import { placeholderEmailFor, readLoginPolicy } from '../common/no-email';
+import { inReviewerScope, reviewerScope } from '../common/dept-scope';
+import { summarizeDocumentReview, type DocumentReview } from './document-review';
+import { featureEnabledFor, sisterCompaniesOn } from '../module-access/module-gate';
+import { FieldTrackingService } from '../field-tracking/field-tracking.service';
+import { LettersService } from '../letters/letters.service';
+import { sendLetterQuietly, handleEventLetter } from '../letters/auto-letter';
+import { assertEmployeeRoom } from '../module-access/module-gate';
+import { buildOrgChart } from './org-chart';
+import {
+  compareProbation,
+  probationBucket,
+  probationDaysLeft,
+} from './probation-tracker';
+import { addMonthsYmd, probationMonthsOf } from '../organizations/org-probation-policy';
 import { EMPLOYEE_ORDER_BY } from '../common/employee-order';
 import { AttendanceService } from '../attendance/attendance.service';
 import { PayrollService } from '../payroll/payroll.service';
@@ -19,12 +34,13 @@ import {
   ForbiddenException,
   Inject,
   Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+  Optional,
+  NotFoundException, Logger } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { generatePolicyPassword } from '../common/password-policy';
-import { isEmail, isDateString } from 'class-validator';
+import { isEmail, isDateString, validateSync } from 'class-validator';
+import { plainToInstance } from 'class-transformer';
 import {
   EmploymentStatus,
   Gender,
@@ -50,6 +66,7 @@ import { escapeHtml } from '../email-templates/email-layout';
 import { mapWithConcurrency } from '../common/concurrency';
 import { skip } from '../common/pagination';
 import { CreateEmployeeDto } from './dto/create-employee.dto';
+import { BulkUpdateEmployeesDto } from './dto/bulk-update-employees.dto';
 import { UpdateEmployeeDto } from './dto/update-employee.dto';
 import { DeactivateEmployeeDto } from './dto/deactivate-employee.dto';
 import { ListEmployeesQueryDto } from './dto/list-employees-query.dto';
@@ -57,16 +74,19 @@ import { lockedFieldAttempts, stripLockedFields } from './employee-field-lock';
 import { mergePersonalData } from './personal-data';
 import {
   Actor,
-  canManagerAccessEmployee,
   collectReportingChain,
-  noDepartmentManagerScope,
-  resolveDepartmentFilter,
+  employeeDirectoryScope,
+  slimForEmployeeViewer,
 } from './employee-query-scope';
 import { PrivacyAuditService } from '../privacy/privacy-audit.service';
 import { auditSensitive } from '../common/sensitive-audit';
-import { reassignDirectReportsBeforeDeactivation } from '../common/manager-reassignment';
+import { reassignReports, reassignDirectReportsBeforeDeactivation } from '../common/manager-reassignment';
+import { assertAccountCanLeave } from '../common/account-guard';
 import { DEFAULT_EMPLOYEE_TYPES } from '../organizations/employee-types';
 import { normalizeEmail } from '../common/normalize-input';
+import { LeaveBalanceService } from '../leave-balances/leave-balance.service';
+import { dmyText } from '../payroll/format-date';
+import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
 
 const SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS ?? 10);
 // The original release's ROLES_HR_CAN_ASSIGN — hr_admin may create employee/
@@ -123,8 +143,13 @@ export const LEAVING_STATUSES: EmploymentStatus[] = [
 const DEACTIVATION_BLOCKED_MESSAGE =
   'An employee is not deactivated directly. Start their Resignation or Offboarding - the account is closed when the offboarding is completed.';
 
+/** Yes / Y / True / 1 in the import column's Live tracking cell. */
+export const wantsTracking = (v: string): boolean => ['yes', 'y', 'true', '1', 'on'].includes(v.trim().toLowerCase());
+
 @Injectable()
 export class EmployeesService {
+  private readonly logger = new Logger(EmployeesService.name);
+
   constructor(
     // The tenant-scope-extended client only — including for
     // $transaction(). Using the plain PrismaService's $transaction here
@@ -143,6 +168,10 @@ export class EmployeesService {
     private readonly privacyAudit: PrivacyAuditService,
     private readonly attendanceService: AttendanceService,
     private readonly payrollService: PayrollService,
+    private readonly lettersService: LettersService,
+    private readonly leaveBalanceService: LeaveBalanceService,
+    // Last, so tests that build the service by position keep working. Turns live tracking on / off with the usual notice, audit and consent.
+    @Optional() private readonly fieldTracking?: FieldTrackingService,
   ) {}
 
   async create(
@@ -159,6 +188,9 @@ export class EmployeesService {
   ) {
     const sendWelcomeEmail = options?.sendWelcomeEmail ?? true;
     const requestedRole = dto.role ?? Role.EMPLOYEE;
+    // Live tracking at creation: Admin / HR only, and only where the company has the feature on (checked before anything is created).
+    const wantsTracking = dto.fieldTrackingEnabled === true;
+    if (wantsTracking) await this.assertMayTrack(actor, organizationId);
     if (
       actor.role === Role.HR &&
       !ROLES_HR_CAN_ASSIGN.includes(requestedRole)
@@ -168,15 +200,33 @@ export class EmployeesService {
       );
     }
 
-    const existing = await this.usersService.findByEmail(dto.email);
+    // A person with no email gets an undeliverable placeholder login address, but only where the company allows it
+    // (Policies > Sign-in); everyone else must have a real one.
+    const hasEmail = !!dto.email;
+    if (!hasEmail) {
+      const orgPolicies = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+      if (!readLoginPolicy(orgPolicies?.policies).allowNoEmail) {
+        throw new BadRequestException('An email address is required. Switch on "People may have no email" in Organization Settings to add someone without one.');
+      }
+    }
+    const existing = hasEmail ? await this.usersService.findByEmail(dto.email as string) : null;
     if (existing) {
       throw new ConflictException('An account with this email already exists.');
     }
+    // The Super Admin may cap this company's employee count; bulk import goes through here row by row.
+    await assertEmployeeRoom(organizationId);
 
     await this.assertWorkLocationInOrg(dto.workLocationId, organizationId);
     await this.assertOrgReferences(dto, organizationId);
+    const brandId = await this.brandForNewEmployee(dto.brandId, organizationId);
+    // Extra managers beyond the primary (an Admin reports to nobody, so none).
+    const extraManagers =
+      (dto.role ?? Role.EMPLOYEE) === Role.ADMIN
+        ? []
+        : await this.cleanExtraManagers(dto.additionalReportingManagerIds, dto.reportingManagerId, undefined, organizationId);
     await this.assertContactNumberUnique(dto.contactNumber, organizationId);
 
+    const probationMonths = await this.probationMonths(organizationId);
     const generatedPassword = generatePolicyPassword();
     const hashedPassword = await bcrypt.hash(generatedPassword, SALT_ROUNDS);
 
@@ -186,12 +236,15 @@ export class EmployeesService {
         const employeeId = await this.employeeIdService.generate(
           tx,
           organizationId,
+          brandId,
         );
         return tx.user.create({
           data: {
             organizationId,
             employeeId,
-            email: dto.email,
+            brandId,
+            ...(dto.alwaysPresent ? { alwaysPresent: true, alwaysPresentFrom: dto.alwaysPresentFrom ?? null } : {}),
+            email: dto.email || placeholderEmailFor(employeeId),
             password: hashedPassword,
             name: dto.name,
             role: requestedRole,
@@ -212,9 +265,14 @@ export class EmployeesService {
             // An Admin reports to nobody: their requests are decided by an Admin, never routed to HR.
             reportingManagerId:
               requestedRole === Role.ADMIN ? undefined : dto.reportingManagerId,
+            additionalReportingManagerIds: extraManagers,
             employeeType: dto.employeeType ?? 'permanent',
             employmentStatus:
               dto.employeeType === 'probation' ? 'PROBATION' : 'ONBOARDING',
+            // A probation hire gets the end date worked out from the joining date and the company's probation length.
+            ...(dto.employeeType === 'probation' && dto.joiningDate
+              ? { probationEndDate: addMonthsYmd(String(dto.joiningDate), probationMonths) }
+              : {}),
             // personalEmail rides along at creation (rather than only via the
             // later personal-data PATCH) specifically so the welcome email
             // below always has somewhere to go on the interactive Add
@@ -305,6 +363,7 @@ export class EmployeesService {
           loginUrl: `${frontendUrl()}/login`,
         },
         { subject: `Welcome to ${companyName} HRMS`, html: fallbackHtml },
+        { brandId: user.brandId },
       );
       // Fire-and-forget: EmailService.send() already never throws (falls
       // back to a console dry-run log on any delivery failure internally),
@@ -356,7 +415,28 @@ export class EmployeesService {
       performedById: actor.id,
     });
 
-    return { employee: toSafe(user), generatedPassword };
+    // After the record exists: switch live tracking on the same way the directory does (notice to the person, audit, consent to follow).
+    let trackingOn = false;
+    if (wantsTracking && this.fieldTracking) {
+      try {
+        await this.fieldTracking.setEnabled(actor as never, [user.id], true);
+        trackingOn = true;
+      } catch (err) {
+        this.logger.warn(`Live tracking for new employee ${user.id} could not be switched on: ${(err as Error).message}`);
+      }
+    }
+
+    return { employee: toSafe(trackingOn ? { ...user, fieldTrackingEnabled: true, fieldTrackingConsentAt: null } : user), generatedPassword };
+  }
+
+  // Switching live tracking on or off is for Admin / HR, and only where the company has the feature on.
+  private async assertMayTrack(actor: { role: Role }, organizationId: string) {
+    if (actor.role !== Role.ADMIN && actor.role !== Role.HR) {
+      throw new ForbiddenException('Only Admin or HR can switch live tracking on.');
+    }
+    if (!(await featureEnabledFor(organizationId, 'feature.field_tracking'))) {
+      throw new BadRequestException('Live tracking is not switched on for this company.');
+    }
   }
 
   // One-time set-password link for welcome/resend emails: only the SHA-256 of the token is stored (same
@@ -386,6 +466,97 @@ export class EmployeesService {
   // original password can't literally be "resent" since it's hashed
   // immediately and never stored in plaintext, so this issues a fresh one
   // and invalidates the old one, same generation path as create().
+  // For someone with no email (or no personal email on file) there is nowhere to send a link, so HR gets a fresh one-time password to
+  // pass on in person. They must change it at their next sign-in. Shown once; never stored in the clear.
+  async resetPassword(id: string, actor: Actor & { id: string; role: Role }, organizationId: string) {
+    const employee = await this.findByIdOrThrow(id, organizationId);
+    if (id === actor.id) {
+      throw new BadRequestException('Use Change password in your own profile to change your own password.');
+    }
+    if (employee.role === Role.ADMIN && actor.role !== Role.ADMIN) {
+      throw new ForbiddenException('Only an Admin can reset an Admin account\'s password.');
+    }
+    const temporaryPassword = generatePolicyPassword();
+    const hashedPassword = await bcrypt.hash(temporaryPassword, SALT_ROUNDS);
+    await this.scopedPrisma.user.updateMany({
+      where: { id, organizationId },
+      data: { password: hashedPassword, mustChangePassword: true, failedLoginAttempts: 0, lockedUntil: null },
+    });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'EMPLOYEE_PASSWORD_RESET_BY_HR',
+      module: 'EMPLOYEE',
+      organizationId,
+      targetId: id,
+      details: { employeeId: employee.employeeId },
+    });
+    return { temporaryPassword, employeeId: employee.employeeId };
+  }
+
+  // New one-time passwords for several people at once, returned ONCE so HR can hand them out as a sheet. Everyone
+  // changes theirs at first sign-in. Skipped, with a reason: the caller's own record, an Admin when the caller is not
+  // one, and anyone who has left. Passwords are stored hashed and are never kept in readable form.
+  async bulkResetPasswords(ids: string[], actor: Actor & { id: string; role: Role }, organizationId: string) {
+    const people = await this.scopedPrisma.user.findMany({
+      where: { organizationId, id: { in: [...new Set(ids)] } },
+      select: { id: true, employeeId: true, name: true, email: true, role: true, isActive: true },
+    });
+    const credentials: { employeeId: string; name: string; temporaryPassword: string; loginEmail: string | null }[] = [];
+    const skipped: { employeeId: string; name: string; reason: string }[] = [];
+    const todo = people.filter((p) => {
+      const reason =
+        p.id === actor.id ? 'Your own password is changed from your profile.'
+        : p.role === Role.ADMIN && actor.role !== Role.ADMIN ? 'Only an Admin can reset an Admin account.'
+        : !p.isActive ? 'This person is no longer active.'
+        : null;
+      if (reason) skipped.push({ employeeId: p.employeeId, name: p.name, reason });
+      return !reason;
+    });
+    // Hashing is the slow part, so a few at a time.
+    for (let i = 0; i < todo.length; i += 8) {
+      await Promise.all(
+        todo.slice(i, i + 8).map(async (p) => {
+          const temporaryPassword = generatePolicyPassword();
+          const hashedPassword = await bcrypt.hash(temporaryPassword, SALT_ROUNDS);
+          await this.scopedPrisma.user.updateMany({
+            where: { id: p.id, organizationId },
+            data: { password: hashedPassword, mustChangePassword: true, failedLoginAttempts: 0, lockedUntil: null },
+          });
+          credentials.push({
+            employeeId: p.employeeId,
+            name: p.name,
+            temporaryPassword,
+            loginEmail: p.email.endsWith('.invalid') ? null : p.email,
+          });
+        }),
+      );
+    }
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'EMPLOYEE_PASSWORDS_BULK_RESET',
+      module: 'EMPLOYEE',
+      organizationId,
+      targetId: actor.id,
+      details: { count: credentials.length, employeeIds: credentials.map((c) => c.employeeId) },
+    });
+    credentials.sort((a, b) => a.employeeId.localeCompare(b.employeeId, undefined, { numeric: true }));
+    const missing = ids.length - people.length;
+    return { credentials, skipped, notFound: Math.max(0, missing) };
+  }
+
+  // A credentials sheet (Excel/PDF) was downloaded - kept in the audit trail so there is a record of who held the passwords.
+  async logCredentialsExport(count: number, source: string | undefined, actor: Actor & { id: string }, organizationId: string) {
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'CREDENTIALS_SHEET_DOWNLOADED',
+      module: 'EMPLOYEE',
+      organizationId,
+      targetId: actor.id,
+      details: { count, source: source ?? 'directory' },
+    });
+    return { logged: true };
+  }
+
   async resendCredentials(id: string, organizationId: string) {
     const employee = await this.findByIdOrThrow(id, organizationId);
     const personalEmail = (
@@ -433,6 +604,7 @@ export class EmployeesService {
         subject: `Your ${companyName} HRMS login credentials`,
         html: fallbackHtml,
       },
+      { brandId: employee.brandId },
     );
     const sent = await this.emailService.send({
       organizationId,
@@ -470,8 +642,10 @@ export class EmployeesService {
       department?: unknown;
       employeeCategory?: unknown;
       workLocation?: unknown;
+      company?: unknown;
       role?: unknown;
       employeeType?: unknown;
+      liveTracking?: unknown;
     }>,
     actor: Actor & { id: string; role: Role },
     organizationId: string,
@@ -493,7 +667,14 @@ export class EmployeesService {
     // (not the internal ids/values the manual form's Selects submit) —
     // resolved once up front rather than per row, since every row in a
     // batch is checked against the same org-wide lists.
-    const [departments, workLocationItems, employeeCategoryItems, org] =
+    // The Company column is read only when sister companies is switched on; otherwise it is ignored.
+    // A Live tracking column asking for Yes needs the feature on for the company - refused up front, before any row is created.
+    if (rows.some((r) => wantsTracking(asString(r.liveTracking)))) await this.assertMayTrack(actor, organizationId);
+    const brandsOn = await sisterCompaniesOn(organizationId);
+    const allowNoEmail = readLoginPolicy(
+      (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } }))?.policies,
+    ).allowNoEmail;
+    const [departments, workLocationItems, employeeCategoryItems, org, brandItems] =
       await Promise.all([
         this.scopedPrisma.department.findMany({
           where: { organizationId },
@@ -513,6 +694,10 @@ export class EmployeesService {
             customEmployeeTypes: true,
             inactiveBuiltinEmployeeTypes: true,
           },
+        }),
+        this.scopedPrisma.companyBrand.findMany({
+          where: { organizationId },
+          select: { id: true, name: true, isActive: true },
         }),
       ]);
     const customEmployeeTypes =
@@ -546,21 +731,23 @@ export class EmployeesService {
       const departmentName = asString(row.department).trim();
       const employeeCategoryName = asString(row.employeeCategory).trim();
       const workLocationName = asString(row.workLocation).trim();
+      const companyName = asString(row.company).trim();
       const roleInput = asString(row.role).trim();
       const employeeTypeInput = asString(row.employeeType).trim();
+      const liveTrackingInput = asString(row.liveTracking).trim().toLowerCase();
 
       if (!name) {
         failed.push({ row, error: 'Name is required.' });
         return;
       }
-      if (!email || !isEmail(email)) {
+      if (email ? !isEmail(email) : !allowNoEmail) {
         failed.push({ row, error: 'A valid email is required.' });
         return;
       }
       if (joiningDate && !isDateString(joiningDate)) {
         failed.push({
           row,
-          error: 'Joining date must be a valid date (YYYY-MM-DD).',
+          error: 'Joining date must be a valid date (DD-MM-YYYY).',
         });
         return;
       }
@@ -595,7 +782,7 @@ export class EmployeesService {
       // five fields — personalEmail is also what makes the welcome email
       // actually go out for bulk-imported rows (it was previously never
       // collected, so bulk-imported employees never got one).
-      if (!personalEmail || !isEmail(personalEmail)) {
+      if (personalEmail ? !isEmail(personalEmail) : !(allowNoEmail && !email)) {
         failed.push({ row, error: 'A valid personal email is required.' });
         return;
       }
@@ -629,6 +816,14 @@ export class EmployeesService {
           row,
           error: `Work location "${workLocationName}" not found.`,
         });
+        return;
+      }
+      // The optional Company column: matched by name against the active companies. Blank = the default company, if any.
+      const company = companyName && brandsOn
+        ? brandItems.find((b) => b.isActive && b.name.toLowerCase() === companyName.toLowerCase())
+        : undefined;
+      if (companyName && brandsOn && !company) {
+        failed.push({ row, error: `Company "${companyName}" not found or inactive.` });
         return;
       }
       if (!employeeCategoryName) {
@@ -676,23 +871,39 @@ export class EmployeesService {
         return;
       }
 
+      // The Add Employee form requires a contact number, so a row without one is refused here too.
+      if (!contactNumber) {
+        failed.push({ row, error: 'Contact number is required.' });
+        return;
+      }
+      const dto = {
+        name,
+        email: email || undefined,
+        personalEmail: personalEmail || undefined,
+        departmentId: department.id,
+        workLocationId: workLocation.id,
+        brandId: company?.id,
+        designation,
+        employeeCategory: employeeCategory.name,
+        contactNumber,
+        gender,
+        joiningDate: joiningDate || undefined,
+        selfieRequirement,
+        role,
+        employeeType: employeeType.value,
+        ...(wantsTracking(liveTrackingInput) ? { fieldTrackingEnabled: true } : {}),
+      };
+      // The same field rules the form's API enforces (name pattern and length, phone and email formats, lengths): an imported
+      // row is held to exactly what a person typing it into the form would be.
+      const problems = validateSync(plainToInstance(CreateEmployeeDto, dto), { whitelist: false });
+      if (problems.length > 0) {
+        failed.push({ row, error: problems.flatMap((p) => Object.values(p.constraints ?? {}))[0] ?? 'A field is not valid.' });
+        return;
+      }
+
       try {
         const { employee, generatedPassword } = await this.create(
-          {
-            name,
-            email,
-            personalEmail,
-            departmentId: department.id,
-            workLocationId: workLocation.id,
-            designation,
-            employeeCategory: employeeCategory.name,
-            contactNumber: contactNumber || undefined,
-            gender,
-            joiningDate: joiningDate || undefined,
-            selfieRequirement,
-            role,
-            employeeType: employeeType.value,
-          },
+          dto,
           actor,
           organizationId,
           { sendWelcomeEmail },
@@ -735,6 +946,105 @@ export class EmployeesService {
     } as unknown as T;
   }
 
+  // The company's default probation length, in months (Organization Settings > Policies; 6 when not set).
+  private async probationMonths(organizationId: string): Promise<number> {
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+    return probationMonthsOf((org?.policies as { defaultProbationMonths?: unknown } | null)?.defaultProbationMonths);
+  }
+
+  // Everyone currently on probation (or an extended one), with days left to the end date and how urgent the decision
+  // is, most urgent first - the Probation Tracker. ADMIN/HR see the whole organization; a MANAGER only their department.
+  async probationTracker(actor: Actor, organizationId: string) {
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: { timezone: true },
+    });
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const months = await this.probationMonths(organizationId);
+    // A department head (MANAGER, or HR heading departments) sees only the people they look after.
+    const scope = await reviewerScope(this.scopedPrisma, actor, organizationId);
+    const rows = await this.scopedPrisma.user.findMany({
+      where: {
+        organizationId,
+        isActive: true,
+        employmentStatus: { in: ['PROBATION', 'EXTENDED_PROBATION'] },
+        // Not someone who is leaving: there is no probation decision left to take.
+        exitDate: null,
+        ...(scope && { id: { in: scope } }),
+      },
+      select: {
+        id: true,
+        employeeId: true,
+        name: true,
+        designation: true,
+        joiningDate: true,
+        probationEndDate: true,
+        employmentStatus: true,
+        department: { select: { name: true } },
+        reportingManager: { select: { id: true, name: true } },
+      },
+    });
+    return rows
+      .map((r) => {
+        // No end date saved yet: show the expected one (joining date + the company's probation length) so the list is never blank.
+        const joined = r.joiningDate.toISOString().slice(0, 10);
+        const estimated = !r.probationEndDate;
+        const effectiveEnd = r.probationEndDate ?? addMonthsYmd(joined, months);
+        const daysLeft = probationDaysLeft(today, effectiveEnd);
+        return {
+          id: r.id,
+          employeeId: r.employeeId,
+          name: r.name,
+          designation: r.designation,
+          department: r.department?.name ?? '',
+          joiningDate: r.joiningDate.toISOString().slice(0, 10),
+          probationEndDate: effectiveEnd,
+          estimated,
+          extended: r.employmentStatus === 'EXTENDED_PROBATION',
+          reportingManager: r.reportingManager?.name ?? null,
+          daysLeft,
+          bucket: probationBucket(daysLeft),
+        };
+      })
+      .sort(compareProbation);
+  }
+
+  // The company's reporting tree for the Org Chart: current employees only (no one who has left), with just the
+  // fields a chart needs - name, designation, department and who they report to. Open to every role, like the
+  // employee list behind Reporting Structure. Besides those, only the profile photo (signed, the same one the employee
+  // list already returns to every role) so the chart can show faces; nothing else personal is included.
+  async orgChart(organizationId: string) {
+    const rows = await this.scopedPrisma.user.findMany({
+      where: {
+        organizationId,
+        isActive: true,
+        employmentStatus: { notIn: EXIT_STATUSES },
+      },
+      select: {
+        id: true,
+        employeeId: true,
+        name: true,
+        designation: true,
+        reportingManagerId: true,
+        profileImage: true,
+        department: { select: { name: true } },
+      },
+    });
+    return buildOrgChart(
+      rows.map((r) => ({
+        id: r.id,
+        employeeId: r.employeeId,
+        name: r.name,
+        designation: r.designation,
+        department: r.department?.name ?? '',
+        reportingManagerId: r.reportingManagerId,
+        profileImage: r.profileImage
+          ? `/files/${signFileToken(organizationId, r.profileImage, SESSION_ASSET_TTL_SECONDS)}`
+          : null,
+      })),
+    );
+  }
+
   async findAll(
     query: ListEmployeesQueryDto,
     actor: Actor,
@@ -753,20 +1063,25 @@ export class EmployeesService {
             actor.id,
             await this.scopedPrisma.user.findMany({
               where: { organizationId },
-              select: { id: true, reportingManagerId: true },
+              select: { id: true, reportingManagerId: true, additionalReportingManagerIds: true },
             }),
           )
         : null;
-    const departmentId = teamIds
-      ? undefined
-      : resolveDepartmentFilter(actor, query.department);
-    const noDeptScope = teamIds ? undefined : noDepartmentManagerScope(actor);
+    // Everyone else a department head (MANAGER, or HR heading departments) lists is the people they look after
+    // (see reviewerScope); a picked department only narrows that.
+    const scope =
+      teamIds || actor.role === Role.EMPLOYEE
+        ? null
+        : await reviewerScope(this.scopedPrisma, actor as { id?: string; role: Role }, organizationId);
+    const ids = teamIds ?? scope;
+    const departmentId = teamIds ? undefined : query.department;
     const where = {
       organizationId,
-      ...(teamIds && { id: { in: teamIds } }),
+      ...(ids && { id: { in: ids } }),
       ...(departmentId && { departmentId }),
-      ...(noDeptScope && { AND: [noDeptScope] }),
+      ...(employeeDirectoryScope(actor) && { AND: [employeeDirectoryScope(actor)] as object[] }),
       ...(query.role && { role: query.role }),
+      ...(query.isActive !== undefined && { isActive: query.isActive }),
       ...(query.search && {
         OR: [
           { name: { contains: query.search, mode: 'insensitive' as const } },
@@ -798,10 +1113,28 @@ export class EmployeesService {
       this.scopedPrisma.user.count({ where }),
     ]);
 
+    // Admin/HR see, per employee, how many uploaded documents are waiting for review or were rejected, so the directory can show a
+    // profile as "In review". An HR/Admin colleague's documents are for an Admin only (the same tier as their Documents tab).
+    let review = new Map<string, DocumentReview>();
+    if (actor.role === Role.ADMIN || actor.role === Role.HR) {
+      const reviewable = rows.filter((r) => actor.id === r.id || actor.role === Role.ADMIN || !(r.role === Role.ADMIN || r.role === Role.HR));
+      if (reviewable.length > 0) {
+        review = summarizeDocumentReview(
+          await this.scopedPrisma.employeeDocument.findMany({
+            where: { organizationId, employeeId: { in: reviewable.map((r) => r.id) }, category: 'DOCUMENT', status: { in: ['PENDING', 'REJECTED'] } },
+            select: { employeeId: true, status: true },
+          }),
+        );
+      }
+    }
+
     return {
-      data: rows.map((r) =>
-        this.forViewer(toSafe(r, maskFor(actor, r.id)), r.id, actor),
-      ),
+      data: rows.map((r) => ({
+        ...(actor.role === Role.EMPLOYEE && r.id !== actor.id
+          ? slimForEmployeeViewer(this.forViewer(toSafe(r, maskFor(actor, r.id)), r.id, actor))
+          : this.forViewer(toSafe(r, maskFor(actor, r.id)), r.id, actor)),
+        ...(review.has(r.id) ? { documentReview: review.get(r.id) } : {}),
+      })),
       total,
       page: query.page,
       limit: query.limit,
@@ -810,17 +1143,12 @@ export class EmployeesService {
 
   async findOne(id: string, actor: Actor, organizationId: string) {
     const employee = await this.findByIdOrThrow(id, organizationId);
-    const noDeptScope = noDepartmentManagerScope(actor);
-    const ownOrDirectReport =
-      !!noDeptScope &&
-      !!actor.id &&
-      (employee.id === actor.id || employee.reportingManagerId === actor.id);
     if (
-      !ownOrDirectReport &&
-      !canManagerAccessEmployee(actor, employee.departmentId)
+      actor.role !== Role.EMPLOYEE &&
+      !(await inReviewerScope(this.scopedPrisma, actor, organizationId, employee.id))
     ) {
       throw new ForbiddenException(
-        'You can only view employees in your own department.',
+        'You can only view employees in the departments you head or who report to you.',
       );
     }
     // Personal data of another employee read by HR/ADMIN/MANAGER — record who looked at whom (never the values).
@@ -837,7 +1165,15 @@ export class EmployeesService {
         },
       );
     }
-    return toSafe(employee, maskFor(actor, employee.id));
+    // Names for the extra reporting managers, so the profile can show them without a second lookup.
+    const extraIds = employee.additionalReportingManagerIds ?? [];
+    const additionalReportingManagers = extraIds.length
+      ? await this.scopedPrisma.user.findMany({
+          where: { id: { in: extraIds }, organizationId },
+          select: { id: true, name: true, employeeId: true },
+        })
+      : [];
+    return { ...toSafe(employee, maskFor(actor, employee.id)), additionalReportingManagers };
   }
 
   async update(
@@ -871,8 +1207,13 @@ export class EmployeesService {
       effectiveDate,
       changeReason,
       isPromotion,
+      fieldTrackingEnabled,
       ...updateFields
     } = dto;
+    // Live tracking is applied through FieldTrackingService after the save, and only when it actually changes.
+    const trackingChange =
+      fieldTrackingEnabled !== undefined && fieldTrackingEnabled !== before.fieldTrackingEnabled ? fieldTrackingEnabled : undefined;
+    if (trackingChange !== undefined) await this.assertMayTrack(actor, organizationId);
     // Department, designation, employee category and work location are required on every employee, so an edit
     // cannot blank one that is set (a blank sent for one that is already empty is a no-op).
     const requiredFields: [string, string][] = [
@@ -907,7 +1248,16 @@ export class EmployeesService {
       );
     }
     const clean = stripLockedFields(updateFields, actor.role);
+    // Always-present: switching it on starts today unless a date is given; switching it off clears the date.
+    if (clean.alwaysPresent === true && !clean.alwaysPresentFrom && !before.alwaysPresentFrom) {
+      const tz = (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata';
+      clean.alwaysPresentFrom = todayInOrgTz(tz);
+    }
+    if (clean.alwaysPresent === false) (clean as Record<string, unknown>).alwaysPresentFrom = null;
     await this.assertWorkLocationInOrg(clean.workLocationId, organizationId);
+    // The company brand may be changed, never to an inactive or foreign one; the employee ID is untouched either way.
+    if (clean.brandId !== undefined && !(await sisterCompaniesOn(organizationId))) delete clean.brandId;
+    if (clean.brandId && clean.brandId !== before.brandId) await this.assertBrandUsable(clean.brandId, organizationId);
     await this.assertOrgReferences(
       clean,
       organizationId,
@@ -925,6 +1275,9 @@ export class EmployeesService {
     // can set it to. Without this check, HR could PATCH an employee's role
     // straight to ADMIN even though they're blocked from doing so at
     // creation time.
+    if (clean.role !== undefined && clean.role !== Role.ADMIN && before.role === Role.ADMIN) {
+      await assertAccountCanLeave(this.scopedPrisma, id, organizationId);
+    }
     if (
       actor.role === Role.HR &&
       clean.role !== undefined &&
@@ -1003,6 +1356,8 @@ export class EmployeesService {
       }
     }
     if (reinstating) {
+      // Bringing someone back counts as adding an employee (checked against the company's cap).
+      await assertEmployeeRoom(organizationId);
       // Reopening the account is part of the same save, so the status and the account never disagree.
       Object.assign(clean, { isActive: true });
     }
@@ -1014,6 +1369,40 @@ export class EmployeesService {
     const statusChanging =
       clean.employmentStatus !== undefined &&
       clean.employmentStatus !== before.employmentStatus;
+    // An exit in progress (an open offboarding case) is ended in Offboarding, not by editing the status: moving them to a
+    // working status here left the case, its last working day and the final settlement running behind a status that
+    // said they were staying.
+    if (
+      statusChanging &&
+      !LEAVING_STATUSES.includes(clean.employmentStatus as EmploymentStatus)
+    ) {
+      const openCase = await this.scopedPrisma.offboardingCase.findFirst({
+        where: {
+          organizationId,
+          employeeId: id,
+          status: { in: ['INITIATED', 'IN_PROGRESS'] },
+        },
+        select: { lastWorkingDay: true },
+      });
+      if (openCase) {
+        throw new BadRequestException(
+          `This employee's exit is in progress (last working day ${dmyText(openCase.lastWorkingDay.slice(0, 10))}). Cancel it in Offboarding to keep them - that also puts their status back.`,
+        );
+      }
+    }
+    // Onboarding is the status a new hire starts with; someone already on probation or confirmed does not go back to it
+    // (it undid their confirmation and re-sent letters on the way forward again).
+    if (
+      statusChanging &&
+      clean.employmentStatus === 'ONBOARDING' &&
+      ['PROBATION', 'EXTENDED_PROBATION', 'CONFIRMED'].includes(
+        before.employmentStatus,
+      )
+    ) {
+      throw new BadRequestException(
+        'An employee on probation or confirmed cannot be moved back to Onboarding.',
+      );
+    }
     // HR cannot move their own employment status (confirm their own probation, put themselves on hold or into
     // notice): another HR user or an Admin has to. An Admin is the top authority with no one above, so an Admin may -
     // same split as salary revision. The change is still in the status history and the audit log.
@@ -1050,11 +1439,65 @@ export class EmployeesService {
       clean.employmentStatus === 'EXTENDED_PROBATION'
     ) {
       Object.assign(clean, { probationStatus: 'EXTENDED' });
+    } else if (statusChanging && clean.employmentStatus === 'PROBATION') {
+      // Back on (or newly on) probation: the decision is pending again, so reminders and the tracker pick them up.
+      Object.assign(clean, { probationStatus: 'PENDING' });
+    }
+
+    // The confirmation date follows the status: moving to Confirmed stamps today (unless one was given), moving back to a
+    // probation / onboarding status clears it, and a given date has to belong to a Confirmed employee between joining and today.
+    {
+      const resultingStatus = (clean.employmentStatus ?? before.employmentStatus) as EmploymentStatus;
+      const orgTz = (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata';
+      const today = todayInOrgTz(orgTz);
+      if (statusChanging && resultingStatus === 'CONFIRMED' && clean.confirmationDate === undefined) {
+        Object.assign(clean, { confirmationDate: today });
+      } else if (statusChanging && ['ONBOARDING', 'PROBATION', 'EXTENDED_PROBATION'].includes(resultingStatus) && clean.confirmationDate === undefined) {
+        Object.assign(clean, { confirmationDate: null });
+      }
+      // Confirmation moves a probation-type employee to Permanent, so leave types and rules set for Permanent apply to them. An
+      // explicitly chosen different type is respected.
+      if (statusChanging && resultingStatus === 'CONFIRMED' && before.employeeType === 'probation' && (clean.employeeType === undefined || clean.employeeType === 'probation')) {
+        Object.assign(clean, { employeeType: 'permanent' });
+      }
+      // Moving a Permanent employee onto probation puts them on the Probation type, so leave types set for probation apply.
+      if (statusChanging && ['PROBATION', 'EXTENDED_PROBATION'].includes(resultingStatus) && before.employeeType === 'permanent' && (clean.employeeType === undefined || clean.employeeType === 'permanent')) {
+        Object.assign(clean, { employeeType: 'probation' });
+      }
+      // Moving onto probation with no end date saved: work it out from the joining date and the company's probation length.
+      if (statusChanging && resultingStatus === 'PROBATION' && clean.probationEndDate === undefined && !before.probationEndDate) {
+        Object.assign(clean, { probationEndDate: addMonthsYmd(before.joiningDate.toISOString().slice(0, 10), await this.probationMonths(organizationId)) });
+      }
+      if (typeof clean.probationEndDate === 'string') {
+        if (!['PROBATION', 'EXTENDED_PROBATION'].includes(resultingStatus)) {
+          throw new BadRequestException('A probation end date can only be set for someone on probation.');
+        }
+        if (clean.probationEndDate <= before.joiningDate.toISOString().slice(0, 10)) {
+          throw new BadRequestException('The probation end date must be after the joining date.');
+        }
+      }
+      if (typeof clean.confirmationDate === 'string') {
+        if (resultingStatus !== 'CONFIRMED') {
+          throw new BadRequestException('A confirmation date can only be set for a Confirmed employee.');
+        }
+        const joined = before.joiningDate.toISOString().slice(0, 10);
+        if (clean.confirmationDate < joined || clean.confirmationDate > today) {
+          throw new BadRequestException('The confirmation date must be between the joining date and today.');
+        }
+      }
     }
 
     // An Admin reports to nobody: whenever the resulting role is Admin the reporting manager is cleared.
     if ((clean.role ?? before.role) === Role.ADMIN) {
-      Object.assign(clean, { reportingManagerId: null });
+      Object.assign(clean, { reportingManagerId: null, additionalReportingManagerIds: [] });
+    } else if (clean.additionalReportingManagerIds !== undefined || clean.reportingManagerId) {
+      // Extra managers: validated like the primary, never the person themself or the primary, no cycles. When only the
+      // primary changes (an older client), a new primary that was already an extra manager is simply moved up.
+      const primary = clean.reportingManagerId !== undefined ? clean.reportingManagerId : before.reportingManagerId;
+      const wanted = clean.additionalReportingManagerIds ?? before.additionalReportingManagerIds ?? [];
+      const extras = await this.cleanExtraManagers(wanted, primary, id, organizationId);
+      for (const m of extras) await this.assertNoReportingCycle(id, m, organizationId);
+      Object.assign(clean, { additionalReportingManagerIds: extras });
     }
 
     // Reporting manager: no self-reporting and no cycles in the chain.
@@ -1066,11 +1509,13 @@ export class EmployeesService {
       );
     }
 
-    // Joining date: a one-time correction, never after payroll has been processed for the employee.
+    // Joining date: HR gets a one-time correction, an Admin can correct it as often as needed; never after payroll has
+    // been processed for the employee.
     const joiningDateChange = await this.assertJoiningDateChangeAllowed(
       before,
       clean.joiningDate,
       organizationId,
+      actor.role,
     );
 
     // Deactivating (not reactivating) someone who's still another active
@@ -1078,6 +1523,8 @@ export class EmployeesService {
     // reports first — otherwise they're left pointing at a manager who can
     // no longer even log in.
     if (clean.isActive === false && before.isActive) {
+      // The registered account and the last active Admin must stay (Control Panel needs an active Admin per company).
+      await assertAccountCanLeave(this.scopedPrisma, id, organizationId);
       await reassignDirectReportsBeforeDeactivation(
         {
           scopedPrisma: this.scopedPrisma,
@@ -1106,6 +1553,9 @@ export class EmployeesService {
             ? new Date(clean.joiningDate)
             : undefined,
           joiningDateChangedAt: joiningDateChange ? new Date() : undefined,
+          // Bringing someone back (or reopening the account) ends the exit: its last working day must stop hiding them
+          // from the trackers and cutting their payroll short.
+          ...(clean.isActive === true && !before.isActive ? { exitDate: null } : {}),
         },
       });
     } catch (err) {
@@ -1200,6 +1650,59 @@ export class EmployeesService {
       targetId: id,
       details: { fields: changedFieldKeys, changes },
     });
+
+    // Newly marked (or the start date moved): write the Present days since the effective date. Best-effort - the nightly sweep covers it too.
+    if (clean.alwaysPresent === true && (!before.alwaysPresent || (clean.alwaysPresentFrom && clean.alwaysPresentFrom !== before.alwaysPresentFrom))) {
+      try {
+        await this.attendanceService.backfillAlwaysPresent(id, (clean.alwaysPresentFrom ?? before.alwaysPresentFrom) as string, organizationId);
+      } catch (err) {
+        this.logger.warn(`Always-present backfill for ${id} failed: ${(err as Error).message}`);
+      }
+    }
+
+    if (trackingChange !== undefined && this.fieldTracking) {
+      await this.fieldTracking.setEnabled(actor as never, [id], trackingChange);
+    }
+    // Moving a tracked person to another department or role switches tracking off (an office move should not leave a phone
+    // reporting a location). HR can turn it back on in the same breath by setting the switch in this very edit, or later.
+    if (
+      before.fieldTrackingEnabled &&
+      trackingChange === undefined &&
+      before.isActive &&
+      this.fieldTracking
+    ) {
+      const departmentMoved =
+        clean.departmentId !== undefined &&
+        clean.departmentId !== before.departmentId;
+      const roleMoved = clean.role !== undefined && clean.role !== before.role;
+      if (departmentMoved || roleMoved) {
+        try {
+          await this.fieldTracking.stopForChange(
+            organizationId,
+            id,
+            departmentMoved ? 'department_changed' : 'role_changed',
+            actor.id,
+            { tellPerson: true },
+          );
+        } catch (err) {
+          this.logger.warn(
+            `Stopping live tracking for ${id} failed: ${(err as Error).message}`,
+          );
+        }
+      }
+    }
+
+    // The probation outcome letter goes out with the decision (confirmation, or the extension notice), so HR does not have
+    // to generate it. Only when the status actually changed to that outcome; quiet on failure (see sendLetterQuietly).
+    if (statusChanging && before.isActive) {
+      const letter =
+        clean.employmentStatus === 'CONFIRMED'
+          ? 'confirmationLetter'
+          : clean.employmentStatus === 'EXTENDED_PROBATION'
+            ? 'probationExtensionLetter'
+            : null;
+      if (letter) await sendLetterQuietly(this.lettersService, this.logger, id, letter, actor as never, organizationId);
+    }
 
     return toSafe(await this.findByIdOrThrow(id, organizationId));
   }
@@ -1319,6 +1822,12 @@ export class EmployeesService {
     }
     await this.scopedPrisma.employeeMovement.createMany({ data: rows });
 
+    const eventLetterDeps = { letters: this.lettersService, logger: this.logger, prisma: this.scopedPrisma };
+    if ((designationChanged || gradeChanged) && meta.isPromotion) {
+      void handleEventLetter(eventLetterDeps, { employeeId: before.id, key: 'promotionLetter', actorId: changedById, organizationId });
+    } else if (departmentChanged || locationChanged) {
+      void handleEventLetter(eventLetterDeps, { employeeId: before.id, key: 'transferLetter', actorId: changedById, organizationId });
+    }
     if ((designationChanged || gradeChanged) && meta.isPromotion) {
       await this.timelineService.logEvent({
         organizationId,
@@ -1417,6 +1926,9 @@ export class EmployeesService {
           previousStatus: before.employmentStatus,
           newStatus: clean.employmentStatus,
           changedById,
+          ...(clean.employeeType !== undefined && clean.employeeType !== before.employeeType
+            ? { note: `Employee type changed from ${before.employeeType} to ${clean.employeeType}.` }
+            : {}),
         },
       });
       // Generic fallback event for direct employmentStatus edits through
@@ -1424,11 +1936,15 @@ export class EmployeesService {
       // confirm/extend, offboarding) log their own specific eventKey
       // instead via their own services, so this only fires for the
       // plain PATCH /employees/:id path.
+      const label = (v: string) => { const t = v.toLowerCase().replace(/_/g, ' '); return t.charAt(0).toUpperCase() + t.slice(1); };
       await this.timelineService.logEvent({
         organizationId,
         employeeId: before.id,
         eventKey: 'EMPLOYEE_UPDATED',
         performedById: changedById,
+        description:
+          `Employment status changed from ${label(before.employmentStatus)} to ${label(clean.employmentStatus)}.` +
+          (clean.employeeType !== undefined && clean.employeeType !== before.employeeType ? ` Employee type changed to ${clean.employeeType}.` : ''),
       });
     }
   }
@@ -1456,6 +1972,24 @@ export class EmployeesService {
   // DEACTIVATION_BLOCKED_MESSAGE). Closing the account is the last step of Offboarding, which settles the final pay
   // first and records the exit.
   // eslint-disable-next-line @typescript-eslint/require-await -- only ever throws, but stays async so callers get a rejected promise
+  /** Reassign all of a manager's active reports (primary or additional) to a replacement manager at once. */
+  async reassignAllReports(
+    managerId: string,
+    newManagerId: string,
+    actor: Actor & { id: string },
+    organizationId: string,
+  ) {
+    const manager = await this.scopedPrisma.user.findFirst({ where: { id: managerId, organizationId }, select: { id: true } });
+    if (!manager) throw new NotFoundException('Employee not found.');
+    return reassignReports(
+      { scopedPrisma: this.scopedPrisma, timelineService: this.timelineService, auditLogService: this.auditLogService },
+      managerId,
+      newManagerId,
+      organizationId,
+      actor.id,
+    );
+  }
+
   async deactivate(
     id: string,
     dto: DeactivateEmployeeDto,
@@ -1485,8 +2019,8 @@ export class EmployeesService {
   }
 
   // Returns the change descriptor when joiningDate really changes (null when it is absent/unchanged).
-  // Allowed once per employee, and only while no payroll for them is past the editable
-  // draft/calculated stage - a verified/approved/locked/paid run is final, so the date is frozen.
+  // Allowed once per employee for HR, any number of times for an Admin, and only while no payroll for them is past the
+  // editable draft/calculated stage - a verified/approved/locked/paid run is final, so the date is frozen for everyone.
   private async assertJoiningDateChangeAllowed(
     before: {
       id: string;
@@ -1495,13 +2029,14 @@ export class EmployeesService {
     },
     newDateStr: string | undefined,
     organizationId: string,
+    actorRole: Role,
   ): Promise<{ newDate: string } | null> {
     if (!newDateStr) return null;
     const newDate = newDateStr.slice(0, 10);
     if (newDate === before.joiningDate.toISOString().slice(0, 10)) return null;
-    if (before.joiningDateChangedAt) {
+    if (before.joiningDateChangedAt && actorRole !== Role.ADMIN) {
       throw new BadRequestException(
-        'The joining date has already been changed once and cannot be changed again.',
+        'The joining date has already been changed once. Only an Admin can change it again.',
       );
     }
     const processed = await this.scopedPrisma.payrollRun.findFirst({
@@ -1614,6 +2149,25 @@ export class EmployeesService {
       organizationId,
     );
 
+    // This year's leave was credited for the old joining date: someone created with a wrong date (e.g. 01-01-2000) got
+    // the whole annual quota, and moving the date to this year has to cut it to the prorated share (and the other way
+    // round). Unlike a leave-type edit, this sets the credit to exactly what the new date earns, even when leave already
+    // taken or booked exceeds it (the balance then shows the shortfall) - keeping the higher figure left days the new
+    // joining date had not earned.
+    const leaveTypes = await this.scopedPrisma.leaveType.findMany({
+      where: { organizationId, isActive: true },
+    });
+    await this.scopedPrisma.$transaction(async (tx) => {
+      for (const leaveType of leaveTypes) {
+        await this.leaveBalanceService.reconcileUpfrontCredit(
+          tx,
+          leaveType,
+          organizationId,
+          { employeeIds: [before.id], exact: true },
+        );
+      }
+    });
+
     // Recalculate only the months that have an open (draft/calculated) payroll run in the affected range.
     const from = (newDate < oldDate ? newDate : oldDate).slice(0, 7);
     const to = (newDate < oldDate ? oldDate : newDate).slice(0, 7);
@@ -1705,6 +2259,29 @@ export class EmployeesService {
         });
       current = row?.reportingManagerId ?? null;
     }
+  }
+
+  // The additional reporting managers to store: each must be an active Admin, HR or Manager of this organisation; the
+  // employee themself, the primary manager and duplicates are dropped.
+  private async cleanExtraManagers(
+    ids: string[] | undefined,
+    primaryId: string | null | undefined,
+    selfId: string | undefined,
+    organizationId: string,
+  ): Promise<string[]> {
+    const wanted = [...new Set((ids ?? []).filter((x) => !!x && x !== selfId && x !== primaryId))];
+    if (wanted.length === 0) return [];
+    const found = await this.scopedPrisma.user.findMany({
+      where: { id: { in: wanted }, organizationId, isActive: true },
+      select: { id: true, role: true },
+    });
+    if (found.length !== wanted.length) {
+      throw new BadRequestException('One of the additional reporting managers was not found.');
+    }
+    if (found.some((m) => m.role === Role.EMPLOYEE)) {
+      throw new BadRequestException('Every reporting manager must be an Admin, HR or Manager.');
+    }
+    return wanted;
   }
 
   // departmentId / reportingManagerId must reference a row of the caller's
@@ -1804,6 +2381,119 @@ export class EmployeesService {
   }
 
   // workLocationId (nullable override) must reference a location of the same organization.
+  // Gives several employees the same company (or none) in one go. Only the tag changes: employee IDs and past payslips never do.
+  // HR cannot change an Admin's record (the same rule as editing one), so those rows are skipped and counted.
+  async bulkSetCompany(
+    employeeIds: string[],
+    brandId: string | null,
+    actor: Actor & { id: string; role: Role },
+    organizationId: string,
+  ) {
+    if (!(await sisterCompaniesOn(organizationId))) {
+      throw new ForbiddenException('Sister companies is not switched on for your company.');
+    }
+    if (brandId) await this.assertBrandUsable(brandId, organizationId);
+    const targets = await this.scopedPrisma.user.findMany({
+      where: { id: { in: employeeIds }, organizationId },
+      select: { id: true, role: true },
+    });
+    const allowed = targets.filter((t) => actor.role === Role.ADMIN || t.role !== Role.ADMIN);
+    if (allowed.length > 0) {
+      await this.scopedPrisma.user.updateMany({ where: { id: { in: allowed.map((t) => t.id) }, organizationId }, data: { brandId } });
+    }
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'EMPLOYEES_COMPANY_SET',
+      module: 'EMPLOYEE',
+      organizationId,
+      targetId: brandId ?? 'none',
+      details: { brandId, employeeIds: allowed.map((t) => t.id) },
+    });
+    return { updated: allowed.length, skipped: employeeIds.length - allowed.length };
+  }
+
+  async bulkUpdate(
+    dto: BulkUpdateEmployeesDto,
+    actor: Actor & { id: string; role: Role },
+    organizationId: string,
+  ) {
+    const { employeeIds, ...changes } = dto;
+    const patch = Object.fromEntries(Object.entries(changes).filter(([, v]) => v !== undefined && v !== '')) as Partial<UpdateEmployeeDto>;
+    if (Object.keys(patch).length === 0) throw new BadRequestException('Choose at least one thing to change.');
+    if (patch.reportingManagerId && employeeIds.includes(patch.reportingManagerId)) {
+      throw new BadRequestException('A person cannot be moved under themselves. Remove them from the selection or pick another manager.');
+    }
+    const updated: string[] = [];
+    const failed: { employeeId: string; name: string; error: string }[] = [];
+    for (const id of employeeIds) {
+      try {
+        await this.update(id, patch as UpdateEmployeeDto, actor, organizationId);
+        updated.push(id);
+      } catch (err) {
+        const target = await this.scopedPrisma.user.findFirst({ where: { id, organizationId }, select: { name: true } });
+        failed.push({ employeeId: id, name: target?.name ?? 'Unknown', error: err instanceof Error ? err.message : 'Could not be updated.' });
+      }
+    }
+    return { updated: updated.length, failed };
+  }
+
+  // Marks several employees always-present (or normal) in one go. HR cannot change an Admin's record, so those are skipped and counted.
+  async bulkSetAlwaysPresent(
+    employeeIds: string[],
+    alwaysPresent: boolean,
+    from: string | undefined,
+    actor: Actor & { id: string; role: Role },
+    organizationId: string,
+  ) {
+    const tz = (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata';
+    const start = from ?? todayInOrgTz(tz);
+    const targets = await this.scopedPrisma.user.findMany({ where: { id: { in: employeeIds }, organizationId }, select: { id: true, role: true } });
+    const allowed = targets.filter((t) => actor.role === Role.ADMIN || t.role !== Role.ADMIN);
+    if (allowed.length > 0) {
+      await this.scopedPrisma.user.updateMany({
+        where: { id: { in: allowed.map((t) => t.id) }, organizationId },
+        data: { alwaysPresent, alwaysPresentFrom: alwaysPresent ? start : null },
+      });
+    }
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'EMPLOYEES_ALWAYS_PRESENT_SET',
+      module: 'EMPLOYEE',
+      organizationId,
+      targetId: 'bulk',
+      details: { alwaysPresent, from: alwaysPresent ? start : null, employeeIds: allowed.map((t) => t.id) },
+    });
+    if (alwaysPresent) {
+      for (const t of allowed) {
+        try {
+          await this.attendanceService.backfillAlwaysPresent(t.id, start, organizationId);
+        } catch (err) {
+          this.logger.warn(`Always-present backfill for ${t.id} failed: ${(err as Error).message}`);
+        }
+      }
+    }
+    return { updated: allowed.length, skipped: employeeIds.length - allowed.length };
+  }
+
+  // A new employee gets the brand picked, else the default brand (if there is one), else none. null means none, even with a default.
+  private async brandForNewEmployee(brandId: string | null | undefined, organizationId: string): Promise<string | null> {
+    // Sister companies switched off: no new employee is tagged, and the company's own ID series is used.
+    if (!(await sisterCompaniesOn(organizationId))) return null;
+    if (brandId === null) return null;
+    if (brandId) {
+      await this.assertBrandUsable(brandId, organizationId);
+      return brandId;
+    }
+    const fallback = await this.scopedPrisma.companyBrand.findFirst({ where: { organizationId, isDefault: true, isActive: true }, select: { id: true } });
+    return fallback?.id ?? null;
+  }
+
+  private async assertBrandUsable(brandId: string, organizationId: string) {
+    const brand = await this.scopedPrisma.companyBrand.findFirst({ where: { id: brandId, organizationId }, select: { isActive: true } });
+    if (!brand) throw new BadRequestException('The specified company was not found.');
+    if (!brand.isActive) throw new BadRequestException('That company is inactive. Pick an active one.');
+  }
+
   private async assertWorkLocationInOrg(
     workLocationId: string | null | undefined,
     organizationId: string,

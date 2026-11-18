@@ -73,6 +73,11 @@ class BulkEmployeeRowDto {
   @IsOptional()
   workLocation?: unknown;
 
+  // Optional: the company (sister-company name) to give the employee; blank = the default company, if any.
+  @ApiPropertyOptional()
+  @IsOptional()
+  company?: unknown;
+
   @ApiPropertyOptional()
   @IsOptional()
   role?: unknown;
@@ -80,6 +85,11 @@ class BulkEmployeeRowDto {
   @ApiPropertyOptional()
   @IsOptional()
   employeeType?: unknown;
+
+  // Optional Yes / No: live tracking for this person (only when the company has the feature on).
+  @ApiPropertyOptional()
+  @IsOptional()
+  liveTracking?: unknown;
 }
 
 export class BulkCreateEmployeesDto {

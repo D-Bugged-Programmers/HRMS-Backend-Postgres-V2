@@ -1,3 +1,4 @@
+import { HealthController } from './health.controller';
 import {
   MiddlewareConsumer,
   Module,
@@ -38,6 +39,7 @@ import { TaxSlabsModule } from './tax-slabs/tax-slabs.module';
 import { TaxDeclarationsModule } from './tax-declarations/tax-declarations.module';
 import { AttendanceModule } from './attendance/attendance.module';
 import { OvertimeModule } from './overtime/overtime.module';
+import { FieldTrackingModule } from './field-tracking/field-tracking.module';
 import { PerformanceRatingsModule } from './performance-ratings/performance-ratings.module';
 import { SelfReviewsModule } from './self-reviews/self-reviews.module';
 import { CompanyPerformanceModule } from './company-performance/company-performance.module';
@@ -57,23 +59,31 @@ import { AuditLogModule } from './audit-log/audit-log.module';
 import { EmployeeTimelineModule } from './employee-timeline/employee-timeline.module';
 import { ApprovalDelegationModule } from './approval-delegation/approval-delegation.module';
 import { DocumentsModule } from './documents/documents.module';
-import { PolicyAssistantModule } from './policy-assistant/policy-assistant.module';
+import { AskHrModule } from './ask-hr/ask-hr.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { ApprovalsDigestModule } from './approvals-digest/approvals-digest.module';
 import { ScheduledRemindersModule } from './scheduled-reminders/scheduled-reminders.module';
 import { HrEventsModule } from './hr-events/hr-events.module';
 import { EmailTemplatesModule } from './email-templates/email-templates.module';
 import { OrgListItemsModule } from './org-list-items/org-list-items.module';
+import { CustomFieldsModule } from './custom-fields/custom-fields.module';
+import { ControlCenterModule } from './control-center/control-center.module';
 import { WorkSchedulesModule } from './work-schedules/work-schedules.module';
 import { LettersModule } from './letters/letters.module';
+import { JoiningModule } from './joining/joining.module';
+import { OrgHealthModule } from './org-health/org-health.module';
+import { CompanyBrandsModule } from './company-brands/company-brands.module';
 import { LetterTemplatesModule } from './letter-templates/letter-templates.module';
 import { LeaveTrackerModule } from './leave-tracker/leave-tracker.module';
 import { PrivacyModule } from './privacy/privacy.module';
+import { AccessControlModule } from './access-control/access-control.module';
 import { AssetsModule } from './assets/assets.module';
 import { PlatformInternalModule } from './platform-internal/platform-internal.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
 import { PasswordRotationGuard } from './common/guards/password-rotation.guard';
+import { ModuleAccessModule } from './module-access/module-access.module';
+import { ModuleGuard } from './module-access/module.guard';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 
 @Module({
@@ -133,6 +143,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     TaxDeclarationsModule,
     AttendanceModule,
     OvertimeModule,
+    FieldTrackingModule,
     PerformanceRatingsModule,
     SelfReviewsModule,
     CompanyPerformanceModule,
@@ -144,6 +155,9 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     LoansModule,
     SettlementsModule,
     OffboardingModule,
+    JoiningModule,
+    OrgHealthModule,
+    CompanyBrandsModule,
     ResignationsModule,
     DashboardModule,
     ReportsModule,
@@ -152,22 +166,26 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     EmployeeTimelineModule,
     ApprovalDelegationModule,
     DocumentsModule,
-    PolicyAssistantModule,
+    AskHrModule,
     NotificationsModule,
     HrEventsModule,
     ApprovalsDigestModule,
     ScheduledRemindersModule,
     EmailTemplatesModule,
     OrgListItemsModule,
+    CustomFieldsModule,
+    ControlCenterModule,
+    ModuleAccessModule,
     WorkSchedulesModule,
     LettersModule,
     LetterTemplatesModule,
     LeaveTrackerModule,
     PrivacyModule,
+    AccessControlModule,
     AssetsModule,
     PlatformInternalModule,
   ],
-  controllers: [AppController],
+  controllers: [AppController, HealthController],
   providers: [
     AppService,
     // Every route requires a valid access token by default; @Public()
@@ -195,6 +213,8 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     // but nothing enforced it server-side: an emailed temporary password
     // could drive the whole API without ever being rotated.
     { provide: APP_GUARD, useClass: PasswordRotationGuard },
+    // Refuses routes of a module the company's Super Admin switched off (module.* flags in the Control Center).
+    { provide: APP_GUARD, useClass: ModuleGuard },
     // Every error response (HttpException or not) comes out in one
     // consistent {statusCode, message, error, path, timestamp} shape —
     // see the filter for why message/error are preserved as Nest

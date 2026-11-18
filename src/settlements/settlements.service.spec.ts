@@ -18,9 +18,12 @@ interface Opts {
   openCase?: Row | null;
   resignation?: Row | null;
   defaultNotice?: number;
+  policies?: Row;
   bonusOn?: boolean;
   gratuityConfig?: Row;
   headcount?: number;
+  // Saved salary lines for the employee; 0 = no salary structure.
+  salaryLines?: number;
   signedRuns?: Row[];
   paidRuns?: Row[];
 }
@@ -49,7 +52,23 @@ function build(o: Opts = {}) {
       if (v && typeof v === 'object' && 'in' in v) return v.in.includes(r[k]);
       return v === undefined || r[k] === v;
     });
-  const tx: Row = {};
+  const unlinked: Row[] = [];
+  const linked: Row[] = [];
+  const tx: Row = {
+    offboardingCase: {
+      updateMany: async (a: Row) => {
+        unlinked.push(a.where);
+        return { count: 1 };
+      },
+    },
+    settlement: {
+      deleteMany: async (a: Row) => {
+        const i = settlements.findIndex((x) => match(x, a.where));
+        if (i >= 0) settlements.splice(i, 1);
+        return { count: i >= 0 ? 1 : 0 };
+      },
+    },
+  };
   const prisma: Row = {
     user: {
       findFirst: async () => employee,
@@ -58,12 +77,12 @@ function build(o: Opts = {}) {
     organization: {
       findFirst: async () => ({
         timezone: 'Asia/Kolkata',
-        policies: { defaultNoticeDays: o.defaultNotice ?? 0 },
+        policies: { defaultNoticeDays: o.defaultNotice ?? 0, ...o.policies },
       }),
     },
     leave: { count: async () => 0 },
     resignation: { findFirst: async () => o.resignation ?? null },
-    offboardingCase: { findFirst: async () => o.openCase ?? null },
+    offboardingCase: { findFirst: async () => o.openCase ?? null, updateMany: async (a: Row) => { linked.push(a); return { count: 1 }; } },
     leaveEncashment: { count: async () => 0 },
     settlement: {
       findFirst: async (a: Row) => {
@@ -103,6 +122,7 @@ function build(o: Opts = {}) {
         a.where.runSequence === 0 ? (o.signedRuns ?? []) : (o.paidRuns ?? []),
     },
     loan: { findMany: async () => o.loans ?? [] },
+    employeeSalaryComponent: { count: async () => o.salaryLines ?? 3 },
     leaveType: { findMany: async () => o.leaveTypes ?? [] },
     reimbursement: {
       aggregate: async () => ({ _sum: { amount: o.reimbursed ?? 0 } }),
@@ -169,13 +189,26 @@ function build(o: Opts = {}) {
       }),
     }),
   );
-  return { service, settlements, audit, payrollService };
+  return { service, settlements, audit, payrollService, unlinked, linked };
 }
 
 const admin = { id: 'admin', role: Role.ADMIN } as never;
 const dto = (over: Row = {}) =>
   ({ employeeId: 'e1', lastWorkingDay: '2026-10-06', ...over }) as never;
-const encashable = [{ id: 'lt1', encashment: { allowed: true } }];
+// A leave type as the settlement sees it: active, with a real allocation and no eligibility restriction.
+const leaveType = (over: Row = {}) => ({
+  isActive: true,
+  code: 'EL',
+  allocationType: 'FIXED_ANNUAL',
+  minServiceMonths: 0,
+  maxServiceMonths: null,
+  applicableDepartments: [],
+  applicableEmployeeTypes: [],
+  applicableGenders: [],
+  encashment: { allowed: true },
+  ...over,
+});
+const encashable = [leaveType({ id: 'lt1' })];
 
 beforeEach(() =>
   jest.useFakeTimers().setSystemTime(new Date('2026-10-10T08:00:00Z')),
@@ -186,12 +219,51 @@ describe('final settlement: the exit it belongs to', () => {
   it('is refused for a last working day other than the open offboarding case', async () => {
     const { service } = build({ openCase: { lastWorkingDay: '2026-10-08' } });
     await expect(service.calculate(dto(), admin, 'org')).rejects.toThrow(
-      /offboarding case has last working day 2026-10-08/,
+      /offboarding case has last working day 08-10-2026/,
     );
   });
 });
 
+describe('final settlement: automatic link and system drafts', () => {
+  it('a settlement figured for the exit\'s last working day is linked to the open offboarding case by itself', async () => {
+    const { service, linked, settlements } = build({ openCase: { lastWorkingDay: '2026-10-08', createdAt: new Date('2026-09-01T00:00:00Z'), exitStatus: 'RELEASED', id: 'c1' } });
+    await service.calculate(dto({ lastWorkingDay: '2026-10-08' }), admin, 'org');
+    expect(linked).toHaveLength(1);
+    expect(linked[0].data).toEqual({ settlementId: settlements[0].id });
+    expect(linked[0].where).toMatchObject({ employeeId: 'e1', lastWorkingDay: '2026-10-08' });
+  });
+
+  it('a draft prepared by the system is recorded as calculated by nobody, so the reviewer satisfies maker-checker', async () => {
+    const { service, settlements } = build();
+    await service.calculate(dto(), admin, 'org', { system: true });
+    expect(settlements[0].calculatedById).toBeNull();
+    expect(settlements[0].processedById).toBeNull();
+  });
+
+  it('a draft calculated by a person records that person', async () => {
+    const { service, settlements } = build();
+    await service.calculate(dto(), admin, 'org');
+    expect(settlements[0].calculatedById).toBe((admin as unknown as { id: string }).id);
+  });
+});
+
 describe('final settlement: who can be settled', () => {
+  it('someone with no salary structure is refused, since every amount would be 0 and leave would be encashed for nothing', async () => {
+    const { service, settlements } = build({ salaryLines: 0 });
+    await expect(service.calculate(dto(), admin, 'org')).rejects.toThrow(
+      /has no salary structure/,
+    );
+    expect(settlements).toHaveLength(0);
+  });
+
+  it('someone excluded from payroll is settled even without a salary structure', async () => {
+    const { service } = build({
+      salaryLines: 0,
+      employee: { id: 'e1', isActive: true, joiningDate: JOINED, excludeFromPayroll: true },
+    });
+    await expect(service.calculate(dto(), admin, 'org')).resolves.toBeDefined();
+  });
+
   it('someone whose account was closed before their settlement can still be settled', async () => {
     const left = build({
       employee: { id: 'e1', isActive: false, joiningDate: JOINED },
@@ -323,13 +395,54 @@ describe('final settlement: the amounts', () => {
       basic: 30000,
       leaveTypes: [
         ...encashable,
-        { id: 'lt2', encashment: { allowed: true } },
-        { id: 'lt3', encashment: { allowed: false } },
+        leaveType({ id: 'lt2' }),
+        leaveType({ id: 'lt3', encashment: { allowed: false } }),
       ],
       leaveClosing: 3,
     });
     const s = await service.calculate(dto(), admin, 'org');
     expect(s.leaveEncashmentAmount).toBe(2 * 3 * 1000); // two encashable types x 3 days x 1,000
+  });
+
+  it('leave types the employee has no claim to are not paid: inactive, no allocation, or not eligible on the last working day', async () => {
+    const { service } = build({
+      basic: 30000,
+      leaveTypes: [
+        leaveType({ id: 'paid' }),
+        leaveType({ id: 'inactive', isActive: false }),
+        leaveType({ id: 'comp', code: 'COMPOFF' }),
+        leaveType({ id: 'unlimited', allocationType: 'UNLIMITED' }),
+        // Joined 7 Oct 2020; 6 years of service on the last working day, so a 100-month minimum is not met.
+        leaveType({ id: 'newcomers', minServiceMonths: 100 }),
+        leaveType({ id: 'women', applicableGenders: ['FEMALE'] }),
+      ],
+      leaveClosing: 3,
+      employee: {
+        id: 'e1',
+        name: 'Asha',
+        isActive: true,
+        joiningDate: JOINED,
+        employeeType: 'FULL_TIME',
+        gender: 'MALE',
+        departmentId: null,
+      },
+    });
+    const s = await service.calculate(dto(), admin, 'org');
+    expect(s.leaveEncashmentAmount).toBe(3 * 1000); // only the one type they qualify for
+  });
+
+  it('pays no leave while the company switch is off, and says how many days it left unpaid', async () => {
+    const { service } = build({
+      basic: 30000,
+      leaveTypes: encashable,
+      leaveClosing: 3,
+      policies: { allowLeaveEncashment: false },
+    });
+    const s = await service.calculate(dto(), admin, 'org');
+    expect(s.leaveEncashmentAmount).toBe(0);
+    // No per-type days are recorded, so processing never takes days off a balance.
+    expect(Array.isArray(s.leaveEncashmentDetail)).toBe(false);
+    expect(s.warnings.join(' ')).toMatch(/turned off.*3 unused leave day/);
   });
 
   it('the bonus is taxed with the last month; leave encashment only beyond its s.10(10AA) exemption', async () => {
@@ -448,6 +561,25 @@ describe('final settlement: processing', () => {
     ).rejects.toThrow(/Settlement not found/);
   });
 
+  it('a draft that still pays leave out is refused once the company switch has been turned off', async () => {
+    const { service } = build({
+      policies: { allowLeaveEncashment: false },
+      settlements: [
+        {
+          id: 's1',
+          employeeId: 'e1',
+          status: 'DRAFT',
+          netSettlementAmount: 5000,
+          leaveEncashmentAmount: 3000,
+          lastWorkingDay: '2026-10-06',
+        },
+      ],
+    });
+    await expect(service.process('s1', admin, 'org')).rejects.toThrow(
+      /Leave encashment has been turned off.*Rs 3,000.*Recalculate/,
+    );
+  });
+
   it('only one final settlement can ever exist for a person', async () => {
     const { service } = build({
       settlements: [
@@ -464,6 +596,46 @@ describe('final settlement: processing', () => {
     await expect(service.process('s1', admin, 'org')).rejects.toThrow(
       /final settlement has already been processed for this employee \(10\/2026\)/,
     );
+  });
+});
+
+describe('final settlement: discarding a draft', () => {
+  it('deletes a draft, unlinks it from its exit case and audits it', async () => {
+    const { service, settlements, audit, unlinked } = build({
+      settlements: [
+        {
+          id: 's1',
+          employeeId: 'e1',
+          status: 'DRAFT',
+          lastWorkingDay: '2026-10-06',
+        },
+      ],
+    });
+    await expect(service.discardDraft('s1', admin, 'org')).resolves.toEqual({
+      id: 's1',
+      discarded: true,
+    });
+    expect(settlements).toHaveLength(0);
+    expect(unlinked).toEqual([{ organizationId: 'org', settlementId: 's1' }]);
+    expect(audit.at(-1)).toMatchObject({
+      action: 'SETTLEMENT_DISCARDED',
+      targetId: 's1',
+    });
+  });
+
+  it('never deletes a processed or paid settlement', async () => {
+    for (const status of ['PROCESSED', 'PAID']) {
+      const { service, settlements } = build({
+        settlements: [{ id: 's1', employeeId: 'e1', status }],
+      });
+      await expect(service.discardDraft('s1', admin, 'org')).rejects.toThrow(
+        /Only a draft settlement can be discarded/,
+      );
+      expect(settlements).toHaveLength(1);
+    }
+    await expect(
+      build().service.discardDraft('ghost', admin, 'org'),
+    ).rejects.toThrow(/Settlement not found/);
   });
 });
 

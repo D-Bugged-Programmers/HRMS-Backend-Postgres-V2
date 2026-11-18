@@ -26,6 +26,8 @@ function build(
     });
   const prisma: Row = {
     organization: { findFirst: async () => ({ timezone: 'Asia/Kolkata' }) },
+    // Which departments the reviewer heads (common/dept-scope.ts): none here.
+    department: { findMany: async () => [] },
     user: {
       findFirst: async (a: Row) =>
         employees.find((e) => e.id === a?.where?.id) ?? null,
@@ -56,6 +58,7 @@ function build(
       },
     },
   };
+  prisma.$transaction = async (fn: (tx: Row) => unknown) => fn(prisma);
   const stub = <T>(x: T) => x as never;
   const service = new ReimbursementsService(
     stub(prisma),
@@ -70,11 +73,17 @@ function build(
     }),
     stub({ logEvent: async () => undefined }),
     stub({ renderOccasion: async () => ({ subject: 's', html: 'h' }) }),
+    stub({ forBrand: async () => ({ brandId: null, companyName: 'Co', legalName: null, logoUrl: null, emailLogoUrl: null, address: null, contactEmail: null, phone: null, website: null }) }),
   );
   return { service, store, audit, notes };
 }
 
-const emp = { id: 'e1', role: Role.EMPLOYEE, name: 'Asha' } as never;
+const emp = {
+  id: 'e1',
+  role: Role.EMPLOYEE,
+  name: 'Asha',
+  joiningDate: new Date('2020-01-01T00:00:00.000Z'),
+} as never;
 const hr = {
   id: 'hr1',
   role: Role.HR,
@@ -120,6 +129,73 @@ describe('reimbursement claims: submitting', () => {
       'org',
     );
     expect(c.category).toBe('OTHER');
+  });
+
+  it('several dates in one submit become one claim each, with one notification', async () => {
+    const { service, store, notes } = build();
+    const claims = await service.createMany(
+      {
+        category: 'TRAVEL',
+        description: 'Client visits',
+        items: [
+          { claimDate: day(-3), amount: 200 },
+          { claimDate: day(-2), amount: 250, description: 'Airport cab' },
+        ],
+      } as never,
+      emp,
+      'org',
+    );
+    expect(claims).toHaveLength(2);
+    expect(store.map((c) => [c.claimDate, c.amount, c.description])).toEqual([
+      [day(-3), 200, 'Client visits'],
+      [day(-2), 250, 'Airport cab'],
+    ]);
+    expect(notes).toHaveLength(1);
+  });
+
+  it('a multi-date submit is all-or-nothing: one bad date creates nothing', async () => {
+    const { service, store } = build();
+    await expect(
+      service.createMany(
+        {
+          category: 'TRAVEL',
+          items: [
+            { claimDate: day(-3), amount: 200 },
+            { claimDate: day(5), amount: 250 },
+          ],
+        } as never,
+        emp,
+        'org',
+      ),
+    ).rejects.toThrow(/cannot be in the future/);
+    expect(store).toHaveLength(0);
+  });
+
+  it('a multi-date submit refuses a date already claimed, and a repeated row', async () => {
+    const existing = build([
+      { id: 'c0', employeeId: 'e1', status: 'PENDING', category: 'TRAVEL', amount: 200, claimDate: day(-3) },
+    ]);
+    await expect(
+      existing.service.createMany(
+        { category: 'TRAVEL', items: [{ claimDate: day(-3), amount: 200 }] } as never,
+        emp,
+        'org',
+      ),
+    ).rejects.toThrow(/already exists/);
+    const { service } = build();
+    await expect(
+      service.createMany(
+        {
+          category: 'TRAVEL',
+          items: [
+            { claimDate: day(-3), amount: 200 },
+            { claimDate: day(-3), amount: 200 },
+          ],
+        } as never,
+        emp,
+        'org',
+      ),
+    ).rejects.toThrow(/listed twice/);
   });
 
   it('a claim for a future date is refused', async () => {
