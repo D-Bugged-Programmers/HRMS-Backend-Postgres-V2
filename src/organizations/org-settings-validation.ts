@@ -218,6 +218,14 @@ function validatePolicies(p: Record<string, unknown>) {
     integer: true,
     allowEmpty: true,
   });
+  // Leave Freeze: after this day of the month, leave dated in the month before is closed to employees and managers (so
+  // payroll for that month reads settled figures). Blank = no freeze.
+  checkNumber(p, 'leaveFreezeDay', 'policies.leaveFreezeDay', {
+    min: 1,
+    max: 28,
+    integer: true,
+    allowEmpty: true,
+  });
   // Days after a leave starts that the employee can still cancel it themselves (0 = only before it starts).
   checkNumber(p, 'leaveCancelWindowDays', 'policies.leaveCancelWindowDays', {
     min: 0,

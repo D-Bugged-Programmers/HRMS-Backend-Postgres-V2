@@ -2863,12 +2863,50 @@ export class AttendanceService {
     const scope = await reviewerScope(this.scopedPrisma, actor, organizationId);
     if (scope) where.employeeId = { in: scope };
 
-    return this.scopedPrisma.attendance.findMany({
+    const rows = await this.scopedPrisma.attendance.findMany({
       where,
       include: {
         employee: { select: { id: true, name: true, employeeId: true } },
       },
       orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { date: 'desc' }],
+    });
+    return this.withWfhMonthLimit(rows, organizationId);
+  }
+
+  // The monthly WFH limit is advice, not a rule: the approver decides. Each waiting day is told which WFH day of its month it
+  // would be (days already approved in that month, then the employee's waiting days in date order) and the limit, so the
+  // screen can say "5th WFH day this month, limit is 4". No limit set = rows come back unchanged.
+  private async withWfhMonthLimit<T extends { employeeId: string; date: string }>(rows: T[], organizationId: string) {
+    if (rows.length === 0) return rows;
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+    const limit = wfhDaysPerMonthOf((org?.policies as { wfhDaysPerMonth?: unknown } | null)?.wfhDaysPerMonth);
+    if (limit === null) return rows;
+    const months = [...new Set(rows.map((r) => r.date.slice(0, 7)))].sort();
+    const approved = await this.scopedPrisma.attendance.findMany({
+      where: {
+        organizationId,
+        employeeId: { in: [...new Set(rows.map((r) => r.employeeId))] },
+        workArrangement: WorkArrangement.WFH,
+        workArrangementStatus: WfhApprovalStatus.APPROVED,
+        status: { not: AttendanceStatus.ON_LEAVE },
+        date: { gte: `${months[0]}-01`, lte: `${months[months.length - 1]}-31` },
+      },
+      select: { employeeId: true, date: true },
+    });
+    const used = new Map<string, number>();
+    for (const a of approved) {
+      const k = `${a.employeeId}|${a.date.slice(0, 7)}`;
+      used.set(k, (used.get(k) ?? 0) + 1);
+    }
+    const waiting = new Map<string, string[]>();
+    for (const r of rows) {
+      const k = `${r.employeeId}|${r.date.slice(0, 7)}`;
+      waiting.set(k, [...(waiting.get(k) ?? []), r.date].sort());
+    }
+    return rows.map((r) => {
+      const k = `${r.employeeId}|${r.date.slice(0, 7)}`;
+      const ordinal = (used.get(k) ?? 0) + (waiting.get(k)!.indexOf(r.date) + 1);
+      return { ...r, wfhMonthLimit: { allowed: limit, ordinal, over: ordinal > limit } };
     });
   }
 

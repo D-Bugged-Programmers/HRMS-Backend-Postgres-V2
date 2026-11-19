@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsInt, IsOptional, IsUUID, Max, Min } from 'class-validator';
+import { IsBoolean, IsInt, IsOptional, IsUUID, Max, Min } from 'class-validator';
 
 export class CalculatePayrollDto {
   @ApiProperty({ minimum: 1, maximum: 12 })
@@ -27,4 +27,10 @@ export class CalculatePayrollDto {
   @IsOptional()
   @IsUUID('4', { each: true })
   excludeEmployeeIds?: string[];
+
+  // Run even though leave for this month is still waiting for a decision (only checked when a Leave Freeze day is set).
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  allowPendingLeave?: boolean;
 }

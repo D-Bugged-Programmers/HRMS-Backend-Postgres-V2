@@ -15,7 +15,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Holiday, HolidayType, Prisma } from '@prisma/client';
+import { Holiday, HolidayType, Prisma, Role } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { CreateHolidayDto } from './dto/create-holiday.dto';
@@ -25,6 +25,8 @@ import { BulkImportHolidaysDto } from './dto/bulk-import-holidays.dto';
 import { wrapAll } from '../common/pagination';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { todayInOrgTz } from '../common/org-date';
+import { resolveShiftConfig, type OrganizationAttendancePrefs } from '../attendance/attendance-shift-config';
+import { parseCheckDates, weeklyOffDay, type OffGroup, type WeeklyOffDay } from './weekly-off-check';
 
 const VALID_TYPES = new Set(Object.values(HolidayType));
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -147,6 +149,49 @@ export class HolidaysService {
     const days = (org?.orgPayrollAttendancePrefs as { weekendDays?: unknown } | null)?.weekendDays;
     const list = Array.isArray(days) ? days.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6) : [];
     return list.length > 0 ? list : [0];
+  }
+
+  /**
+   * For each date: which groups of people have it as a weekly off (a holiday on it adds no extra day off) and which work it (the
+   * holiday gives them an extra day off). Uses the tracker's own rule - a department's weekly offs, else the organization's default,
+   * alternate Saturdays included - so the calendar and the tracker agree. Admin and HR see every department; anyone else sees only
+   * their own schedule, unnamed.
+   */
+  async weeklyOffCheck(
+    rawDates: string,
+    caller: { role: Role; departmentId: string | null },
+    organizationId: string,
+  ): Promise<{ self: boolean; days: Record<string, WeeklyOffDay> }> {
+    let dates: string[];
+    try {
+      dates = parseCheckDates(rawDates);
+    } catch (e) {
+      throw new BadRequestException((e as Error).message);
+    }
+    const org = await this.scopedPrisma.organization.findFirst({
+      where: { id: organizationId },
+      select: { attendancePayrollPrefs: true },
+    });
+    const prefs = org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null;
+    const isHr = caller.role === Role.ADMIN || caller.role === Role.HR;
+    let groups: OffGroup[];
+    if (isHr) {
+      const [departments, withoutDepartment] = await Promise.all([
+        this.scopedPrisma.department.findMany({ where: { organizationId, isActive: true }, orderBy: { name: 'asc' } }),
+        this.scopedPrisma.user.count({ where: { organizationId, isActive: true, departmentId: null } }),
+      ]);
+      groups = departments.map((d) => ({ id: d.id, name: d.name, weeklyOffs: resolveShiftConfig(d, prefs).weeklyOffs }));
+      // People with no department follow the organization's default; with no departments at all that default is everyone's.
+      if (withoutDepartment > 0 || departments.length === 0) {
+        groups.push({ id: null, name: 'People without a department', weeklyOffs: resolveShiftConfig(null, prefs).weeklyOffs });
+      }
+    } else {
+      const own = caller.departmentId
+        ? await this.scopedPrisma.department.findFirst({ where: { id: caller.departmentId, organizationId } })
+        : null;
+      groups = [{ id: own?.id ?? null, name: 'Your schedule', weeklyOffs: resolveShiftConfig(own, prefs).weeklyOffs }];
+    }
+    return { self: !isHr, days: Object.fromEntries(dates.map((d) => [d, weeklyOffDay(d, groups)])) };
   }
 
   // Copies one year's holidays into another on the same day and month (e.g. 26-01-2026 -> 26-01-2027), for HR to adjust: fixed-date

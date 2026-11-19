@@ -102,6 +102,7 @@ import {
   dmyText,
 } from '../payroll/format-date';
 import { dateStrInOrgTz, todayInOrgTz } from '../common/org-date';
+import { isLeaveFrozen, leaveFreezeDayOf, leaveFrozenMessage } from './leave-freeze';
 import { leaveCancelAfterApprovalDaysOf, leaveCancelWindowDaysOf, ownerCancelOptions, adminCanCancelOthers, leaveTaken, ownerCanCancel, cancelReasonRequired } from './leave-cancel-rules';
 import {
   DecideLeaveCancelDto,
@@ -284,7 +285,22 @@ export class LeavesService {
     private readonly emailTemplatesService: EmailTemplatesService,
   ) {}
 
+  // Leave Freeze (Policies > leaveFreezeDay): once the cut-off day has passed, leave dated in the month before is closed
+  // to everyone except Admin and HR, so payroll reads figures that no longer move.
+  private async assertLeaveNotFrozen(actor: Actor, organizationId: string, ...startDates: (string | undefined | null)[]) {
+    if (actor.role === Role.ADMIN || actor.role === Role.HR) return;
+    const dates = startDates.filter((d): d is string => !!d);
+    if (dates.length === 0) return;
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true, policies: true } });
+    const freezeDay = leaveFreezeDayOf((org?.policies as { leaveFreezeDay?: unknown } | null)?.leaveFreezeDay);
+    if (freezeDay === null) return;
+    const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
+    const frozen = dates.find((d) => isLeaveFrozen(d, today, freezeDay));
+    if (frozen) throw new BadRequestException(leaveFrozenMessage(frozen));
+  }
+
   async apply(dto: ApplyLeaveDto, actor: Actor, organizationId: string) {
+    await this.assertLeaveNotFrozen(actor, organizationId, dto.startDate);
     // A leave cannot be dated more than a year ahead (a typo such as 2035 would otherwise become a pending request).
     if (dto.startDate && dto.endDate) {
       const limit = new Date();
@@ -891,6 +907,7 @@ export class LeavesService {
         'You can only edit your own leave requests.',
       );
     }
+    await this.assertLeaveNotFrozen(actor, organizationId, String(existing.startDate), dto.startDate);
     if (existing.status !== LeaveStatus.PENDING) {
       throw new BadRequestException(
         'Only pending leave requests can be edited.',
@@ -914,6 +931,7 @@ export class LeavesService {
         'This leave request has already been reviewed.',
       );
     }
+    await this.assertLeaveNotFrozen(actor, organizationId, String(leave.startDate));
 
     // An Admin may approve or reject their own leave (it is audit-logged as a self-approval above); HR and managers
     // cannot - assertManagerScopeOrDelegate below refuses a self-review from anyone but an Admin.
@@ -1418,6 +1436,7 @@ export class LeavesService {
 
   async cancel(id: string, actor: Actor, organizationId: string, reason?: string) {
     const leave = await this.findByIdOrThrow(id, organizationId);
+    await this.assertLeaveNotFrozen(actor, organizationId, String(leave.startDate));
     const isSelf = leave.employeeId === actor.id;
     const isOverride = CANCEL_OVERRIDE_ROLES.includes(actor.role);
     // The reason is optional only for the employee cancelling their own request that nobody has approved yet; undoing an
@@ -2586,6 +2605,7 @@ export class LeavesService {
         "You cannot ask to cancel another employee's leave.",
       );
     }
+    await this.assertLeaveNotFrozen(actor, organizationId, String(leave.startDate));
     if (leave.status !== LeaveStatus.APPROVED) {
       throw new BadRequestException(
         'Only an approved leave needs a cancellation request.',
@@ -2658,6 +2678,7 @@ export class LeavesService {
     organizationId: string,
   ) {
     const leave = await this.findByIdOrThrow(id, organizationId);
+    await this.assertLeaveNotFrozen(actor, organizationId, String(leave.startDate));
     if (leave.status !== LeaveStatus.APPROVED || !leave.cancelRequestedAt) {
       throw new BadRequestException(
         'There is no cancellation request waiting on this leave.',

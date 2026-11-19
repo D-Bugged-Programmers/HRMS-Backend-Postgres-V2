@@ -11,6 +11,7 @@
 // already committed by that point and must not be rolled back by a PDF/email failure.
 import { isOvertimePayEnabled } from '../overtime/overtime-pay';
 import { sandwichKindsOf, type LeaveRules } from '../leaves/leave-rules';
+import { leaveFreezeDayOf } from '../leaves/leave-freeze';
 import { employeeDob, missingPastMonths } from './fy-employment';
 import { holidayInEffect } from '../holidays/holiday-in-effect';
 import {
@@ -1672,6 +1673,34 @@ export class PayrollService {
   }
 
   // "Today" (YYYY-MM-DD) in the organization's own timezone.
+  // Leave Freeze (Policies > leaveFreezeDay): with a freeze day set, a payroll run waits until the month's leave has been
+  // decided. HR or an Admin can run anyway ("allowPendingLeave"); the pending requests then stay out of the pay.
+  private async assertNoPendingLeave(
+    dto: { month: number; year: number; allowPendingLeave?: boolean },
+    organizationId: string,
+    employeeIds: string[],
+  ) {
+    if (dto.allowPendingLeave || employeeIds.length === 0) return;
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+    if (leaveFreezeDayOf((org?.policies as { leaveFreezeDay?: unknown } | null)?.leaveFreezeDay) === null) return;
+    const monthStart = `${dto.year}-${String(dto.month).padStart(2, '0')}-01`;
+    const monthEnd = lastDayOfMonth(dto.month, dto.year);
+    const pending = await this.scopedPrisma.leave.count({
+      where: {
+        organizationId,
+        employeeId: { in: employeeIds },
+        startDate: { lte: monthEnd },
+        endDate: { gte: monthStart },
+        OR: [{ status: 'PENDING' }, { status: 'APPROVED', cancelRequestedAt: { not: null } }],
+      },
+    });
+    if (pending > 0) {
+      throw new BadRequestException(
+        `${pending} leave request${pending === 1 ? ' is' : 's are'} still waiting for a decision for ${monthStart.slice(0, 7)}. Decide them in Approvals first, or run payroll anyway if you accept that they are left out.`,
+      );
+    }
+  }
+
   private async orgToday(organizationId: string): Promise<string> {
     const org = await this.scopedPrisma.organization.findFirst({
       where: { id: organizationId },
@@ -2156,6 +2185,7 @@ export class PayrollService {
       }
       return !reason;
     });
+    await this.assertNoPendingLeave(dto, organizationId, employees.map((e) => e.id));
 
     // One batched existence check instead of one findFirst per employee,
     // then one batched createMany for whoever's missing a row — 3 queries
@@ -2260,6 +2290,7 @@ export class PayrollService {
       organizationId,
       dto.excludeEmployeeIds,
     );
+    await this.assertNoPendingLeave(dto, organizationId, employees.map((e) => e.id));
     const results: PayrollRun[] = [];
     const failures: {
       employeeId: string;

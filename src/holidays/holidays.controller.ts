@@ -19,6 +19,7 @@ import { CreateHolidayDto } from './dto/create-holiday.dto';
 import { UpdateHolidayDto } from './dto/update-holiday.dto';
 import { ListHolidaysQueryDto } from './dto/list-holidays-query.dto';
 import { BulkImportHolidaysDto } from './dto/bulk-import-holidays.dto';
+import { WeeklyOffCheckQueryDto } from './dto/weekly-off-check-query.dto';
 import { AttendanceService } from '../attendance/attendance.service';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -51,6 +52,13 @@ export class HolidaysController {
   @Get('weekly-offs')
   weeklyOffs(@CurrentUser() caller: Caller) {
     return this.holidaysService.weeklyOffs(caller.organizationId);
+  }
+
+  // For each date: who has it as a weekly off and who works it (department schedules and alternate Saturdays included), for the
+  // calendar's "falls on a weekly off" note. Any signed-in user: HR sees every department, others only their own schedule.
+  @Get('weekly-off-check')
+  weeklyOffCheck(@Query() query: WeeklyOffCheckQueryDto, @CurrentUser() caller: Caller) {
+    return this.holidaysService.weeklyOffCheck(query.dates, caller, caller.organizationId);
   }
 
   @Post('copy')
