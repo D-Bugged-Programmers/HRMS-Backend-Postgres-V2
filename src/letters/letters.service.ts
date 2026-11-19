@@ -9,6 +9,7 @@
 //   real prerequisite record (OffboardingCase/PayrollRun/Settlement) that can't be invented from nothing.
 import { dateStrInOrgTz } from '../common/org-date';
 import { personalEmailOf } from '../common/personal-email';
+import { letterRecipientOf } from './letter-recipient';
 import {
   BadRequestException,
   ForbiddenException,
@@ -24,11 +25,14 @@ import {
   Role,
   User,
   EmploymentStatus,
+  NotificationCategory,
 } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { AuditLogService } from '../audit-log/audit-log.service';
-import { readStoredFile } from '../files/file-storage.config';
+import { readStoredFile, writeStoredFile } from '../files/file-storage.config';
+import { NotificationsService } from '../notifications/notifications.service';
+import { sanitizeRichText } from '../letter-templates/rich-text-sanitizer';
 import { issueDocumentNumber } from '../organizations/document-numbering';
 import { formatDateDisplay } from '../payroll/format-date';
 import { amountInWords } from '../payroll/number-to-words';
@@ -82,6 +86,7 @@ function hiringLetterBlocked(
 }
 
 import {
+  LETTER_STAGES,
   currentLetterStage,
   letterFlowOrder,
   letterFlowStatus,
@@ -141,6 +146,42 @@ const RESTRICTED_LETTER_KEYS = new Set([
   'showCauseNotice',
 ]);
 
+const EMPLOYEE_HISTORY_ACTIONS = ['LETTER_ISSUED', 'LETTER_EMAILED', 'LETTER_ACKNOWLEDGED', 'LETTER_APPROVED', 'LETTER_DECLINED'];
+// The letter's paragraphs as the HTML the editor works on: bold / italic / underline kept, everything else shown as plain text.
+export function paragraphsToHtml(paragraphs: string[]): string {
+  const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return paragraphs
+    .map((p) => `<p>${p.split(/(<\/?(?:b|i|u)>)/i).map((seg) => (/^<\/?(?:b|i|u)>$/i.test(seg) ? seg.toLowerCase() : esc(seg))).join('')}</p>`)
+    .join('');
+}
+
+const LETTER_FINAL_MESSAGE =
+  'This letter was approved and signed by the employee, so it is final and cannot be changed. If something was wrong, issue a new version.';
+const LETTER_HISTORY_ACTIONS = ['LETTER_APPROVED', 'LETTER_DECLINED', 'LETTER_VERSION_STARTED', 'LETTER_ISSUE_STARTED', 'LETTER_ISSUED', 'LETTER_EMAILED', 'LETTER_CONTENT_SAVED', 'LETTER_CONTENT_RESET', 'LETTER_ISSUE_DATE_CHANGED', 'LETTER_ACCESS_GRANTED', 'LETTER_ACCESS_REVOKED', 'LETTER_ACKNOWLEDGED'];
+
+// Letters that can be issued again and again (every increment, promotion, warning...). Each issue is stored under its own
+// "slot" key - the template key for the first, then "incrementLetter#2", "#3"... - so every one keeps its own date, number,
+// saved PDF, wording, visibility switch and confirmation. A custom template opts in with its "can be issued more than once" box.
+const RECURRING_BUILTIN_KEYS = new Set([
+  'incrementLetter', 'promotionLetter', 'transferLetter', 'warningLetter', 'showCauseNotice', 'suspensionLetter',
+  'appreciationLetter', 'salaryCertificate', 'employmentVerificationLetter', 'probationExtensionLetter', 'abscondingNotice',
+]);
+export const baseKeyOf = (slot: string): string => slot.split('#')[0];
+const isRecurringTemplate = (t: { key: string; isCustom: boolean; allowMultiple?: boolean }) =>
+  t.isCustom ? !!t.allowMultiple : RECURRING_BUILTIN_KEYS.has(t.key) || !!t.allowMultiple;
+
+// "DP-00005-Appointment Letter.pdf": the employee ID, then the letter's name as HR sees it.
+function letterFilename(employeeCode: string, templateName: string): string {
+  return `${`${employeeCode}-${templateName}`.replace(/[\\/:*?"<>|\r\n]+/g, ' ').replace(/\s+/g, ' ').trim()}.pdf`;
+}
+
+// The placeholders each stage-gated profile fills in; in a draft they start as "—" so HR can write the letter before the record exists.
+const LENIENT_PLACEHOLDERS: Partial<Record<LetterDataProfile, string[]>> = {
+  [LetterDataProfile.EXIT]: ['lastWorkingDay', 'reason', 'noticeDate'],
+  [LetterDataProfile.PAYROLL]: ['effectiveFrom', 'month', 'year', 'annualCTC', 'fixedCTC', 'variablePay', 'grossSalary', 'netPay'],
+  [LetterDataProfile.SETTLEMENT]: ['lastWorkingDay', 'pendingSalary', 'leaveEncashment', 'bonus', 'gratuity', 'recoveries', 'loanRecovered', 'noticePeriodRecovery', 'totalDeductions', 'netPayable', 'netPayableInWords'],
+};
+
 @Injectable()
 export class LettersService {
   constructor(
@@ -152,6 +193,7 @@ export class LettersService {
     private readonly emailService: EmailService,
     private readonly emailTemplatesService: EmailTemplatesService,
     private readonly brandingLookup: BrandingLookupService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   // Event letters are held back on the person's own view (and for an EMPLOYEE looking at anyone).
@@ -220,8 +262,8 @@ export class LettersService {
   // Admin / HR only (the controller enforces it). Built from what was issued (the audit trail of generated / emailed letters).
   async overview(
     organizationId: string,
-  ): Promise<Record<string, LetterFlowStatus>> {
-    const [people, issuedRows] = await Promise.all([
+  ): Promise<Record<string, LetterFlowStatus & { approval: { awaiting: number; approved: number; declined: number } }>> {
+    const [people, issuedRows, issueRecords, grants] = await Promise.all([
       this.scopedPrisma.user.findMany({
         where: { organizationId },
         select: { id: true, employmentStatus: true, isActive: true },
@@ -236,24 +278,42 @@ export class LettersService {
         orderBy: { createdAt: 'desc' },
         take: 50_000,
       }),
+      this.scopedPrisma.issuedLetter.findMany({
+        where: { organizationId },
+        select: { employeeId: true, key: true, approvedAt: true, declinedAt: true, supersededAt: true },
+      }),
+      this.scopedPrisma.employeeLetterAccess.findMany({ where: { organizationId, enabled: true }, select: { employeeId: true, key: true } }),
     ]);
+    // Where each person's letters stand with their own approval: waiting for their signature (switched on, not yet answered),
+    // approved and signed, or declined. A replaced letter is not counted.
+    const visible = new Set(grants.map((g) => `${g.employeeId}|${g.key}`));
+    const approvalOf = new Map<string, { awaiting: number; approved: number; declined: number }>();
+    for (const r of issueRecords) {
+      const a = approvalOf.get(r.employeeId) ?? { awaiting: 0, approved: 0, declined: 0 };
+      if (r.approvedAt) a.approved += 1;
+      else if (r.declinedAt) a.declined += 1;
+      else if (!r.supersededAt && visible.has(`${r.employeeId}|${r.key}`)) a.awaiting += 1;
+      approvalOf.set(r.employeeId, a);
+    }
     const byPerson = new Map<string, Map<string, IssuedLetter>>();
     for (const r of issuedRows) {
       const d = r.details as { key?: string; templateName?: string } | null;
       if (!r.targetId || !d?.key) continue;
       const m = byPerson.get(r.targetId) ?? new Map<string, IssuedLetter>();
+      // A later issue of the same letter counts as the letter: the stage logic knows the template key, not the slot.
+      const baseKey = baseKeyOf(d.key);
       // Newest first, so the first one seen for a key is its latest issue.
-      if (!m.has(d.key))
-        m.set(d.key, { name: d.templateName || d.key, at: r.createdAt });
+      if (!m.has(baseKey))
+        m.set(baseKey, { name: d.templateName || baseKey, at: r.createdAt });
       byPerson.set(r.targetId, m);
     }
     return Object.fromEntries(
       people.map((p) => [
         p.id,
-        letterFlowStatus(
-          p,
-          byPerson.get(p.id) ?? new Map<string, IssuedLetter>(),
-        ),
+        {
+          ...letterFlowStatus(p, byPerson.get(p.id) ?? new Map<string, IssuedLetter>()),
+          approval: approvalOf.get(p.id) ?? { awaiting: 0, approved: 0, declined: 0 },
+        },
       ]),
     );
   }
@@ -271,6 +331,17 @@ export class LettersService {
       reason: string | null;
       // YYYY-MM-DD the letter was issued on (null = never issued).
       issuedOn: string | null;
+      canIssueNew?: boolean;
+      requiresApproval?: boolean;
+      approvalStatus?: 'APPROVED' | 'DECLINED' | 'SUPERSEDED' | 'AWAITING' | null;
+      approvedAt?: string | null;
+      signedBy?: string | null;
+      declinedAt?: string | null;
+      declineReason?: string | null;
+      superseded?: boolean;
+      canNewVersion?: boolean;
+      // When the employee confirmed they received and read it (null = not yet).
+      acknowledgedAt: string | null;
       // Only present for a RESTRICTED_LETTER_KEYS entry — restricted is
       // always true there; accessEnabled reflects the current
       // EmployeeLetterAccess grant so a privileged caller's UI can render
@@ -377,7 +448,7 @@ export class LettersService {
     // When each letter was issued: the saved date, else the oldest "letter issued" entry (letters from before dates were saved).
     const issuedOnByKey = new Map<string, string>();
     const [savedIssues, issuedAudit] = await Promise.all([
-      this.scopedPrisma.issuedLetter.findMany({ where: { organizationId, employeeId }, select: { key: true, issuedAt: true } }),
+      this.scopedPrisma.issuedLetter.findMany({ where: { organizationId, employeeId }, select: { key: true, issuedAt: true, acknowledgedAt: true, approvedAt: true, declinedAt: true, declineReason: true, supersededAt: true, signatureName: true } }),
       this.scopedPrisma.auditLog.findMany({
         where: { organizationId, module: AuditModule.DOCUMENT, action: 'LETTER_ISSUED', targetId: employeeId },
         orderBy: { createdAt: 'asc' },
@@ -388,8 +459,17 @@ export class LettersService {
       const k = (r.details as { key?: string } | null)?.key;
       if (k && !issuedOnByKey.has(k)) issuedOnByKey.set(k, dateStrInOrgTz('Asia/Kolkata', r.createdAt));
     }
-    for (const r of savedIssues) issuedOnByKey.set(r.key, dateStrInOrgTz('Asia/Kolkata', r.issuedAt));
-    const all = inFlowOrder.map((t) => {
+    const ackByKey = new Map<string, string>();
+    for (const r of savedIssues) {
+      issuedOnByKey.set(r.key, dateStrInOrgTz('Asia/Kolkata', r.issuedAt));
+      if (r.acknowledgedAt) ackByKey.set(r.key, r.acknowledgedAt.toISOString());
+    }
+    const all = inFlowOrder.flatMap((t) => {
+      const recurring = isRecurringTemplate(t);
+      // Every issue of the letter that exists: repeats of a recurring letter, and new versions of any letter.
+      const slotKeys = savedIssues.filter((r) => baseKeyOf(r.key) === t.key).sort((a, b) => a.issuedAt.getTime() - b.issuedAt.getTime()).map((r) => r.key);
+      const keys = slotKeys.length > 0 ? slotKeys : [t.key];
+      return keys.map((slotKey, slotIndex) => {
       const gate = UNLOCK_BY_PROFILE[t.dataProfile];
       const restricted = RESTRICTED_LETTER_KEYS.has(t.key);
       // No EmployeeLetterAccess row yet: a restricted (disciplinary) key
@@ -398,9 +478,11 @@ export class LettersService {
       // "every other letter stays visible by default" behavior exactly,
       // just now revocable per employee via the same grant row instead of
       // being un-hideable.
-      const accessEnabled = grantByKey.has(t.key)
-        ? grantByKey.get(t.key)!
-        : !restricted;
+      // Every letter now starts hidden from the employee it belongs to: HR/Admin switch "Visible to employee" on once the
+      // letter is ready (letters already visible when this rule began were granted by a one-off migration).
+      const accessEnabled = grantByKey.has(slotKey)
+        ? grantByKey.get(slotKey)!
+        : false;
       // A plain EMPLOYEE also needs the (now-universal) grant, on top of
       // the usual dataProfile unlock. HR/Admin/Manager are never subject
       // to this — see the constant's own comment.
@@ -408,10 +490,34 @@ export class LettersService {
         actor.role === Role.EMPLOYEE && !accessEnabled;
       const leavingBlocked = hiringLetterBlocked(t.key, employee);
       const eventBlocked = eventsMissing.has(t.key);
+      const issuedOn = issuedOnByKey.get(slotKey) ?? null;
+      const rec = savedIssues.find((r) => r.key === slotKey);
+      const isLast = slotIndex === keys.length - 1;
+      const approvalStatus: 'APPROVED' | 'DECLINED' | 'SUPERSEDED' | 'AWAITING' | null = rec?.approvedAt
+        ? 'APPROVED'
+        : rec?.declinedAt
+          ? 'DECLINED'
+          : rec?.supersededAt
+            ? 'SUPERSEDED'
+            : t.requiresApproval && accessEnabled && (rec || issuedOn)
+              ? 'AWAITING'
+              : null;
       return {
-        key: t.key,
-        name: t.name,
-        issuedOn: issuedOnByKey.get(t.key) ?? null,
+        key: slotKey,
+        name: keys.length > 1 && issuedOn ? `${t.name} (${formatDateDisplay(issuedOn)})` : t.name,
+        // Only on the last issue of a letter that can be issued again: HR/Admin start the next one from it.
+        canIssueNew: recurring && isLast,
+        // Approval by the employee (accept and sign): where this issue stands, and what HR/Admin can do next.
+        requiresApproval: !!t.requiresApproval,
+        approvalStatus,
+        approvedAt: rec?.approvedAt?.toISOString() ?? null,
+        signedBy: rec?.signatureName ?? null,
+        declinedAt: rec?.declinedAt?.toISOString() ?? null,
+        declineReason: rec?.declineReason ?? null,
+        superseded: !!rec?.supersededAt,
+        canNewVersion: isLast && !!(rec?.approvedAt || rec?.declinedAt) && !rec?.supersededAt,
+        issuedOn,
+        acknowledgedAt: ackByKey.get(slotKey) ?? null,
         dataProfile: t.dataProfile,
         stage: stageOfTemplate(t),
         inCurrentStage: stageOfTemplate(t) === nowStage,
@@ -434,12 +540,13 @@ export class LettersService {
         // toggle everywhere, not only on the 3 disciplinary keys.
         ...(actor.role !== Role.EMPLOYEE ? { restricted, accessEnabled } : {}),
       };
+      });
     });
     // Only Admin and HR see a locked letter (greyed out, with the reason). Everyone else - employees looking at their
     // own letters, and managers - sees just the letters they can actually get.
-    return actor.role === Role.ADMIN || actor.role === Role.HR
-      ? all
-      : all.filter((l) => l.unlocked);
+    if (actor.role === Role.ADMIN || actor.role === Role.HR) return all;
+    // An employee keeps an approved letter even after a newer version exists; a declined or never-approved old one is not shown.
+    return all.filter((l) => l.unlocked && !(l.superseded && l.approvalStatus !== 'APPROVED'));
   }
 
   // Shared by generate() and previewContent() — fetches the real employee/
@@ -449,7 +556,7 @@ export class LettersService {
   // editable-text preview without burning a document number on every call.
   private async computeLetterContent(
     employeeId: string,
-    key: string,
+    slot: string,
     actor: Actor,
     organizationId: string,
     // The date whose salary structure the Revised CTC letter describes (the revision's effective date); today when
@@ -457,7 +564,12 @@ export class LettersService {
     structureAsOf?: string,
     // The date this letter was first issued; today when it has not been issued yet.
     issuedAt?: Date,
+    // HR/Admin writing or editing the letter before the record it is about exists (no offboarding case, payroll run or
+    // settlement yet): the missing figures show as "—" in the draft instead of refusing. Never used for a plain download.
+    lenient = false,
   ) {
+    // `slot` names one issue of the letter; every rule about the letter itself goes by the template key.
+    const key = baseKeyOf(slot);
     const template = await this.letterTemplatesService.findActiveByKey(
       key,
       organizationId,
@@ -527,12 +639,12 @@ export class LettersService {
     }
     if (actor.role === Role.EMPLOYEE) {
       const grant = await this.scopedPrisma.employeeLetterAccess.findFirst({
-        where: { organizationId, employeeId, key },
+        where: { organizationId, employeeId, key: slot },
         select: { enabled: true },
       });
       const accessEnabled = grant
         ? grant.enabled
-        : !RESTRICTED_LETTER_KEYS.has(key);
+        : false;
       if (!accessEnabled) {
         throw new ForbiddenException(
           'This letter has not been made available to you yet — contact HR.',
@@ -643,6 +755,10 @@ export class LettersService {
       emergencyContactNumber: pdStr('emergencyContact1Number'),
     };
 
+    if (lenient) {
+      for (const k of LENIENT_PLACEHOLDERS[template.dataProfile] ?? []) variables[k] ??= '—';
+    }
+    try {
     switch (template.dataProfile) {
       case LetterDataProfile.EXIT: {
         const offboardingCase = await this.latestOffboardingCase(
@@ -778,6 +894,10 @@ export class LettersService {
       default:
         break;
     }
+    } catch (err) {
+      // Strict unless HR/Admin is drafting: then whatever could not be filled stays "—" and they type the rest.
+      if (!(lenient && err instanceof BadRequestException)) throw err;
+    }
 
     let title = this.letterTemplatesService.render(template.title, variables);
     const renderedBody = this.letterTemplatesService.render(
@@ -803,7 +923,7 @@ export class LettersService {
     // The @@unique([organizationId, employeeId, key]) makes this equally
     // selective.
     const override = await this.scopedPrisma.letterOverride.findFirst({
-      where: { organizationId, employeeId, key },
+      where: { organizationId, employeeId, key: slot },
     });
     const isCustomized = !!override;
     if (override) {
@@ -840,7 +960,7 @@ export class LettersService {
     key: string,
     actor: Actor,
     organizationId: string,
-  ): Promise<{ title: string; body: string; isCustomized: boolean }> {
+  ): Promise<{ title: string; body: string; bodyHtml: string; isCustomized: boolean }> {
     const issued = await this.findIssuedLetter(employeeId, key, organizationId);
     const { title, paragraphs, isCustomized } = await this.computeLetterContent(
       employeeId,
@@ -849,8 +969,9 @@ export class LettersService {
       organizationId,
       undefined,
       issued?.issuedAt,
+      this.isPrivileged(actor),
     );
-    return { title, body: paragraphs.join('\n'), isCustomized };
+    return { title, body: paragraphs.join('\n'), bodyHtml: paragraphsToHtml(paragraphs), isCustomized };
   }
 
   // Persists HR's edited title/body for this one employee+letter — unlike
@@ -865,15 +986,17 @@ export class LettersService {
     actor: Actor,
     organizationId: string,
     content: { title: string; body: string },
-  ): Promise<{ title: string; body: string; isCustomized: boolean }> {
+  ): Promise<{ title: string; body: string; bodyHtml: string; isCustomized: boolean }> {
     // Reuses the same template/employee/view-scope validation as
     // generate() — no point saving an override for an employee the actor
     // can't view, or a key with no active template.
-    await this.computeLetterContent(employeeId, key, actor, organizationId);
+    await this.computeLetterContent(employeeId, key, actor, organizationId, undefined, undefined, this.isPrivileged(actor));
 
+    await this.assertNotFinal(employeeId, key, organizationId);
     const title = content.title.trim();
-    const body = content.body.trim();
-    if (!title || !body) {
+    // The wording may now carry bold / italic / underline and lists; anything else is stripped before it is saved.
+    const body = sanitizeRichText(content.body.trim()).trim();
+    if (!title || !body.replace(/<[^>]*>/g, '').trim()) {
       throw new BadRequestException('Title and body cannot be empty.');
     }
 
@@ -906,7 +1029,9 @@ export class LettersService {
       details: { key },
     });
 
-    return { title, body, isCustomized: true };
+    // The saved PDF no longer matches the wording: the next download builds it again.
+    await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { pdfKey: null } });
+    return { title, body, bodyHtml: body, isCustomized: true };
   }
 
   // Deletes a saved override — Download and future Sends fall back to the
@@ -919,6 +1044,7 @@ export class LettersService {
     actor: Actor,
     organizationId: string,
   ): Promise<{ title: string; body: string; isCustomized: boolean }> {
+    await this.assertNotFinal(employeeId, key, organizationId);
     await this.scopedPrisma.letterOverride.deleteMany({
       where: { organizationId, employeeId, key },
     });
@@ -932,6 +1058,7 @@ export class LettersService {
       details: { key },
     });
 
+    await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { pdfKey: null } });
     return this.previewContent(employeeId, key, actor, organizationId);
   }
 
@@ -949,12 +1076,12 @@ export class LettersService {
     organizationId: string,
   ) {
     const template = await this.letterTemplatesService.findActiveByKey(
-      key,
+      baseKeyOf(key),
       organizationId,
     );
     if (!template) {
       throw new BadRequestException(
-        `No active letter template found for '${key}'.`,
+        `No active letter template found for '${baseKeyOf(key)}'.`,
       );
     }
     const employee = await this.scopedPrisma.user.findFirst({
@@ -962,7 +1089,66 @@ export class LettersService {
       select: { id: true },
     });
     if (!employee) throw new NotFoundException('Employee not found.');
+    // An approved letter stays with the employee: it cannot be hidden again.
+    if (!enabled) await this.assertNotFinal(employeeId, key, organizationId);
+    // A letter whose stage has not been reached cannot be switched on yet.
+    if (enabled) {
+      const row = (await this.listForEmployee(employeeId, actor, organizationId)).find((l) => l.key === key);
+      if (row && !row.unlocked) {
+        throw new BadRequestException(row.reason || 'This letter cannot be made visible until its stage is reached.');
+      }
+    }
+    return this.writeAccess(employeeId, key, enabled, actor, organizationId, template.name, true, !!template.requiresApproval);
+  }
 
+  // One switch for a whole stage of the journey (Hiring, Probation...): every letter of that stage that is open for this employee is
+  // switched on or off together. A letter still locked is left alone, and any one letter can still be changed on its own.
+  async setStageAccess(employeeId: string, stage: string, enabled: boolean, actor: Actor, organizationId: string) {
+    if (!(LETTER_STAGES as readonly string[]).includes(stage) && stage !== 'OTHER') {
+      throw new BadRequestException('Unknown stage.');
+    }
+    const items = (await this.listForEmployee(employeeId, actor, organizationId)).filter((l) => l.stage === stage && l.unlocked);
+    let changed = 0;
+    for (const l of items) {
+      // An approved letter stays with the employee, so a stage switched off leaves it visible.
+      if (!enabled && l.approvalStatus === 'APPROVED') continue;
+      const before = await this.scopedPrisma.employeeLetterAccess.findFirst({
+        where: { organizationId, employeeId, key: l.key },
+        select: { enabled: true },
+      });
+      if ((before?.enabled ?? false) === enabled) continue;
+      await this.writeAccess(employeeId, l.key, enabled, actor, organizationId, l.name, false);
+      changed += 1;
+    }
+    if (enabled && changed > 0 && employeeId !== actor.id) {
+      await this.notificationsService.create({
+        organizationId,
+        userId: employeeId,
+        title: 'Letters available',
+        message: `${changed} ${changed === 1 ? 'letter is' : 'letters are'} now available in My Letters${items.some((l) => l.requiresApproval) ? ' - please review and approve them' : ''}.`,
+        category: NotificationCategory.GENERAL,
+      });
+    }
+    return { stage, enabled, changed };
+  }
+
+  // The visibility switch itself: saves it, logs it, and tells the employee when a letter is switched on for them.
+  private async writeAccess(
+    employeeId: string,
+    key: string,
+    enabled: boolean,
+    actor: Actor,
+    organizationId: string,
+    templateName: string,
+    // false when the caller sends one combined notice itself (a whole stage switched at once).
+    notify = true,
+    // The letter needs the employee's approval: the notice asks for it.
+    askApproval = false,
+  ) {
+    const before = await this.scopedPrisma.employeeLetterAccess.findFirst({
+      where: { organizationId, employeeId, key },
+      select: { enabled: true },
+    });
     // updateMany-then-create rather than upsert — the scope extension can't
     // inject organizationId into an upsert's compound-unique `where`, same
     // reason saveOverride() above uses this exact shape.
@@ -990,6 +1176,15 @@ export class LettersService {
       targetId: employeeId,
       details: { key },
     });
+    if (notify && enabled && !before?.enabled && employeeId !== actor.id) {
+      await this.notificationsService.create({
+        organizationId,
+        userId: employeeId,
+        title: 'Letter available',
+        message: `Your ${templateName} is now available in My Letters${askApproval ? ' - please review and approve it' : ''}.`,
+        category: NotificationCategory.GENERAL,
+      });
+    }
 
     return { key, enabled };
   }
@@ -1002,9 +1197,10 @@ export class LettersService {
     }
     const employee = await this.scopedPrisma.user.findFirst({ where: { id: employeeId, organizationId }, select: { id: true } });
     if (!employee) throw new NotFoundException('Employee not found.');
+    await this.assertNotFinal(employeeId, key, organizationId);
     const existing = await this.findIssuedLetter(employeeId, key, organizationId);
     if (existing) {
-      await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { issuedAt: when } });
+      await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { issuedAt: when, pdfKey: null } });
     } else {
       await this.scopedPrisma.issuedLetter.createMany({ data: [{ organizationId, employeeId, key, issuedAt: when }], skipDuplicates: true });
     }
@@ -1019,8 +1215,267 @@ export class LettersService {
     return { issuedOn: date };
   }
 
+  // The slot to use for the NEXT issue of a letter: the template key when it has never been issued, else the next free
+  // "key#n" for a letter that can be issued again (an increment, a promotion, a warning...). One-time letters keep their key.
+  async slotForNewIssue(employeeId: string, key: string, organizationId: string): Promise<string> {
+    const base = baseKeyOf(key);
+    const template = await this.letterTemplatesService.findActiveByKey(base, organizationId);
+    if (!template || !isRecurringTemplate(template)) return key;
+    const rows = await this.scopedPrisma.issuedLetter.findMany({ where: { organizationId, employeeId }, select: { key: true } });
+    const mine = rows.filter((r) => baseKeyOf(r.key) === base).map((r) => r.key);
+    return this.nextSlot(base, mine);
+  }
+
+  // An entry started for an automatic letter that then could not be sent is removed again, so no empty "issued" entry is left.
+  // Only an entry with no number and no saved PDF (never actually produced) is removed.
+  async discardEmptyIssue(employeeId: string, slot: string, organizationId: string): Promise<void> {
+    if (!slot.includes('#')) return;
+    await this.scopedPrisma.issuedLetter.deleteMany({ where: { organizationId, employeeId, key: slot, documentNumber: null, pdfKey: null } });
+  }
+
+  // For the automatic letters (promotion, increment, transfer, confirmation...: the slot the new letter goes under. A repeat
+  // of a letter already issued gets its own new entry straight away, so it shows on the Letters tab beside the earlier ones.
+  async prepareNextIssue(employeeId: string, key: string, organizationId: string): Promise<string> {
+    const slot = await this.slotForNewIssue(employeeId, key, organizationId);
+    if (slot.includes('#')) {
+      await this.scopedPrisma.issuedLetter.createMany({
+        data: [{ organizationId, employeeId, key: slot, issuedAt: new Date() }],
+        skipDuplicates: true,
+      });
+    }
+    return slot;
+  }
+
+  // HR/Admin start another issue of a letter that can be issued again: it appears as its own entry (own date, wording,
+  // number, visibility), dated today until they change it.
+  async newOccurrence(employeeId: string, key: string, actor: Actor, organizationId: string, date?: string) {
+    if (date !== undefined) {
+      const probe = new Date(`${date}T12:00:00Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(probe.getTime()) || probe.toISOString().slice(0, 10) !== date) {
+        throw new BadRequestException('Enter the issue date as YYYY-MM-DD.');
+      }
+    }
+    const base = baseKeyOf(key);
+    const template = await this.letterTemplatesService.findActiveByKey(base, organizationId);
+    if (!template) throw new BadRequestException(`No active letter template found for '${base}'.`);
+    if (!isRecurringTemplate(template)) {
+      throw new BadRequestException(`${template.name} is issued once; edit the existing one instead.`);
+    }
+    const row = (await this.listForEmployee(employeeId, actor, organizationId)).find((l) => baseKeyOf(l.key) === base && l.canIssueNew);
+    if (row && !row.unlocked && actor.role !== Role.ADMIN && actor.role !== Role.HR) {
+      throw new BadRequestException(row.reason || 'This letter is not available yet.');
+    }
+    const slot = await this.slotForNewIssue(employeeId, base, organizationId);
+    await this.scopedPrisma.issuedLetter.createMany({
+      data: [{ organizationId, employeeId, key: slot, issuedAt: date ? new Date(`${date}T12:00:00Z`) : new Date() }],
+      skipDuplicates: true,
+    });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'LETTER_ISSUE_STARTED',
+      module: AuditModule.DOCUMENT,
+      organizationId,
+      targetId: employeeId,
+      details: { key: slot, templateName: template.name },
+    });
+    return { key: slot };
+  }
+
+  // An approved letter is final: nobody, Admin included, changes its wording, date or visibility; a correction is a new version.
+  private async assertNotFinal(employeeId: string, key: string, organizationId: string) {
+    const row = await this.scopedPrisma.issuedLetter.findFirst({ where: { organizationId, employeeId, key }, select: { approvedAt: true } });
+    if (row?.approvedAt) throw new BadRequestException(LETTER_FINAL_MESSAGE);
+  }
+
+  private async tellReviewers(organizationId: string, title: string, message: string, link: string) {
+    const reviewers = await this.scopedPrisma.user.findMany({
+      where: { organizationId, isActive: true, role: { in: [Role.ADMIN, Role.HR] } },
+      select: { id: true },
+    });
+    for (const r of reviewers) {
+      await this.notificationsService.create({ organizationId, userId: r.id, title, message, category: NotificationCategory.GENERAL, link });
+    }
+  }
+
+  // The employee approves (accepts) a letter and signs it in the app. The signed PDF - with their signature, the time and the
+  // device - becomes the final copy; from then on the letter cannot be changed by anyone. HR and Admin are told.
+  async approve(
+    employeeId: string,
+    key: string,
+    dto: { signatureName: string; signatureImage?: string; consent: boolean },
+    actor: Actor,
+    organizationId: string,
+    meta: { ip?: string | null; device?: string | null },
+  ) {
+    if (actor.id !== employeeId) throw new ForbiddenException('You can only approve your own letters.');
+    if (!dto.consent) throw new BadRequestException('Tick the box to confirm you have read and accept this letter.');
+    const name = (dto.signatureName ?? '').trim();
+    if (name.length < 2) throw new BadRequestException('Type your full name to sign.');
+    let imageBuffer: Buffer | null = null;
+    if (dto.signatureImage) {
+      const m = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(dto.signatureImage);
+      if (!m || m[1].length > 400_000) throw new BadRequestException('The drawn signature could not be read. Draw it again or just type your name.');
+      imageBuffer = Buffer.from(m[1], 'base64');
+    }
+    const template = await this.letterTemplatesService.findActiveByKey(baseKeyOf(key), organizationId);
+    if (!template) throw new BadRequestException('This letter is no longer available.');
+    const issued = await this.findIssuedLetter(employeeId, key, organizationId);
+    if (!issued) throw new BadRequestException('This letter has not been issued to you yet.');
+    if (issued.approvedAt) return { approvedAt: issued.approvedAt.toISOString() };
+    if (issued.declinedAt || issued.supersededAt) {
+      throw new BadRequestException('This letter was replaced or declined and can no longer be approved.');
+    }
+    const signedAt = new Date();
+    // Build the final PDF with the signature on it (this also checks that the letter is visible to this employee).
+    await this.generate(employeeId, key, actor, organizationId, undefined, undefined, false, { name, signedAt, imageBuffer, ip: meta.ip ?? null, device: meta.device ?? null });
+    const { count } = await this.scopedPrisma.issuedLetter.updateMany({
+      where: { organizationId, employeeId, key, approvedAt: null },
+      data: { approvedAt: signedAt, acknowledgedAt: signedAt, signatureName: name, signedIp: meta.ip ?? null, signedUserAgent: meta.device ?? null },
+    });
+    if (count > 0) {
+      await this.auditLogService.log({
+        actorId: actor.id,
+        action: 'LETTER_APPROVED',
+        module: AuditModule.DOCUMENT,
+        organizationId,
+        targetId: employeeId,
+        details: { key, templateName: template.name, signedAs: name },
+      });
+      await this.tellReviewers(organizationId, 'Letter approved by employee', `${actor.name} approved and signed the ${template.name}.`, `/employee-profile?id=${employeeId}&tab=letters`);
+    }
+    return { approvedAt: signedAt.toISOString() };
+  }
+
+  // The employee declines a letter with a reason; HR/Admin are told and issue a new version.
+  async decline(employeeId: string, key: string, reason: string, actor: Actor, organizationId: string) {
+    if (actor.id !== employeeId) throw new ForbiddenException('You can only respond to your own letters.');
+    const why = (reason ?? '').trim();
+    if (!why) throw new BadRequestException('Say why you are declining this letter.');
+    const template = await this.letterTemplatesService.findActiveByKey(baseKeyOf(key), organizationId);
+    const issued = await this.findIssuedLetter(employeeId, key, organizationId);
+    if (!issued) throw new BadRequestException('This letter has not been issued to you yet.');
+    if (issued.approvedAt) throw new BadRequestException(LETTER_FINAL_MESSAGE);
+    if (issued.declinedAt || issued.supersededAt) throw new BadRequestException('This letter has already been answered or replaced.');
+    const grant = await this.scopedPrisma.employeeLetterAccess.findFirst({ where: { organizationId, employeeId, key }, select: { enabled: true } });
+    if (!grant?.enabled) throw new ForbiddenException('This letter has not been made available to you yet - contact HR.');
+    await this.scopedPrisma.issuedLetter.updateMany({
+      where: { organizationId, employeeId, key, approvedAt: null, declinedAt: null },
+      data: { declinedAt: new Date(), declineReason: why },
+    });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'LETTER_DECLINED',
+      module: AuditModule.DOCUMENT,
+      organizationId,
+      targetId: employeeId,
+      details: { key, templateName: template?.name ?? key, reason: why },
+    });
+    await this.tellReviewers(organizationId, 'Letter declined by employee', `${actor.name} declined the ${template?.name ?? 'letter'}: ${why}`, `/employee-profile?id=${employeeId}&tab=letters`);
+    return { declinedAt: new Date().toISOString() };
+  }
+
+  // HR/Admin correct a letter that is final (approved) or was declined: the old one stays as it is, marked as replaced, and a new
+  // version starts as its own entry (hidden from the employee until switched on, and to be approved again).
+  async newVersion(employeeId: string, key: string, actor: Actor, organizationId: string) {
+    const base = baseKeyOf(key);
+    const template = await this.letterTemplatesService.findActiveByKey(base, organizationId);
+    if (!template) throw new BadRequestException(`No active letter template found for '${base}'.`);
+    const rows = await this.scopedPrisma.issuedLetter.findMany({ where: { organizationId, employeeId } });
+    const mine = rows.filter((r) => baseKeyOf(r.key) === base);
+    const current = mine.find((r) => r.key === key);
+    if (!current) throw new BadRequestException('That letter has not been issued yet.');
+    if (!current.approvedAt && !current.declinedAt) {
+      throw new BadRequestException('This letter can still be edited; a new version is only for one that is approved or declined.');
+    }
+    if (current.supersededAt) throw new BadRequestException('A newer version of this letter already exists.');
+    const slot = this.nextSlot(base, mine.map((r) => r.key));
+    await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { supersededAt: new Date() } });
+    await this.scopedPrisma.issuedLetter.createMany({ data: [{ organizationId, employeeId, key: slot, issuedAt: new Date() }], skipDuplicates: true });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'LETTER_VERSION_STARTED',
+      module: AuditModule.DOCUMENT,
+      organizationId,
+      targetId: employeeId,
+      details: { key: slot, replaces: key, templateName: template.name },
+    });
+    return { key: slot };
+  }
+
+  private nextSlot(base: string, existing: string[]): string {
+    if (existing.length === 0) return base;
+    const used = existing.map((k) => Number(k.split('#')[1] ?? 1)).filter((n) => Number.isFinite(n));
+    return `${base}#${Math.max(1, ...used) + 1}`;
+  }
+
+  // The employee confirms they received and read a letter. Only for their own letter, once it has been issued; the first
+  // confirmation is kept.
+  async acknowledge(employeeId: string, key: string, actor: Actor, organizationId: string) {
+    if (actor.id !== employeeId) throw new ForbiddenException('You can only confirm your own letters.');
+    const issued = await this.findIssuedLetter(employeeId, key, organizationId);
+    if (!issued) throw new BadRequestException('This letter has not been issued to you yet.');
+    if (!issued.acknowledgedAt) {
+      await this.scopedPrisma.issuedLetter.updateMany({
+        where: { organizationId, employeeId, key, acknowledgedAt: null },
+        data: { acknowledgedAt: new Date() },
+      });
+      await this.auditLogService.log({
+        actorId: actor.id,
+        action: 'LETTER_ACKNOWLEDGED',
+        module: AuditModule.DOCUMENT,
+        organizationId,
+        targetId: employeeId,
+        details: { key },
+      });
+    }
+    const after = await this.findIssuedLetter(employeeId, key, organizationId);
+    return { acknowledgedAt: after?.acknowledgedAt?.toISOString() ?? null };
+  }
+
+  // Who did what to one letter, newest first: issued, edited, date changed, emailed, switched on or off, confirmed.
+  // An employee sees only the plain facts about their own switched-on letter (issued, emailed, confirmed read), not HR's edits.
+  async history(employeeId: string, key: string, actor: Actor, organizationId: string) {
+    const asEmployee = actor.role === Role.EMPLOYEE;
+    if (asEmployee) {
+      if (actor.id !== employeeId) throw new ForbiddenException('You can only see the history of your own letters.');
+      const grant = await this.scopedPrisma.employeeLetterAccess.findFirst({ where: { organizationId, employeeId, key }, select: { enabled: true } });
+      if (!grant?.enabled) throw new ForbiddenException('This letter has not been made available to you yet - contact HR.');
+    }
+    const rows = await this.scopedPrisma.auditLog.findMany({
+      where: {
+        organizationId,
+        module: AuditModule.DOCUMENT,
+        targetId: employeeId,
+        action: { in: asEmployee ? EMPLOYEE_HISTORY_ACTIONS : LETTER_HISTORY_ACTIONS },
+        details: { path: ['key'], equals: key },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      select: { action: true, createdAt: true, actorId: true, details: true },
+    });
+    const ids = [...new Set(rows.map((r) => r.actorId).filter((x): x is string => !!x))];
+    const people = ids.length ? await this.scopedPrisma.user.findMany({ where: { id: { in: ids }, organizationId }, select: { id: true, name: true } }) : [];
+    const nameOf = new Map(people.map((p) => [p.id, p.name]));
+    return rows.map((r) => {
+      const d = (r.details ?? {}) as { to?: string; documentNumber?: string; issuedOn?: string; edited?: boolean };
+      return {
+        action: r.action,
+        at: r.createdAt.toISOString(),
+        by: asEmployee ? null : (r.actorId && nameOf.get(r.actorId)) || null,
+        to: d.to ?? null,
+        documentNumber: d.documentNumber ?? null,
+        issuedOn: d.issuedOn ?? null,
+        edited: d.edited ?? null,
+      };
+    });
+  }
+
   // The date and number this letter was first issued with. Letters issued before this was stored are recovered from
   // the audit log's oldest "letter issued" entry and saved, so they keep their real date too. null = never issued.
+  private isPrivileged(actor: Actor) {
+    return actor.role === Role.ADMIN || actor.role === Role.HR;
+  }
+
   private async findIssuedLetter(employeeId: string, key: string, organizationId: string) {
     const saved = await this.scopedPrisma.issuedLetter.findFirst({ where: { organizationId, employeeId, key } });
     if (saved) return saved;
@@ -1057,14 +1512,23 @@ export class LettersService {
     structureAsOf?: string,
     // HR/Admin issuing the letter afresh: a new date and document number replace the saved ones.
     reissue = false,
+    // The employee's signature when they approve the letter: the PDF is built with it and kept as the final copy.
+    signature?: { name: string; signedAt: Date; imageBuffer?: Buffer | null; ip?: string | null; device?: string | null },
   ): Promise<{ buffer: Buffer; filename: string }> {
     if (reissue) {
       if (actor.role !== Role.ADMIN && actor.role !== Role.HR) {
         throw new ForbiddenException('Only HR or an Admin can re-issue a letter.');
       }
+      await this.assertNotFinal(employeeId, key, organizationId);
       await this.scopedPrisma.issuedLetter.deleteMany({ where: { organizationId, employeeId, key } });
     }
     const issued = await this.findIssuedLetter(employeeId, key, organizationId);
+    // A letter HR/Admin has written or edited (a saved version, or this send's own wording) can go out even when the record a
+    // template would draw its figures from does not exist yet.
+    const customized =
+      this.isPrivileged(actor) &&
+      (!!(overrides?.title?.trim() || overrides?.body?.trim()) ||
+        !!(await this.scopedPrisma.letterOverride.findFirst({ where: { organizationId, employeeId, key }, select: { id: true } })));
     const {
       template,
       employee,
@@ -1081,6 +1545,7 @@ export class LettersService {
       organizationId,
       structureAsOf,
       issued?.issuedAt,
+      customized,
     );
 
     // The one-off edit made in the Send box: placeholders HR typed are filled in and stray HTML never reaches the PDF.
@@ -1094,12 +1559,20 @@ export class LettersService {
         )
       : computedParagraphs;
 
+    // The PDF that was issued is kept as it was: a later download returns it, not a rebuild from today's data. Editing the
+    // wording or the date, or re-issuing, clears it (see saveOverride / setIssueDate), and a send with its own wording replaces it.
+    const sendEdited = !!(overrides?.title?.trim() || overrides?.body?.trim());
+    const filename = letterFilename(employee.employeeId, key.includes('#') ? `${template.name} ${(issued?.issuedAt ?? new Date()).toISOString().slice(0, 10)}` : template.name);
+    if (issued?.pdfKey && !sendEdited && !signature) {
+      const stored = await readStoredFile(issued.pdfKey);
+      if (stored) return { buffer: stored, filename };
+    }
     // A letter already issued keeps its date and number; only a first issue (or a re-issue) takes a new number.
     const issuedAt = issued?.issuedAt ?? new Date();
     const documentNumber =
       issued?.documentNumber ??
       (await this.scopedPrisma.$transaction((tx) =>
-        issueDocumentNumber(tx, organizationId, key, issuedAt, employee.employeeId, employee.name),
+        issueDocumentNumber(tx, organizationId, baseKeyOf(key), issuedAt, employee.employeeId, employee.name),
       ));
     if (!issued) {
       await this.scopedPrisma.issuedLetter.createMany({
@@ -1164,7 +1637,17 @@ export class LettersService {
       watermarkEnabled: organization.watermarkLogo,
       letterHeaderBuffer,
       letterFooterBuffer,
+      employeeSignature: signature ?? null,
     });
+
+    // Keep the exact PDF just produced as the issued copy. Never fatal: without it the letter is simply rebuilt next time.
+    try {
+      const pdfKey = `${organizationId}/letters/${employeeId}/${key.replace(/[^A-Za-z0-9_-]/g, '_')}-${Date.now()}.pdf`;
+      await writeStoredFile(pdfKey, buffer, 'application/pdf');
+      await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { pdfKey } });
+    } catch {
+      /* the letter was produced; only the saved copy is missing */
+    }
 
     await this.auditLogService.log({
       actorId: actor.id,
@@ -1175,14 +1658,7 @@ export class LettersService {
       details: { key, templateName: template.name, documentNumber },
     });
 
-    return {
-      buffer,
-      // "DP-00005-Appointment Letter.pdf": the employee ID, then the letter's name as HR sees it.
-      filename: `${`${employee.employeeId}-${template.name}`
-        .replace(/[\\/:*?"<>|\r\n]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()}.pdf`,
-    };
+    return { buffer, filename };
   }
 
   // HR/Admin-only follow-up to generate() — everything is pulled from the
@@ -1205,9 +1681,13 @@ export class LettersService {
     // the Send modal — see SendLetterDto and generate()'s own comment.
     overrides?: { title?: string; body?: string },
     structureAsOf?: string,
+    // Also switch the letter on in the employee's My Letters (so what they were emailed is also there).
+    makeVisible = false,
   ): Promise<{ message: string }> {
+    // The approved copy can be emailed as it is, but not re-worded.
+    if (overrides?.title?.trim() || overrides?.body?.trim()) await this.assertNotFinal(employeeId, key, organizationId);
     const template = await this.letterTemplatesService.findActiveByKey(
-      key,
+      baseKeyOf(key),
       organizationId,
     );
     if (!template) {
@@ -1228,19 +1708,14 @@ export class LettersService {
       },
     });
     if (!employee) throw new NotFoundException('Employee not found.');
-    // Someone who has left (or is leaving) loses the company mailbox, so their letters - relieving, experience - go to the
-    // personal address on file when there is one.
-    const leaving = !employee.isActive || !!employee.exitDate;
-    let recipient =
-      (leaving ? personalEmailOf(employee.personalData) : null) ??
-      employee.email;
-    // Someone with no email has only an undeliverable placeholder address: use a personal address if one was ever added, else
-    // refuse - the letter is never "sent" to nowhere. HR downloads it and hands it over.
-    if (isPlaceholderEmail(recipient))
-      recipient = personalEmailOf(employee.personalData) ?? '';
+    // Someone who has left (or is leaving) has no working company mailbox: their letters go to the personal email on file and
+    // nowhere else. With none, the letter is refused - never sent to the company address, never "sent" to nowhere.
+    const { leaving, recipient } = letterRecipientOf(employee);
     if (!recipient) {
       throw new BadRequestException(
-        `${employee.name} has no email address, so this letter cannot be emailed. Download it and hand it over.`,
+        leaving
+          ? `${employee.name} has left (or is leaving) and has no personal email on file, so this letter cannot be emailed. Add their Personal Email to the profile, or download the letter and hand it over.`
+          : `${employee.name} has no email address, so this letter cannot be emailed. Download it and hand it over.`,
       );
     }
 
@@ -1288,6 +1763,7 @@ export class LettersService {
       attachments: [{ filename, content: buffer }],
     });
 
+    if (makeVisible) await this.writeAccess(employeeId, key, true, actor, organizationId, template.name, true, !!template.requiresApproval);
     const edited = !!(overrides?.title?.trim() || overrides?.body?.trim());
     await this.auditLogService.log({
       actorId: actor.id,
@@ -1295,7 +1771,8 @@ export class LettersService {
       module: AuditModule.DOCUMENT,
       organizationId,
       targetId: employeeId,
-      details: { key, templateName: template.name, to: recipient, edited },
+      // What HR changed for this send is kept as sent, so there is a record of the exact wording that went out.
+      details: { key, templateName: template.name, to: recipient, edited, ...(edited ? { sentTitle: overrides?.title ?? null, sentBody: overrides?.body ?? null } : {}) },
     });
     await this.timelineService.logEvent({
       organizationId,

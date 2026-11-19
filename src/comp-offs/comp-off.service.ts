@@ -43,7 +43,7 @@ import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { CreateCompOffDto } from './dto/create-comp-off.dto';
 import { CreateCompOffsDto, PreviewCompOffDto } from './dto/comp-off-dates.dto';
 import { ReviewCompOffDto } from './dto/review-comp-off.dto';
-import { CancelCompOffDto } from './dto/cancel-comp-off.dto';
+import { CancelCompOffDto, WithdrawCompOffDto } from './dto/cancel-comp-off.dto';
 import {
   consumeCompOff,
   releaseCompOff,
@@ -909,6 +909,63 @@ export class CompOffService {
       organizationId,
       targetId: id,
       details: { earnedForDate: compOff.earnedForDate, reason },
+    });
+    return this.findByIdOrThrow(id, organizationId);
+  }
+
+  // The employee withdraws their own comp-off: while it is waiting, or once approved if no day of it has been used.
+  // Reviewers are told. A comp-off already used (even partly) stays: leave has been taken against it.
+  async withdraw(
+    id: string,
+    dto: WithdrawCompOffDto,
+    actor: Actor,
+    organizationId: string,
+  ) {
+    const compOff = await this.findByIdOrThrow(id, organizationId);
+    if (compOff.employeeId !== actor.id) {
+      throw new ForbiddenException('You can only withdraw your own comp-off.');
+    }
+    const wasApproved = compOff.status === CompOffStatus.APPROVED;
+    if (
+      (compOff.status !== CompOffStatus.PENDING && !wasApproved) ||
+      Number(compOff.daysAvailed) > 0
+    ) {
+      throw new BadRequestException(
+        'Only a waiting comp-off, or an approved one that has not been used, can be withdrawn.',
+      );
+    }
+    const reason = (dto.reason ?? '').trim();
+    if (wasApproved && !reason) {
+      throw new BadRequestException('Add a reason for withdrawing this comp-off.');
+    }
+    const { count } = await this.scopedPrisma.compOff.updateMany({
+      where: { id, organizationId, status: compOff.status, daysAvailed: 0 },
+      data: {
+        status: CompOffStatus.REJECTED,
+        decisionNote: reason ? `Withdrawn by employee: ${reason}` : 'Withdrawn by employee',
+      },
+    });
+    if (count === 0) {
+      throw new ConflictException(
+        'This comp-off was just used or changed - reload and try again.',
+      );
+    }
+    const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(this.scopedPrisma, organizationId);
+    await this.notificationsService.notifyReviewers({
+      organizationId,
+      requester: actor,
+      title: 'Comp-Off Withdrawn',
+      message: `${actor.name} withdrew ${wasApproved ? 'the approved' : 'the requested'} comp-off for ${formatDateDisplay(compOff.earnedForDate, '', dateFormat, timeZone)}.${reason ? ` Reason: ${reason}` : ''}`,
+      category: NotificationCategory.ATTENDANCE,
+      managerFirst: true,
+    });
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'COMP_OFF_WITHDRAWN_BY_EMPLOYEE',
+      module: 'LEAVE',
+      organizationId,
+      targetId: id,
+      details: { earnedForDate: compOff.earnedForDate, reason, wasApproved },
     });
     return this.findByIdOrThrow(id, organizationId);
   }

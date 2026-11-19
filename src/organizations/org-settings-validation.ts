@@ -343,7 +343,7 @@ function validatePolicies(p: Record<string, unknown>) {
     if (!e || typeof e !== 'object' || Array.isArray(e)) bad('policies.eventLetters must be an object.');
     else {
       for (const [k, v] of Object.entries(e as Record<string, unknown>)) {
-        if (!['promotionLetter', 'incrementLetter', 'transferLetter'].includes(k)) bad(`policies.eventLetters.${k} is not a letter that follows an event.`);
+        if (!['promotionLetter', 'incrementLetter', 'transferLetter', 'offerLetter', 'appointmentLetter'].includes(k)) bad(`policies.eventLetters.${k} is not a letter that follows an event.`);
         else if (!['off', 'review', 'send'].includes(v as string)) bad(`policies.eventLetters.${k} must be off, review or send.`);
       }
     }

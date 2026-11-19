@@ -7,8 +7,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
-  MaxLength,
-} from 'class-validator';
+  MaxLength, } from 'class-validator';
 import { LETTER_STAGES } from '../../letters/letter-stages';
 
 export class UpdateLetterTemplateDto {
@@ -59,4 +58,16 @@ export class UpdateLetterTemplateDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+
+  // Can be issued to the same person more than once (increment, warning, ...). Only a custom template takes it.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  allowMultiple?: boolean;
+
+  // The employee must approve (accept and sign) the letter once it is visible to them.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  requiresApproval?: boolean;
 }

@@ -125,6 +125,15 @@ export interface LetterPdfInput {
   // name, address, rule) is drawn / no footer strip.
   letterHeaderBuffer?: Buffer | null;
   letterFooterBuffer?: Buffer | null;
+  // The employee's approval of the letter, signed in the app: drawn (image) or typed (name only). Printed under the company's
+  // signature with the time and device it was signed on, so the signed copy is a record in itself.
+  employeeSignature?: {
+    name: string;
+    signedAt: Date;
+    imageBuffer?: Buffer | null;
+    ip?: string | null;
+    device?: string | null;
+  } | null;
 }
 
 @Injectable()
@@ -354,6 +363,35 @@ export class LetterPdfService {
       } else {
         doc.font('Letter-Regular').fontSize(9).fillColor(INK_400);
         doc.text('Authorized Signatory', MARGIN, doc.y, { width: CONTENT_W });
+      }
+
+      if (input.employeeSignature) {
+        const sig = input.employeeSignature;
+        const ACCEPT_H = 120;
+        if (doc.y + ACCEPT_H > doc.page.height - doc.page.margins.bottom) doc.addPage();
+        doc.moveDown(1.2);
+        const ruleY = doc.y;
+        doc.moveTo(MARGIN, ruleY).lineTo(MARGIN + CONTENT_W, ruleY).lineWidth(0.5).strokeColor(BORDER).stroke();
+        doc.font('Letter-Regular').fontSize(9).fillColor(INK_400);
+        doc.text('Accepted and signed electronically by the employee', MARGIN, ruleY + 8, { width: CONTENT_W });
+        const signTop = doc.y + 6;
+        if (sig.imageBuffer) {
+          try {
+            doc.image(sig.imageBuffer, MARGIN, signTop, { fit: [140, 44] });
+          } catch {
+            doc.font('Letter-Bold').fontSize(16).fillColor(INK_900);
+            doc.text(sig.name, MARGIN, signTop, { width: CONTENT_W });
+          }
+        } else {
+          doc.font('Letter-Bold').fontSize(16).fillColor(INK_900);
+          doc.text(sig.name, MARGIN, signTop, { width: CONTENT_W });
+        }
+        doc.y = signTop + 48;
+        doc.font('Letter-Bold').fontSize(10).fillColor(INK_900);
+        doc.text(sig.name, MARGIN, doc.y, { width: CONTENT_W });
+        doc.font('Letter-Regular').fontSize(8.5).fillColor(INK_400);
+        const when = sig.signedAt.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+        doc.text(`Signed ${when}${sig.ip ? ` - IP ${sig.ip}` : ''}${sig.device ? ` - ${sig.device.slice(0, 80)}` : ''}`, MARGIN, doc.y, { width: CONTENT_W });
       }
 
       doc.end();

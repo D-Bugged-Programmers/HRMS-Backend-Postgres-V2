@@ -896,6 +896,10 @@ model LetterTemplate {
   // The stage of the employee's journey a CUSTOM template belongs to (HIRING | PROBATION | EMPLOYMENT | DISCIPLINARY | EXIT); null = not part of the
   // flow. Built-in templates ignore it - their stage is fixed in letters/letter-stages.ts.
   journeyStage String?
+  // A custom template that can be issued to the same person again and again (each issue keeps its own date and number).
+  allowMultiple Boolean @default(false)
+  // The employee has to approve (accept and sign) this letter once HR/Admin have made it visible to them.
+  requiresApproval Boolean @default(true)
   // False only for the 7 seeded built-in keys — can't be deleted (Document
   // Numbering and this app's own onboarding/exit flows point at those
   // exact keys), only disabled/re-edited. A custom template can be
@@ -957,6 +961,21 @@ model IssuedLetter {
   key            String
   issuedAt       DateTime
   documentNumber String?
+  // The exact PDF that was issued (storage key); null until one has been produced, or after the wording or date changed.
+  pdfKey         String?
+  // When the employee confirmed they received and read it.
+  acknowledgedAt DateTime?
+  // The employee's approval (acceptance) of the letter, signed in the app. Once set the letter is final: nobody can change it,
+  // and a correction is issued as a new version.
+  approvedAt       DateTime?
+  signatureName    String?
+  signedIp         String?
+  signedUserAgent  String?
+  // The employee declined it (with a reason); HR/Admin issue a new version.
+  declinedAt       DateTime?
+  declineReason    String?
+  // Replaced by a newer version; kept for the record.
+  supersededAt     DateTime?
   createdAt      DateTime @default(now())
 
   @@unique([organizationId, employeeId, key])

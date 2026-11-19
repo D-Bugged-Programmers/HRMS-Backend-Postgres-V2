@@ -16,6 +16,7 @@ import {
   Delete,
   Get,
   Param,
+  Req,
   Query,
   Patch,
   Post,
@@ -23,13 +24,14 @@ import {
   Res,
   UseGuards,
 } from '@nestjs/common';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Role, User } from '@prisma/client';
 import { LettersService } from './letters.service';
 import { SendLetterDto } from './dto/send-letter.dto';
-import { SetIssueDateDto } from './dto/set-issue-date.dto';
+import { SetIssueDateDto, NewLetterIssueDto } from './dto/set-issue-date.dto';
+import { ApproveLetterDto, DeclineLetterDto } from './dto/approve-letter.dto';
 import { SaveLetterContentDto } from './dto/save-letter-content.dto';
 import { SetLetterAccessDto } from './dto/set-letter-access.dto';
 import { SelfOrRoles } from '../common/decorators/self-or-roles.decorator';
@@ -187,6 +189,19 @@ export class LettersController {
     );
   }
 
+  // Switch a whole stage (HIRING, PROBATION, EMPLOYMENT, DISCIPLINARY, EXIT) on or off for the employee at once.
+  @Patch('stage/:stage/access')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  async setStageAccess(
+    @Param('id') id: string,
+    @Param('stage') stage: string,
+    @Body() dto: SetLetterAccessDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.lettersService.setStageAccess(id, stage, dto.enabled, caller, caller.organizationId);
+  }
+
   @Patch(':key/issue-date')
   @Roles(Role.ADMIN, Role.HR)
   @UseGuards(RolesGuard)
@@ -212,6 +227,61 @@ export class LettersController {
     return this.lettersService.send(id, key, caller, caller.organizationId, {
       title: dto.title,
       body: dto.body,
+    }, undefined, dto.makeVisible === true);
+  }
+
+  // Start another issue of a letter that can be issued again (increment, promotion, warning...).
+  @Post(':key/new')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  async newIssue(@Param('id') id: string, @Param('key') key: string, @Body() dto: NewLetterIssueDto, @CurrentUser() caller: Caller) {
+    return this.lettersService.newOccurrence(id, key, caller, caller.organizationId, dto.date);
+  }
+
+  // The employee approves (accepts) their letter and signs it in the app; from then on it is final.
+  @Post(':key/approve')
+  async approve(
+    @Param('id') id: string,
+    @Param('key') key: string,
+    @Body() dto: ApproveLetterDto,
+    @CurrentUser() caller: Caller,
+    @Req() req: Request,
+  ) {
+    return this.lettersService.approve(id, key, dto, caller, caller.organizationId, {
+      ip: req.ip ?? null,
+      device: (req.headers['user-agent'] as string | undefined) ?? null,
     });
+  }
+
+  // The employee declines their letter with a reason.
+  @Post(':key/decline')
+  async decline(@Param('id') id: string, @Param('key') key: string, @Body() dto: DeclineLetterDto, @CurrentUser() caller: Caller) {
+    return this.lettersService.decline(id, key, dto.reason, caller, caller.organizationId);
+  }
+
+  // HR/Admin correct an approved or declined letter: a new version starts and the old one is kept as the record.
+  @Post(':key/version')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  async newVersion(@Param('id') id: string, @Param('key') key: string, @CurrentUser() caller: Caller) {
+    return this.lettersService.newVersion(id, key, caller, caller.organizationId);
+  }
+
+  // The employee confirms they received and read their own letter.
+  @Post(':key/acknowledge')
+  async acknowledge(
+    @Param('id') id: string,
+    @Param('key') key: string,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.lettersService.acknowledge(id, key, caller, caller.organizationId);
+  }
+
+  // Who did what to this letter (HR/Admin); the employee sees only issued / emailed / confirmed for their own switched-on letter.
+  @Get(':key/history')
+  @SelfOrRoles('id', Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  async history(@Param('id') id: string, @Param('key') key: string, @CurrentUser() caller: Caller) {
+    return this.lettersService.history(id, key, caller, caller.organizationId);
   }
 }

@@ -16,7 +16,7 @@ import { Role, User } from '@prisma/client';
 import { CompOffService } from './comp-off.service';
 import { CreateCompOffDto } from './dto/create-comp-off.dto';
 import { CreateCompOffsDto, PreviewCompOffDto } from './dto/comp-off-dates.dto';
-import { CancelCompOffDto } from './dto/cancel-comp-off.dto';
+import { CancelCompOffDto, WithdrawCompOffDto } from './dto/cancel-comp-off.dto';
 import { ReviewCompOffDto } from './dto/review-comp-off.dto';
 import { ListCompOffsQueryDto } from './dto/list-comp-offs-query.dto';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -86,5 +86,15 @@ export class CompOffController {
     @CurrentUser() caller: Caller,
   ) {
     return this.compOffService.cancel(id, dto, caller, caller.organizationId);
+  }
+
+  // The employee withdraws their own comp-off while it is waiting, or after approval if it has not been used.
+  @Patch(':id/withdraw')
+  withdraw(
+    @Param('id') id: string,
+    @Body() dto: WithdrawCompOffDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.compOffService.withdraw(id, dto, caller, caller.organizationId);
   }
 }

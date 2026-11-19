@@ -1155,6 +1155,8 @@ export class DashboardService {
         // Set once the reporting manager has signed off level 1 of a two-level leave type; the request then waits
         // for HR/Admin's final decision, so the list can say so instead of offering the manager Approve again.
         levelOneApprovedAt: l.level1ApprovedAt,
+        // The employee's remarks on the leave (a cancellation shows its own reason instead).
+        reason: l.status === LeaveStatus.APPROVED ? null : l.remarks?.trim() || null,
       })),
       ...regularizations.map((a) => {
         // What was actually punched and what is being asked for, in the organization's own clock, so the reviewer sees
@@ -1162,6 +1164,7 @@ export class DashboardService {
         const reg = a.regularization as unknown as {
           requestedInTime?: string | null;
           requestedOutTime?: string | null;
+          reason?: string | null;
         } | null;
         const clock = (v: Date | string | null | undefined, none: string) =>
           v
@@ -1185,6 +1188,8 @@ export class DashboardService {
           date: a.date,
           endDate: null,
           requestedAt: a.updatedAt,
+          // Why the employee asked for the correction: the approver needs it to decide.
+          reason: reg?.reason?.trim() || null,
         };
       }),
       ...this.groupWfhRows(wfh).map((g) => ({
@@ -1226,6 +1231,7 @@ export class DashboardService {
         date: c.earnedForDate,
         endDate: null,
         requestedAt: c.createdAt,
+        reason: c.reason?.trim() || null,
       })),
     ];
     // Newest first: the latest request is on top. With more than LIMIT waiting the list is the LIMIT newest (each

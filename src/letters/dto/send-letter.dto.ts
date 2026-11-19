@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 
 // Both optional — an unedited Send keeps sending the template's own
 // rendered content exactly as before this existed. When present and
@@ -19,4 +19,10 @@ export class SendLetterDto {
   @IsString()
   @MaxLength(20000)
   body?: string;
+
+  // Also switch the letter on in the employee's My Letters.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  makeVisible?: boolean;
 }

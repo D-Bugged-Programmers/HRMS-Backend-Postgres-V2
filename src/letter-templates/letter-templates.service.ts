@@ -235,6 +235,8 @@ export class LetterTemplatesService implements OnApplicationBootstrap {
         addressedToEmployee: dto.addressedToEmployee ?? true,
         dataProfile: dto.dataProfile ?? LetterDataProfile.BASIC,
         journeyStage: dto.journeyStage ?? null,
+        allowMultiple: dto.allowMultiple ?? false,
+        requiresApproval: dto.requiresApproval ?? true,
         isCustom: true,
       },
     });
@@ -302,9 +304,13 @@ export class LetterTemplatesService implements OnApplicationBootstrap {
         // data profile is load-bearing, so an edit can't change it.
         ...(dto.dataProfile !== undefined &&
           existing.isCustom && { dataProfile: dto.dataProfile }),
+        // Whether the employee has to approve and sign the letter: the company's choice for every template.
+        ...(dto.requiresApproval !== undefined && { requiresApproval: dto.requiresApproval }),
         // The journey stage is the admin's choice on a custom template (null = not part of the flow); a built-in one's is fixed.
         ...(dto.journeyStage !== undefined &&
           existing.isCustom && { journeyStage: dto.journeyStage }),
+        ...(dto.allowMultiple !== undefined &&
+          existing.isCustom && { allowMultiple: dto.allowMultiple }),
         ...(dto.isActive !== undefined && { isActive: dto.isActive }),
       },
     });

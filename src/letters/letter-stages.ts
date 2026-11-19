@@ -36,9 +36,12 @@ const KEYS_BY_STAGE: Record<KnownLetterStage, string[]> = {
     'employmentVerificationLetter',
     'appreciationLetter',
   ],
+  // The usual order of progressive discipline (as in most HR systems): a show-cause asks for the employee's explanation, then a
+  // written warning, then suspension (or a final warning), and termination (in Exit) as the last step. Absconding is its own
+  // track, for unauthorised absence.
   DISCIPLINARY: [
-    'warningLetter',
     'showCauseNotice',
+    'warningLetter',
     'suspensionLetter',
     'abscondingNotice',
   ],

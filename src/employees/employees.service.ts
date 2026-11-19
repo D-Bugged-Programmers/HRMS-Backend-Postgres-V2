@@ -14,7 +14,7 @@ import { summarizeDocumentReview, type DocumentReview } from './document-review'
 import { featureEnabledFor, sisterCompaniesOn } from '../module-access/module-gate';
 import { FieldTrackingService } from '../field-tracking/field-tracking.service';
 import { LettersService } from '../letters/letters.service';
-import { sendLetterQuietly, handleEventLetter } from '../letters/auto-letter';
+import { sendLetterQuietly, handleEventLetter, handleHiringLetters } from '../letters/auto-letter';
 import { assertEmployeeRoom } from '../module-access/module-gate';
 import { buildOrgChart } from './org-chart';
 import {
@@ -185,7 +185,7 @@ export class EmployeesService {
     // below. Never set by the controller directly: CreateEmployeeDto (the
     // manual "Add Employee" form) has no such flag — its own Email/No-email
     // choice is expressed by whether personalEmail is present at all.
-    options?: { sendWelcomeEmail?: boolean },
+    options?: { sendWelcomeEmail?: boolean; prepareHiringLetters?: boolean },
   ) {
     const sendWelcomeEmail = options?.sendWelcomeEmail ?? true;
     const requestedRole = dto.role ?? Role.EMPLOYEE;
@@ -416,6 +416,11 @@ export class EmployeesService {
       eventKey: 'EMPLOYEE_RECORD_CREATED',
       performedById: actor.id,
     });
+
+    // The hiring letters are prepared the way the company chose (review / send / off). Not for a bulk import, which would flood HR with one notice per row.
+    if (options?.prepareHiringLetters !== false) {
+      void handleHiringLetters({ letters: this.lettersService, logger: this.logger, prisma: this.scopedPrisma }, { employeeId: user.id, actorId: actor.id, organizationId });
+    }
 
     // After the record exists: switch live tracking on the same way the directory does (notice to the person, audit, consent to follow).
     let trackingOn = false;
@@ -916,7 +921,7 @@ export class EmployeesService {
           dto,
           actor,
           organizationId,
-          { sendWelcomeEmail },
+          { sendWelcomeEmail, prepareHiringLetters: false },
         );
         created.push({
           employeeId: employee.employeeId,
