@@ -947,6 +947,23 @@ model LetterOverride {
   @@map("letter_overrides")
 }
 
+// The date and document number a letter was first issued with, so every later download of the same letter shows
+// them again instead of today's. HR can issue it afresh (new date and number) with a re-issue. See LettersService.generate.
+model IssuedLetter {
+  id             String   @id @default(uuid())
+  organizationId String
+  employeeId     String
+  // Matches LetterTemplate.key (loose coupling, as LetterOverride).
+  key            String
+  issuedAt       DateTime
+  documentNumber String?
+  createdAt      DateTime @default(now())
+
+  @@unique([organizationId, employeeId, key])
+  @@index([organizationId, employeeId])
+  @@map("issued_letters")
+}
+
 // Per-employee visibility override for a small set of RESTRICTED_LETTER_KEYS
 // (see letters.service.ts) — disciplinary/sensitive letters (Warning,
 // Suspension, Show-Cause Notice) that must not be self-servable by every

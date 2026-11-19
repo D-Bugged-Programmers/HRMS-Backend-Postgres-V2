@@ -7,6 +7,7 @@
 //   Content is fully admin-authored via LetterTemplatesService — nothing here hardcodes letter wording;
 //   only the *shape* of the 4 dataProfiles (BASIC/EXIT/PAYROLL/SETTLEMENT) is fixed, since each names a
 //   real prerequisite record (OffboardingCase/PayrollRun/Settlement) that can't be invented from nothing.
+import { dateStrInOrgTz } from '../common/org-date';
 import { personalEmailOf } from '../common/personal-email';
 import {
   BadRequestException,
@@ -268,6 +269,8 @@ export class LettersService {
       dataProfile: LetterDataProfile;
       unlocked: boolean;
       reason: string | null;
+      // YYYY-MM-DD the letter was issued on (null = never issued).
+      issuedOn: string | null;
       // Only present for a RESTRICTED_LETTER_KEYS entry — restricted is
       // always true there; accessEnabled reflects the current
       // EmployeeLetterAccess grant so a privileged caller's UI can render
@@ -371,6 +374,21 @@ export class LettersService {
     const inFlowOrder = [...activeTemplates].sort(
       (a, b) => letterFlowOrder(a.key) - letterFlowOrder(b.key),
     );
+    // When each letter was issued: the saved date, else the oldest "letter issued" entry (letters from before dates were saved).
+    const issuedOnByKey = new Map<string, string>();
+    const [savedIssues, issuedAudit] = await Promise.all([
+      this.scopedPrisma.issuedLetter.findMany({ where: { organizationId, employeeId }, select: { key: true, issuedAt: true } }),
+      this.scopedPrisma.auditLog.findMany({
+        where: { organizationId, module: AuditModule.DOCUMENT, action: 'LETTER_ISSUED', targetId: employeeId },
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true, details: true },
+      }),
+    ]);
+    for (const r of issuedAudit) {
+      const k = (r.details as { key?: string } | null)?.key;
+      if (k && !issuedOnByKey.has(k)) issuedOnByKey.set(k, dateStrInOrgTz('Asia/Kolkata', r.createdAt));
+    }
+    for (const r of savedIssues) issuedOnByKey.set(r.key, dateStrInOrgTz('Asia/Kolkata', r.issuedAt));
     const all = inFlowOrder.map((t) => {
       const gate = UNLOCK_BY_PROFILE[t.dataProfile];
       const restricted = RESTRICTED_LETTER_KEYS.has(t.key);
@@ -393,6 +411,7 @@ export class LettersService {
       return {
         key: t.key,
         name: t.name,
+        issuedOn: issuedOnByKey.get(t.key) ?? null,
         dataProfile: t.dataProfile,
         stage: stageOfTemplate(t),
         inCurrentStage: stageOfTemplate(t) === nowStage,
@@ -436,6 +455,8 @@ export class LettersService {
     // The date whose salary structure the Revised CTC letter describes (the revision's effective date); today when
     // omitted. Only the increment letter reads it.
     structureAsOf?: string,
+    // The date this letter was first issued; today when it has not been issued yet.
+    issuedAt?: Date,
   ) {
     const template = await this.letterTemplatesService.findActiveByKey(
       key,
@@ -600,7 +621,7 @@ export class LettersService {
       companyLin: registration.lin?.trim() || '—',
       companyMsmeNumber: registration.msmeRegistrationNumber?.trim() || '—',
       companyLabourLicense: registration.labourLicenseNumber?.trim() || '—',
-      issueDate: formatDateDisplay(new Date()),
+      issueDate: formatDateDisplay(issuedAt ?? new Date()),
       // Available on every dataProfile (not just BASIC) since it's a
       // plain employee-record field, same as designation/department above
       // — backs Confirmation/Probation Extension Letter.
@@ -820,11 +841,14 @@ export class LettersService {
     actor: Actor,
     organizationId: string,
   ): Promise<{ title: string; body: string; isCustomized: boolean }> {
+    const issued = await this.findIssuedLetter(employeeId, key, organizationId);
     const { title, paragraphs, isCustomized } = await this.computeLetterContent(
       employeeId,
       key,
       actor,
       organizationId,
+      undefined,
+      issued?.issuedAt,
     );
     return { title, body: paragraphs.join('\n'), isCustomized };
   }
@@ -970,6 +994,56 @@ export class LettersService {
     return { key, enabled };
   }
 
+  // HR/Admin correct the date a letter was issued on. It is saved, and every later download, preview and email shows it.
+  async setIssueDate(employeeId: string, key: string, date: string, actor: Actor, organizationId: string) {
+    const when = new Date(`${date}T12:00:00Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(when.getTime()) || when.toISOString().slice(0, 10) !== date) {
+      throw new BadRequestException('Enter the issue date as YYYY-MM-DD.');
+    }
+    const employee = await this.scopedPrisma.user.findFirst({ where: { id: employeeId, organizationId }, select: { id: true } });
+    if (!employee) throw new NotFoundException('Employee not found.');
+    const existing = await this.findIssuedLetter(employeeId, key, organizationId);
+    if (existing) {
+      await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { issuedAt: when } });
+    } else {
+      await this.scopedPrisma.issuedLetter.createMany({ data: [{ organizationId, employeeId, key, issuedAt: when }], skipDuplicates: true });
+    }
+    await this.auditLogService.log({
+      actorId: actor.id,
+      action: 'LETTER_ISSUE_DATE_CHANGED',
+      module: AuditModule.DOCUMENT,
+      organizationId,
+      targetId: employeeId,
+      details: { key, issuedOn: date },
+    });
+    return { issuedOn: date };
+  }
+
+  // The date and number this letter was first issued with. Letters issued before this was stored are recovered from
+  // the audit log's oldest "letter issued" entry and saved, so they keep their real date too. null = never issued.
+  private async findIssuedLetter(employeeId: string, key: string, organizationId: string) {
+    const saved = await this.scopedPrisma.issuedLetter.findFirst({ where: { organizationId, employeeId, key } });
+    if (saved) return saved;
+    const first = await this.scopedPrisma.auditLog.findFirst({
+      where: {
+        organizationId,
+        module: AuditModule.DOCUMENT,
+        action: 'LETTER_ISSUED',
+        targetId: employeeId,
+        details: { path: ['key'], equals: key },
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { createdAt: true, details: true },
+    });
+    if (!first) return null;
+    const number = (first.details as { documentNumber?: unknown } | null)?.documentNumber;
+    await this.scopedPrisma.issuedLetter.createMany({
+      data: [{ organizationId, employeeId, key, issuedAt: first.createdAt, documentNumber: typeof number === 'string' ? number : null }],
+      skipDuplicates: true,
+    });
+    return this.scopedPrisma.issuedLetter.findFirst({ where: { organizationId, employeeId, key } });
+  }
+
   async generate(
     employeeId: string,
     key: string,
@@ -981,7 +1055,16 @@ export class LettersService {
     // download route never overrides anything.
     overrides?: { title?: string; body?: string },
     structureAsOf?: string,
+    // HR/Admin issuing the letter afresh: a new date and document number replace the saved ones.
+    reissue = false,
   ): Promise<{ buffer: Buffer; filename: string }> {
+    if (reissue) {
+      if (actor.role !== Role.ADMIN && actor.role !== Role.HR) {
+        throw new ForbiddenException('Only HR or an Admin can re-issue a letter.');
+      }
+      await this.scopedPrisma.issuedLetter.deleteMany({ where: { organizationId, employeeId, key } });
+    }
+    const issued = await this.findIssuedLetter(employeeId, key, organizationId);
     const {
       template,
       employee,
@@ -997,6 +1080,7 @@ export class LettersService {
       actor,
       organizationId,
       structureAsOf,
+      issued?.issuedAt,
     );
 
     // The one-off edit made in the Send box: placeholders HR typed are filled in and stray HTML never reaches the PDF.
@@ -1010,16 +1094,22 @@ export class LettersService {
         )
       : computedParagraphs;
 
-    const documentNumber = await this.scopedPrisma.$transaction((tx) =>
-      issueDocumentNumber(
-        tx,
-        organizationId,
-        key,
-        new Date(),
-        employee.employeeId,
-        employee.name,
-      ),
-    );
+    // A letter already issued keeps its date and number; only a first issue (or a re-issue) takes a new number.
+    const issuedAt = issued?.issuedAt ?? new Date();
+    const documentNumber =
+      issued?.documentNumber ??
+      (await this.scopedPrisma.$transaction((tx) =>
+        issueDocumentNumber(tx, organizationId, key, issuedAt, employee.employeeId, employee.name),
+      ));
+    if (!issued) {
+      await this.scopedPrisma.issuedLetter.createMany({
+        data: [{ organizationId, employeeId, key, issuedAt, documentNumber }],
+        skipDuplicates: true,
+      });
+    } else if (!issued.documentNumber) {
+      // A date was set by hand before the letter was ever issued: the number is taken now and kept.
+      await this.scopedPrisma.issuedLetter.updateMany({ where: { organizationId, employeeId, key }, data: { documentNumber } });
+    }
 
     const signatories = (organization.signatories ?? []) as Array<{
       name?: string;
@@ -1058,7 +1148,7 @@ export class LettersService {
     const buffer = await this.pdfService.render({
       content: { title, paragraphs },
       documentNumber,
-      issueDate: new Date(),
+      issueDate: issuedAt,
       companyName,
       companyAddress:
         (branding?.brandId

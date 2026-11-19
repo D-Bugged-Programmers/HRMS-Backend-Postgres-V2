@@ -16,6 +16,7 @@ import {
   Delete,
   Get,
   Param,
+  Query,
   Patch,
   Post,
   Put,
@@ -28,6 +29,7 @@ import { Throttle } from '@nestjs/throttler';
 import { Role, User } from '@prisma/client';
 import { LettersService } from './letters.service';
 import { SendLetterDto } from './dto/send-letter.dto';
+import { SetIssueDateDto } from './dto/set-issue-date.dto';
 import { SaveLetterContentDto } from './dto/save-letter-content.dto';
 import { SetLetterAccessDto } from './dto/set-letter-access.dto';
 import { SelfOrRoles } from '../common/decorators/self-or-roles.decorator';
@@ -81,12 +83,17 @@ export class LettersController {
     @Param('key') key: string,
     @CurrentUser() caller: Caller,
     @Res() res: Response,
+    // ?reissue=true: HR/Admin issue the letter afresh, with today's date and a new document number.
+    @Query('reissue') reissue?: string,
   ) {
     const { buffer, filename } = await this.lettersService.generate(
       id,
       key,
       caller,
       caller.organizationId,
+      undefined,
+      undefined,
+      reissue === 'true',
     );
     res.setHeader('Content-Type', 'application/pdf');
     // Quoted (the name has spaces) plus the UTF-8 form for names that are not plain ASCII.
@@ -178,6 +185,18 @@ export class LettersController {
       caller,
       caller.organizationId,
     );
+  }
+
+  @Patch(':key/issue-date')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  async setIssueDate(
+    @Param('id') id: string,
+    @Param('key') key: string,
+    @Body() dto: SetIssueDateDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.lettersService.setIssueDate(id, key, dto.date, caller, caller.organizationId);
   }
 
   @Post(':key/send')

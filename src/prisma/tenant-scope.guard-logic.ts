@@ -80,6 +80,7 @@ export const TENANT_SCOPED_MODELS = new Set([
   'EmailTemplate',
   'LetterTemplate',
   'LetterOverride',
+  'IssuedLetter',
   'EmployeeLetterAccess',
   'OrgListItem',
   'WorkSchedule',
