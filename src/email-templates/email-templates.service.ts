@@ -239,6 +239,31 @@ export class EmailTemplatesService implements OnApplicationBootstrap {
     return this.findByOccasionOrThrow(occasionKey, organizationId);
   }
 
+  // One switch for every template (or every one of a category): on or off together. Only the ones that are not already in that state
+  // are changed, and the number changed is reported so the page can say so.
+  async setAllActive(
+    isActive: boolean,
+    organizationId: string,
+    actorId: string,
+    category?: string,
+  ): Promise<{ changed: number }> {
+    const { count } = await this.scopedPrisma.emailTemplate.updateMany({
+      where: { organizationId, isActive: !isActive, ...(category ? { category } : {}) },
+      data: { isActive, updatedById: actorId },
+    });
+    if (count > 0) {
+      await this.auditLogService.log({
+        actorId,
+        action: isActive ? 'EMAIL_TEMPLATES_ENABLED_ALL' : 'EMAIL_TEMPLATES_DISABLED_ALL',
+        module: AuditModule.NOTIFICATION,
+        organizationId,
+        targetId: organizationId,
+        details: { changed: count, ...(category ? { category } : {}) },
+      });
+    }
+    return { changed: count };
+  }
+
   // Auto-derives occasionKey from name (BIRTHDAY-style SCREAMING_SNAKE_CASE)
   // rather than asking the admin to pick a machine key themselves — it's
   // only ever read back by id from here on (create/delete/send all take

@@ -17,6 +17,7 @@ import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import {
   resolveShiftConfig,
+  resolveShiftConfigFor,
   type OrganizationAttendancePrefs,
 } from '../attendance/attendance-shift-config';
 import { markPayrollInputsChanged } from '../payroll/payroll-period-guard';
@@ -92,6 +93,7 @@ export class LeaveStampRepairService {
           employeeId: true,
           departmentId: true,
           department: true,
+          weeklyOffsOverride: true,
         },
       }),
       this.db.holiday.findMany({
@@ -123,8 +125,9 @@ export class LeaveStampRepairService {
     const calendarOf = (employeeId: string) => {
       const p = byPerson.get(employeeId);
       return {
-        weeklyOffs: resolveShiftConfig(
+        weeklyOffs: resolveShiftConfigFor(
           p?.department ?? null,
+          p,
           orgPrefs,
           org?.timezone,
         ).weeklyOffs,

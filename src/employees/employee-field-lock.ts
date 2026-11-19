@@ -40,6 +40,8 @@ const LOCKED_FIELDS_FOR_EMPLOYEE: (keyof UpdateEmployeeDto)[] = [
   'confirmationDate',
   'probationEndDate',
   'employeeType',
+  // Their own weekly offs are set by Admin / HR, never by the employee.
+  'weeklyOffsOverride',
 ];
 
 /**

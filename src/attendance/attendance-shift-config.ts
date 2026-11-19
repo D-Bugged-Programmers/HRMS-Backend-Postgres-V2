@@ -199,6 +199,26 @@ function resolveShiftConfigWithoutZone(
   };
 }
 
+// A person's own weekly offs, when HR set them on the employee: they replace their department's (or the company default). Anything
+// that is not a valid list of weekday entries is ignored, so a bad value can never blank out someone's week.
+export function personalWeeklyOffs(person: { weeklyOffsOverride?: unknown } | null | undefined): WeeklyOffEntry[] | null {
+  const v = person?.weeklyOffsOverride;
+  return Array.isArray(v) && v.length > 0 && v.every(isWeeklyOffEntry) ? (v as WeeklyOffEntry[]) : null;
+}
+
+// resolveShiftConfig for a particular person: the department's (or company) shift, with this person's own weekly offs on top
+// when they have them. Use this wherever a person's working days matter (attendance, leave days, payroll, the tracker).
+export function resolveShiftConfigFor(
+  department: DepartmentShiftFields | null | undefined,
+  person: { weeklyOffsOverride?: unknown } | null | undefined,
+  orgPrefs: OrganizationAttendancePrefs | null | undefined,
+  timezone?: string,
+): ShiftConfig {
+  const base = resolveShiftConfig(department, orgPrefs, timezone);
+  const own = personalWeeklyOffs(person);
+  return own ? { ...base, weeklyOffs: own } : base;
+}
+
 // Which occurrence of its weekday this date is within its month — the 1st,
 // 2nd, 3rd, 4th, or (rarely) 5th Saturday, Sunday, etc. Every date-of-month
 // 1-7 is the 1st occurrence, 8-14 the 2nd, and so on.

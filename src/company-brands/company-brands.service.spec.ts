@@ -148,3 +148,19 @@ describe('CompanyBrandsService.update', () => {
     ).rejects.toThrow(/inactive/);
   });
 });
+
+describe('brand logo preview links', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { withPreviews } = require('./company-brands.service');
+  beforeAll(() => { process.env.FILE_TOKEN_SECRET = process.env.FILE_TOKEN_SECRET || 'test-secret'; });
+  it('adds a signed link for each stored logo and keeps the durable keys', () => {
+    const out = withPreviews({ organizationId: 'org1', logoUrl: 'org1/branding/a.png', emailLogoUrl: null });
+    expect(out.logoUrl).toBe('org1/branding/a.png');
+    expect(out.logoPreviewUrl).toMatch(/^\/files\/.+/);
+    expect(out.emailLogoPreviewUrl).toBeNull();
+  });
+  it('leaves an external address as it is', () => {
+    const out = withPreviews({ organizationId: 'org1', logoUrl: 'https://cdn.example.com/x.png', emailLogoUrl: null });
+    expect(out.logoPreviewUrl).toBe('https://cdn.example.com/x.png');
+  });
+});

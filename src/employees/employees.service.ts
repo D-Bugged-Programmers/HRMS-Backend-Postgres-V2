@@ -15,6 +15,7 @@ import { featureEnabledFor, sisterCompaniesOn } from '../module-access/module-ga
 import { FieldTrackingService } from '../field-tracking/field-tracking.service';
 import { LettersService } from '../letters/letters.service';
 import { sendLetterQuietly, handleEventLetter, handleHiringLetters } from '../letters/auto-letter';
+import { normalizeWeeklyOffsOverride } from './weekly-off-override';
 import { assertEmployeeRoom } from '../module-access/module-gate';
 import { buildOrgChart } from './org-chart';
 import {
@@ -1566,11 +1567,23 @@ export class EmployeesService {
     // findByIdOrThrow above already confirmed the row exists in this org,
     // but re-scoping the write itself is what actually closes the gap,
     // not just the pre-check.
+    const weeklyOffsData =
+      clean.weeklyOffsOverride === undefined
+        ? undefined
+        : (() => {
+            const v = normalizeWeeklyOffsOverride(clean.weeklyOffsOverride);
+            return v === null ? Prisma.DbNull : (v as unknown as Prisma.InputJsonValue);
+          })();
+    const { weeklyOffsOverride: _weeklyOffsIn, ...cleanForDb } = clean;
     try {
       await this.scopedPrisma.user.updateMany({
         where: { id, organizationId },
         data: {
-          ...clean,
+          ...cleanForDb,
+          // The person's own weekly offs: checked and normalised; null / an empty list goes back to the department's.
+          ...(clean.weeklyOffsOverride !== undefined
+            ? { weeklyOffsOverride: weeklyOffsData }
+            : {}),
           joiningDate: clean.joiningDate
             ? new Date(clean.joiningDate)
             : undefined,
@@ -1593,6 +1606,24 @@ export class EmployeesService {
         );
       }
       throw err;
+    }
+
+    // Their own weekly offs changed: this month's days are judged again under the new ones (a Wednesday that is now a working day, a
+    // Sunday that is now a day off), and the change is recorded.
+    if (clean.weeklyOffsOverride !== undefined) {
+      const after = normalizeWeeklyOffsOverride(clean.weeklyOffsOverride);
+      const prior = (before as unknown as { weeklyOffsOverride?: unknown }).weeklyOffsOverride ?? null;
+      if (JSON.stringify(after) !== JSON.stringify(prior)) {
+        void this.attendanceService.rederiveCurrentMonth(organizationId, [], actor.id, [id]);
+        await this.auditLogService.log({
+          actorId: actor.id,
+          action: 'EMPLOYEE_WEEKLY_OFF_CHANGED',
+          module: 'EMPLOYEE',
+          organizationId,
+          targetId: id,
+          details: { from: prior, to: after },
+        });
+      }
     }
 
     if (joiningDateChange) {

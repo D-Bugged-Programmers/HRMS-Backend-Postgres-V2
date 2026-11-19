@@ -75,6 +75,7 @@ import {
   enumerateDateStrings,
   isWeeklyOff,
   resolveShiftConfig,
+  resolveShiftConfigFor,
   type OrganizationAttendancePrefs,
 } from '../attendance/attendance-shift-config';
 
@@ -1289,8 +1290,9 @@ export class DashboardService {
       select: { date: true },
     });
     const holidayDates = new Set(holidays.map((h) => h.date));
-    const shiftConfig = resolveShiftConfig(
+    const shiftConfig = resolveShiftConfigFor(
       employee?.department,
+      employee,
       (org?.attendancePayrollPrefs ??
         null) as OrganizationAttendancePrefs | null,
     );

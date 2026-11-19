@@ -37,7 +37,7 @@ import {
   effectiveLeaveRules,
   LeaveRules,
 } from '../leaves/leave-rules';
-import { resolveShiftConfig } from '../attendance/attendance-shift-config';
+import { resolveShiftConfig, resolveShiftConfigFor } from '../attendance/attendance-shift-config';
 import type { OrganizationAttendancePrefs } from '../attendance/attendance-shift-config';
 import { LEAVE_TYPE_CODES } from '../common/reserved-codes';
 import { TransitionLeaveYearDto } from './dto/transition-leave-year.dto';
@@ -184,8 +184,9 @@ export class LeaveYearService {
           )
           .map((h) => h.date),
       );
-      const { weeklyOffs } = resolveShiftConfig(
+      const { weeklyOffs } = resolveShiftConfigFor(
         leave.employee.department,
+        leave.employee,
         orgPrefs,
       );
       const newParts = splitDaysByYear(

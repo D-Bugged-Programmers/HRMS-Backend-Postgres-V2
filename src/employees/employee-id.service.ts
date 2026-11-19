@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { formatDocumentNumber, issueDocumentNumber } from '../organizations/document-numbering';
+import { effectiveCounter } from '../company-brands/brand-rules';
 
 /**
  * Employee ID generation. A person in a company brand that has its own ID series takes the next number of that series; everyone else
@@ -24,7 +25,8 @@ export class EmployeeIdService {
       `;
       const brand = rows[0];
       if (brand?.employeeIdFormat) {
-        let counter = brand.employeeIdCounter;
+        // The number inside the braces is where the series starts (E{3000} issues E3001 first); a series already beyond it keeps counting.
+        let counter = effectiveCounter(brand.employeeIdFormat, brand.employeeIdCounter);
         // An ID is unique across the company: a number somebody already holds is skipped, never reused.
         for (let tries = 0; tries < 50; tries++) {
           counter += 1;

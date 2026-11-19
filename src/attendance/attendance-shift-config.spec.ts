@@ -199,3 +199,25 @@ describe('statusForWorkedMinutes', () => {
     expect(statusForWorkedMinutes(240, none)).toBe('HALF_DAY');
   });
 });
+
+describe('a person’s own weekly offs', () => {
+  const { personalWeeklyOffs, resolveShiftConfigFor, resolveShiftConfig } = require('./attendance-shift-config');
+  const dept = { shiftStartTime: '09:00', shiftEndTime: '18:00', lateInThresholdMinutes: 15, earlyOutThresholdMinutes: 15, minHoursForPresent: 8, minHoursForHalfDay: 4, weeklyOffs: [0, 6], breakMinutes: 60, crossesMidnight: false };
+  it('replaces the department’s weekly offs for that person only', () => {
+    expect(resolveShiftConfigFor(dept, { weeklyOffsOverride: [3] }, null).weeklyOffs).toEqual([3]);
+    expect(resolveShiftConfigFor(dept, { weeklyOffsOverride: null }, null).weeklyOffs).toEqual([0, 6]);
+    expect(resolveShiftConfigFor(dept, {}, null).weeklyOffs).toEqual([0, 6]);
+    expect(resolveShiftConfigFor(dept, undefined, null).weeklyOffs).toEqual([0, 6]);
+  });
+  it('keeps the rest of the shift and works without a department', () => {
+    const c = resolveShiftConfigFor(dept, { weeklyOffsOverride: [0] }, null);
+    expect(c.shiftStartTime).toBe('09:00');
+    expect(resolveShiftConfigFor(null, { weeklyOffsOverride: [1] }, null).weeklyOffs).toEqual([1]);
+    expect(resolveShiftConfigFor(null, {}, null).weeklyOffs).toEqual(resolveShiftConfig(null, null).weeklyOffs);
+  });
+  it('supports the 2nd and 4th Saturday style and ignores garbage', () => {
+    expect(personalWeeklyOffs({ weeklyOffsOverride: [{ day: 6, occurrences: [2, 4] }] })).toEqual([{ day: 6, occurrences: [2, 4] }]);
+    expect(personalWeeklyOffs({ weeklyOffsOverride: 'x' })).toBeNull();
+    expect(personalWeeklyOffs({ weeklyOffsOverride: [] })).toBeNull();
+  });
+});

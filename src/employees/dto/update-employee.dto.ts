@@ -37,6 +37,13 @@ import {
 // It's auto-generated and uniquely constrained per org; a general update
 // endpoint isn't the right place to let it be hand-edited.
 export class UpdateEmployeeDto {
+  // This person's own weekly offs, replacing their department's: weekday numbers (0=Sunday..6=Saturday) or
+  // { day, occurrences } for the 2nd/4th Saturday style. null or [] = follow the department. Admin / HR only.
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @IsArray()
+  weeklyOffsOverride?: Array<number | { day: number; occurrences: number[] }> | null;
+
   // Trimmed + non-empty when present: a whitespace-only name used to be
   // stored as-is.
   @ApiPropertyOptional()

@@ -91,6 +91,7 @@ import {
   enumerateDateStrings,
   isWeeklyOff,
   resolveShiftConfig,
+  resolveShiftConfigFor,
   type OrganizationAttendancePrefs,
   type ShiftConfig,
   statusForWorkedMinutes,
@@ -603,8 +604,8 @@ export class AttendanceService {
           })
         : employee.department;
 
-    const shiftConfig = resolveShiftConfig(
-      shiftDepartmentFor(departmentForShiftConfig, employee, await this.shiftRulesOf(db, organizationId)),
+    const shiftConfig = resolveShiftConfigFor(
+      shiftDepartmentFor(departmentForShiftConfig, employee, await this.shiftRulesOf(db, organizationId)), employee,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? DEFAULT_ORG_TIMEZONE,
     );
@@ -999,9 +1000,11 @@ export class AttendanceService {
     organizationId: string,
     departmentIds: string[],
     actorId?: string | null,
+    // Re-judge only these people (when one person's own weekly offs changed) instead of whole departments.
+    employeeIds?: string[],
   ): Promise<{ updated: number }> {
     try {
-      if (departmentIds.length === 0) return { updated: 0 };
+      if (departmentIds.length === 0 && !employeeIds?.length) return { updated: 0 };
       const org = await this.prisma.organization.findUnique({
         where: { id: organizationId },
       });
@@ -1015,9 +1018,9 @@ export class AttendanceService {
         where: {
           organizationId,
           isActive: true,
-          departmentId: { in: departmentIds },
+          ...(employeeIds?.length ? { id: { in: employeeIds } } : { departmentId: { in: departmentIds } }),
         },
-        select: { id: true, gender: true, departmentId: true, joiningDate: true, exitDate: true },
+        select: { id: true, gender: true, departmentId: true, joiningDate: true, exitDate: true, weeklyOffsOverride: true },
       });
       if (employees.length === 0) return { updated: 0 };
       const lockedRuns = await this.scopedPrisma.payrollRun.findMany({
@@ -1034,8 +1037,12 @@ export class AttendanceService {
       const eligible = employees.filter((e) => !locked.has(e.id));
       const employeeById = new Map(eligible.map((e) => [e.id, e]));
       const shiftRules = await this.shiftRulesOf(this.scopedPrisma, organizationId);
+      // The departments of the people being re-judged (named directly, or those of the people picked individually).
+      const deptIds = employeeIds?.length
+        ? [...new Set(eligible.map((e) => e.departmentId).filter((d): d is string => !!d))]
+        : departmentIds;
       const departments = await this.scopedPrisma.department.findMany({
-        where: { organizationId, id: { in: departmentIds } },
+        where: { organizationId, id: { in: deptIds } },
       });
       const departmentById = new Map(departments.map((d) => [d.id, d]));
 
@@ -1061,8 +1068,8 @@ export class AttendanceService {
         const department = employee.departmentId
           ? (departmentById.get(employee.departmentId) ?? null)
           : null;
-        const shiftConfig = resolveShiftConfig(
-          shiftDepartmentFor(department, employee, shiftRules),
+        const shiftConfig = resolveShiftConfigFor(
+          shiftDepartmentFor(department, employee, shiftRules), employee,
           org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
           org?.timezone ?? DEFAULT_ORG_TIMEZONE,
         );
@@ -1425,8 +1432,9 @@ export class AttendanceService {
     const org = await this.prisma.organization.findUnique({
       where: { id: organizationId },
     });
-    return resolveShiftConfig(
+    return resolveShiftConfigFor(
       employee ? shiftDepartmentFor(employee.department, employee, await this.shiftRulesOf(this.scopedPrisma, organizationId)) ?? null : null,
+      employee,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? DEFAULT_ORG_TIMEZONE,
     );
@@ -2621,8 +2629,9 @@ export class AttendanceService {
         where: { id: organizationId },
       }),
     ]);
-    const { weeklyOffs } = resolveShiftConfig(
+    const { weeklyOffs } = resolveShiftConfigFor(
       employee?.department ?? null,
+      employee,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? DEFAULT_ORG_TIMEZONE,
     );
@@ -3197,7 +3206,7 @@ export class AttendanceService {
         : Promise.resolve([]),
       this.prisma.organization.findUnique({ where: { id: organizationId } }),
     ]);
-    const shift = resolveShiftConfig(shiftDepartmentFor(employee.department, employee, await this.shiftRulesOf(this.scopedPrisma, organizationId)), org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null, org?.timezone ?? DEFAULT_ORG_TIMEZONE);
+    const shift = resolveShiftConfigFor(shiftDepartmentFor(employee.department, employee, await this.shiftRulesOf(this.scopedPrisma, organizationId)), employee, org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null, org?.timezone ?? DEFAULT_ORG_TIMEZONE);
     // A flexible shift's expected time is its full-day hours (there is no start / end to span).
     const shiftNetMinutes = shift.flexible ? Math.round(shift.minHoursForPresent * 60) : shiftMinutes(shift.shiftStartTime, shift.shiftEndTime, shift.crossesMidnight, shift.breakMinutes);
     return {
@@ -3567,6 +3576,7 @@ export class AttendanceService {
           departmentId: true,
           createdAt: true,
           exitDate: true,
+          weeklyOffsOverride: true,
         },
       }),
       this.scopedPrisma.attendance.findMany({
@@ -3609,8 +3619,8 @@ export class AttendanceService {
         org?.timezone ?? 'Asia/Kolkata',
         employee.createdAt,
       );
-      const shiftConfig = resolveShiftConfig(
-        shiftDepartmentFor(employee.department, employee, listShiftRules),
+      const shiftConfig = resolveShiftConfigFor(
+        shiftDepartmentFor(employee.department, employee, listShiftRules), employee,
         orgPrefs,
         org?.timezone ?? DEFAULT_ORG_TIMEZONE,
       );
@@ -4440,8 +4450,8 @@ export class AttendanceService {
             where: { id: row.departmentId, organizationId },
           })
         : (employee?.department ?? null);
-    const shiftConfig = resolveShiftConfig(
-      shiftDepartmentFor(department, employee ?? {}, await this.shiftRulesOf(this.scopedPrisma, organizationId)),
+    const shiftConfig = resolveShiftConfigFor(
+      shiftDepartmentFor(department, employee ?? {}, await this.shiftRulesOf(this.scopedPrisma, organizationId)), employee ?? {},
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? DEFAULT_ORG_TIMEZONE,
     );
@@ -5054,6 +5064,7 @@ export class AttendanceService {
             gender: true,
             departmentId: true,
             department: true,
+            weeklyOffsOverride: true,
           },
         })
       : [];
@@ -5245,8 +5256,8 @@ export class AttendanceService {
           existing.departmentId !== employee?.departmentId
             ? await departmentFor(existing.departmentId)
             : (employee?.department ?? null);
-        const shiftConfig = resolveShiftConfig(
-          shiftDepartmentFor(departmentForShiftConfig, employee ?? {}, importShiftRules),
+        const shiftConfig = resolveShiftConfigFor(
+          shiftDepartmentFor(departmentForShiftConfig, employee ?? {}, importShiftRules), employee ?? {},
           orgPrefs,
           org?.timezone ?? DEFAULT_ORG_TIMEZONE,
         );
@@ -5685,8 +5696,8 @@ export class AttendanceService {
         return;
       }
       if (row.date < utcDateStrOf(employee.joiningDate)) return;
-      const shiftConfig = resolveShiftConfig(
-        shiftDepartmentFor(employee.department, employee, recalcShiftRules),
+      const shiftConfig = resolveShiftConfigFor(
+        shiftDepartmentFor(employee.department, employee, recalcShiftRules), employee,
         org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
         org?.timezone ?? DEFAULT_ORG_TIMEZONE,
       );
@@ -5821,8 +5832,8 @@ export class AttendanceService {
           !existing.has(d) &&
           lockedMonths.has(`${user.id}:${d.slice(0, 7)}`),
       ).length;
-      const shiftConfig = resolveShiftConfig(
-        shiftDepartmentFor(user.department, user, backfillShiftRules),
+      const shiftConfig = resolveShiftConfigFor(
+        shiftDepartmentFor(user.department, user, backfillShiftRules), user,
         orgPrefs,
         org?.timezone ?? DEFAULT_ORG_TIMEZONE,
       );

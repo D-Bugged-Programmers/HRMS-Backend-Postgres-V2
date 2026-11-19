@@ -114,3 +114,21 @@ describe('resolveBranding', () => {
     ).toBe('org/logo.png');
   });
 });
+
+describe('where an ID series starts', () => {
+  const { effectiveCounter, nextEmployeeId } = require('./brand-rules');
+  it('treats the number in the braces as the starting point', () => {
+    expect(nextEmployeeId('E{3000}', 0)).toBe('E3001');
+    expect(nextEmployeeId('SA-{00000}', 0)).toBe('SA-00001');
+    expect(nextEmployeeId('E{0000}', 0)).toBe('E0001');
+  });
+  it('keeps counting once the series is past that number', () => {
+    expect(nextEmployeeId('E{3000}', 3010)).toBe('E3011');
+    expect(effectiveCounter('E{3000}', 5)).toBe(3000);
+    expect(effectiveCounter('E{3000}', 3500)).toBe(3500);
+  });
+  it('is safe for a missing or odd format', () => {
+    expect(effectiveCounter(null, 7)).toBe(7);
+    expect(effectiveCounter('plain', 7)).toBe(7);
+  });
+});

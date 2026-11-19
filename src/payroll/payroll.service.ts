@@ -135,6 +135,7 @@ import {
 import {
   enumerateDateStrings,
   resolveShiftConfig,
+  resolveShiftConfigFor,
   type OrganizationAttendancePrefs,
 } from '../attendance/attendance-shift-config';
 import {
@@ -680,8 +681,9 @@ export class PayrollService {
     // Weekly offs and holidays are paid days even when no attendance row was ever written for them (an imported or
     // backfilled month, or one the daily job never ran for). The days before the employee joined are not unpaid
     // leave, they are simply outside their employment. See off-days.ts.
-    const { weeklyOffs } = resolveShiftConfig(
+    const { weeklyOffs } = resolveShiftConfigFor(
       department,
+      employee,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
     );
     // A month still running is paid for the days that have finished so far (up to yesterday - today is not over yet),
@@ -5870,8 +5872,9 @@ export class PayrollService {
         const department = e.departmentId
           ? (departmentById.get(e.departmentId) ?? null)
           : null;
-        const { weeklyOffs } = resolveShiftConfig(
+        const { weeklyOffs } = resolveShiftConfigFor(
           department,
+          e,
           org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
         );
         const employed = employmentWindow(

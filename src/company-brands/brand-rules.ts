@@ -31,9 +31,19 @@ export function prefixesClash(a: string, b: string): boolean {
   return x.startsWith(y) || y.startsWith(x);
 }
 
+/**
+ * Where a series stands: the number written inside the braces is its starting point, so 'E{3000}' issues E3001 next and 'SA-{00000}'
+ * issues SA-00001. A series already past that number keeps its own counter. (The digits also set how many places the number is padded to.)
+ */
+export function effectiveCounter(format: string | null | undefined, counter: number): number {
+  const m = format ? FORMAT_RE.exec(format) : null;
+  const start = m ? parseInt(m[2], 10) : 0;
+  return Math.max(counter, Number.isFinite(start) ? start : 0);
+}
+
 /** The ID the series would issue after `counter` numbers have been used. */
 export function nextEmployeeId(format: string, counter: number): string {
-  return formatDocumentNumber(format, counter + 1);
+  return formatDocumentNumber(format, effectiveCounter(format, counter) + 1);
 }
 
 export interface OrgBranding extends Partial<RegistrationFields> {

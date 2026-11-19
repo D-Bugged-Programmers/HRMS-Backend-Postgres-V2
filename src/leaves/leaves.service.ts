@@ -80,6 +80,7 @@ import {
 } from '../leave-balances/leave-year';
 import {
   resolveShiftConfig,
+  resolveShiftConfigFor,
   OrganizationAttendancePrefs,
 } from '../attendance/attendance-shift-config';
 import { checkAffordability, NegativeBalanceRule } from './leave-balance-check';
@@ -387,8 +388,9 @@ export class LeavesService {
     };
     const year = leaveYearOf(dto.startDate, leaveYearCfg);
     if (leaveYearOf(dto.endDate, leaveYearCfg) !== year) return null;
-    const { weeklyOffs } = resolveShiftConfig(
+    const { weeklyOffs } = resolveShiftConfigFor(
       dept,
+      actor,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
     );
     const rules = effectiveLeaveRules(
@@ -1729,7 +1731,7 @@ export class LeavesService {
     if (kinds.weeklyOffs && kinds.holidays) return undefined;
     const person = await this.scopedPrisma.user.findFirst({
       where: { id: leave.employeeId, organizationId },
-      select: { departmentId: true },
+      select: { departmentId: true, weeklyOffsOverride: true },
     });
     const [holidays, org, dept] = await Promise.all([
       this.holidaysFor({ departmentId: person?.departmentId ?? null }, organizationId),
@@ -1740,8 +1742,9 @@ export class LeavesService {
           })
         : Promise.resolve(null),
     ]);
-    const { weeklyOffs } = resolveShiftConfig(
+    const { weeklyOffs } = resolveShiftConfigFor(
       dept,
+      person,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
     );
     const charged = chargedDatesInclusive(
@@ -1799,7 +1802,7 @@ export class LeavesService {
     const person = forOther
       ? await this.scopedPrisma.user.findFirst({
           where: { id: query.employeeId, organizationId },
-          select: { id: true, departmentId: true },
+          select: { id: true, departmentId: true, weeklyOffsOverride: true },
         })
       : actor;
     if (!person) throw new NotFoundException('Employee not found.');
@@ -1824,8 +1827,9 @@ export class LeavesService {
         where: { id: organizationId },
       }),
     ]);
-    const { weeklyOffs } = resolveShiftConfig(
+    const { weeklyOffs } = resolveShiftConfigFor(
       employeeDept,
+      person,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
     );
     const baseRules = effectiveLeaveRules(
@@ -1985,8 +1989,9 @@ export class LeavesService {
     // config, falling back to the org default) — same source AttendanceService
     // itself reads — instead of assuming every org's weekend is plain Sunday
     // (see the sandwich-leave gap check in leave-rules.ts).
-    const { weeklyOffs } = resolveShiftConfig(
+    const { weeklyOffs } = resolveShiftConfigFor(
       employeeDept,
+      actor,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
     );
     const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');

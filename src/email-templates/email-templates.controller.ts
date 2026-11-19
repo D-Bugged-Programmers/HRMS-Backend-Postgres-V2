@@ -2,6 +2,7 @@
 // list (Organization.emailSignatures — each template picks which one it uses).
 // Responsibilities: Validates DTOs and delegates all logic to EmailTemplatesService.
 // Important: every route here is ADMIN/HR only - the templates and signatures are not for other roles.
+import { SetAllEmailTemplatesActiveDto } from './dto/set-all-active.dto';
 import {
   Body,
   Controller,
@@ -103,6 +104,14 @@ export class EmailTemplatesController {
       occasionKey,
       caller.organizationId,
     );
+  }
+
+  // Every template on or off in one go (optionally only one category). A POST on its own path, so it can never be read as a template key.
+  @Post('set-all-active')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  setAllActive(@Body() dto: SetAllEmailTemplatesActiveDto, @CurrentUser() caller: Caller) {
+    return this.emailTemplatesService.setAllActive(dto.isActive, caller.organizationId, caller.id, dto.category);
   }
 
   @Put(':occasionKey')

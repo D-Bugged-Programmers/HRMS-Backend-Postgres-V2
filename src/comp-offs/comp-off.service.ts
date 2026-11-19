@@ -16,6 +16,7 @@ import { holidayInEffect } from '../holidays/holiday-in-effect';
 import {
   isWeeklyOff,
   resolveShiftConfig,
+  resolveShiftConfigFor,
   type OrganizationAttendancePrefs,
 } from '../attendance/attendance-shift-config';
 import { EMPLOYEE_RELATION_ORDER_BY } from '../common/employee-order';
@@ -454,7 +455,7 @@ export class CompOffService {
   // earns none: only the employee's weekly off (their department's shift, else the organisation's default) or a
   // holiday that applies to them qualifies. A public holiday missing from the calendar is added there first.
   private async assertDayOffWorked(
-    employee: { departmentId: string | null; department: Department | null },
+    employee: { departmentId: string | null; department: Department | null; weeklyOffsOverride?: unknown },
     date: string,
     organizationId: string,
   ) {
@@ -476,8 +477,9 @@ export class CompOffService {
         select: { id: true },
       }),
     ]);
-    const { weeklyOffs } = resolveShiftConfig(
+    const { weeklyOffs } = resolveShiftConfigFor(
       employee.department,
+      employee,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? 'Asia/Kolkata',
     );
@@ -506,8 +508,9 @@ export class CompOffService {
         select: { workDurationMinutes: true },
       }),
     ]);
-    const shift = resolveShiftConfig(
+    const shift = resolveShiftConfigFor(
       employee.department,
+      employee,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
       org?.timezone ?? 'Asia/Kolkata',
     );

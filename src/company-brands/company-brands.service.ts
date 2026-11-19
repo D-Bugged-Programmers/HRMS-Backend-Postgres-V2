@@ -4,6 +4,7 @@
 //   that people are tagged with (it can be deactivated instead). Every change is audited.
 // Important: nothing here changes an existing employee or any existing ID. An employee's brand is set on the employee, and an ID, once
 //   issued, never changes with the brand.
+import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
 import {
   BadRequestException,
   ConflictException,
@@ -34,6 +35,14 @@ import { UpdateCompanyBrandDto } from './dto/update-company-brand.dto';
 
 type Actor = Omit<User, 'password'>;
 
+// The logos are stored as durable file keys; a browser cannot show a key, only a signed link to the file. Every brand sent to the web carries
+// both: `logoUrl` / `emailLogoUrl` stay the keys (what a save sends back), `logoPreviewUrl` / `emailLogoPreviewUrl` are the links to show.
+export function withPreviews<T extends { organizationId: string; logoUrl: string | null; emailLogoUrl: string | null }>(b: T) {
+  const link = (key: string | null) =>
+    key && !/^https?:\/\//i.test(key) ? `/files/${signFileToken(b.organizationId, key, SESSION_ASSET_TTL_SECONDS)}` : key;
+  return { ...b, logoPreviewUrl: link(b.logoUrl), emailLogoPreviewUrl: link(b.emailLogoUrl) };
+}
+
 const blank = (v: string | null | undefined): string | null =>
   v && v.trim() ? v.trim() : null;
 
@@ -53,7 +62,7 @@ export class CompanyBrandsService {
       include: { _count: { select: { users: true } } },
     });
     return brands.map(({ _count, ...b }) => ({
-      ...b,
+      ...withPreviews(b),
       employeeCount: _count.users,
       nextEmployeeId: b.employeeIdFormat
         ? nextEmployeeId(b.employeeIdFormat, b.employeeIdCounter)
@@ -107,7 +116,7 @@ export class CompanyBrandsService {
       organizationId,
       { name },
     );
-    return created;
+    return withPreviews(created);
   }
 
   async update(
@@ -170,7 +179,7 @@ export class CompanyBrandsService {
     await this.audit(actor, 'COMPANY_BRAND_UPDATED', id, organizationId, {
       fields: Object.keys(data),
     });
-    return updated;
+    return withPreviews(updated);
   }
 
   async remove(id: string, actor: Actor, organizationId: string) {

@@ -43,6 +43,7 @@ import { todayInOrgTz } from '../common/org-date';
 import {
   isWeeklyOff,
   resolveShiftConfig,
+  resolveShiftConfigFor,
   type OrganizationAttendancePrefs,
 } from '../attendance/attendance-shift-config';
 import {
@@ -195,6 +196,10 @@ export class LeaveTrackerService {
             departmentId: true,
             isActive: true,
             exitDate: true,
+            // Shown instead of the initials when the person has a photo.
+            profileImage: true,
+            // Their own weekly offs, when set, replace the department's.
+            weeklyOffsOverride: true,
             // The department's shift decides each person's weekly offs.
             department: true,
           },
@@ -384,8 +389,9 @@ export class LeaveTrackerService {
       null;
     const timeZone = org?.timezone ?? 'Asia/Kolkata';
     for (const employee of employees) {
-      const { weeklyOffs } = resolveShiftConfig(
+      const { weeklyOffs } = resolveShiftConfigFor(
         employee.department,
+        employee,
         orgPrefs,
         timeZone,
       );
@@ -426,6 +432,7 @@ export class LeaveTrackerService {
         id: e.id,
         name: e.name,
         employeeId: e.employeeId,
+        profileImage: e.profileImage ?? null,
         // So the grid leaves the days before joining / after leaving blank instead of drawing a weekend there.
         joiningDate: joiningOf.get(e.id) ?? null,
         exitDate: e.exitDate ?? null,
@@ -484,6 +491,8 @@ export class LeaveTrackerService {
         exitDate: true,
         // Shown by the Employee Leave Stat page.
         designation: true,
+        // Their own weekly offs, when set, replace the department's.
+        weeklyOffsOverride: true,
         // The name is shown; the whole row also carries the shift that decides this person's weekly offs.
         department: true,
       },
@@ -746,8 +755,9 @@ export class LeaveTrackerService {
     ): number =>
       chargedDaysInWindow(l, from, to, (): WindowRules => {
         const employee = employeeById.get(l.employeeId);
-        const { weeklyOffs } = resolveShiftConfig(
+        const { weeklyOffs } = resolveShiftConfigFor(
           employee?.department ?? null,
+          employee,
           calendar?.orgPrefs ?? null,
           calendar?.timeZone,
         );

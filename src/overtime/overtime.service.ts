@@ -68,6 +68,7 @@ import { addDaysStr } from '../leaves/leave-rules';
 import {
   isWeeklyOff,
   resolveShiftConfig,
+  resolveShiftConfigFor,
 } from '../attendance/attendance-shift-config';
 import { ReviewOvertimeDto } from './dto/review-overtime.dto';
 import { QueryOvertimeDto } from './dto/query-overtime.dto';
@@ -558,7 +559,7 @@ export class OvertimeService {
       }),
     ]);
     const timeZone = org?.timezone || 'Asia/Kolkata';
-    const shiftConfig = resolveShiftConfig(
+    const shiftConfig = resolveShiftConfigFor(
       employee
         ? (shiftDepartmentFor(
             employee.department,
@@ -568,6 +569,7 @@ export class OvertimeService {
             }),
           ) ?? null)
         : null,
+      employee,
       org?.attendancePayrollPrefs as never,
       timeZone,
     );

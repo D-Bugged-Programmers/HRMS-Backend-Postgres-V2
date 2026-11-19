@@ -573,6 +573,9 @@ model User {
   // The last working day once an exit is planned (YYYY-MM-DD), kept in step with the resignation / offboarding case.
   // Trackers, absence marking and headcounts stop counting the person after this day, even though the account stays
   // active until Offboarding is completed. Null = no exit planned.
+  // This person's own weekly offs, replacing their department's (null = follow the department). The same shape as
+  // Department.weeklyOffs: weekday numbers (0=Sunday..6=Saturday), or { day, occurrences } for e.g. the 2nd/4th Saturday.
+  weeklyOffsOverride            Json?
   exitDate                      String?
   subordinates                  User[]   @relation("ReportingManager")
 
