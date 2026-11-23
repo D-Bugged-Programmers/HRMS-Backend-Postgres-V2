@@ -136,21 +136,19 @@ export function IsStrongPassword(options?: ValidationOptions) {
   };
 }
 
-/** Random password guaranteed to satisfy the policy (crypto.randomInt). */
-export function generatePolicyPassword(length = 14): string {
-  const sets = [
-    'abcdefghijkmnopqrstuvwxyz',
-    'ABCDEFGHJKLMNPQRSTUVWXYZ',
-    '23456789',
-    '!@#$%^&*-_=+?',
-  ];
-  const all = sets.join('');
-  const pick = (s: string) => s[crypto.randomInt(s.length)];
-  const chars = sets.map(pick);
-  while (chars.length < length) chars.push(pick(all));
-  for (let i = chars.length - 1; i > 0; i--) {
-    const j = crypto.randomInt(i + 1);
-    [chars[i], chars[j]] = [chars[j], chars[i]];
-  }
-  return chars.join('');
+// Short, easy-to-read words for the temporary password (all 4-6 letters).
+const TEMP_PASSWORD_WORDS = ['Apple', 'Arrow', 'Beach', 'Bison', 'Blaze', 'Bloom', 'Brave', 'Bread', 'Brook', 'Candy', 'Cedar', 'Charm', 'Cherry', 'Cloud', 'Clover', 'Coral', 'Crane', 'Daisy', 'Dance', 'Eagle', 'Earth', 'Ember', 'Fairy', 'Falcon', 'Fern', 'Field', 'Flame', 'Flora', 'Forest', 'Frost', 'Garden', 'Ginger', 'Glade', 'Globe', 'Grape', 'Green', 'Happy', 'Harbor', 'Hazel', 'Heart', 'Honey', 'Horse', 'Ivory', 'Jolly', 'Jungle', 'Kitten', 'Lemon', 'Light', 'Lilac', 'Lotus', 'Lucky', 'Magic', 'Mango', 'Maple', 'Meadow', 'Melon', 'Mint', 'Moon', 'Ocean', 'Olive', 'Orange', 'Otter', 'Panda', 'Peach', 'Pearl', 'Pebble', 'Pilot', 'Plum', 'Polar', 'Pond', 'Poppy', 'Puppy', 'Quail', 'Quiet', 'Rabbit', 'Rain', 'River', 'Robin', 'Rocket', 'Rose', 'Ruby', 'Sandy', 'Shell', 'Silver', 'Sky', 'Smile', 'Snow', 'Solar', 'Spark', 'Spice', 'Spring', 'Star', 'Stone', 'Storm', 'Sunny', 'Swan', 'Sweet', 'Tiger', 'Tulip', 'Turtle', 'Velvet', 'Violet', 'Walnut', 'Water', 'Willow', 'Wind', 'Winter', 'Zebra'];
+
+/**
+ * A simple temporary password people can read out and type: two words and four digits, e.g. "Tiger-Maple-4827".
+ * It always satisfies the policy (a capital, a lowercase letter, a digit, a hyphen as the symbol, 14+ characters).
+ * It is single-use: the person must choose their own password at first sign-in, and repeated wrong tries lock the account.
+ */
+export function generatePolicyPassword(): string {
+  const word = () => TEMP_PASSWORD_WORDS[crypto.randomInt(TEMP_PASSWORD_WORDS.length)];
+  const first = word();
+  let second = word();
+  while (second === first) second = word();
+  const digits = String(crypto.randomInt(1000, 10000));
+  return `${first}-${second}-${digits}`;
 }
