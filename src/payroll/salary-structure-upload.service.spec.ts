@@ -1,3 +1,4 @@
+import { todayInOrgTz } from '../common/org-date';
 import { Role } from '@prisma/client';
 import { SalaryStructureUploadService } from './salary-structure-upload.service';
 
@@ -43,7 +44,7 @@ describe('SalaryStructureUploadService', () => {
     const skip = await build().svc.process({ rows: [{ employeeCode: 'E2', annualCtc: 600000 }], existing: 'SKIP', dryRun: true }, actor, 'org');
     expect(skip.rows[0].status).toBe('SKIPPED');
     const revise = await build().svc.process({ rows: [{ employeeCode: 'E2', annualCtc: 700000 }], existing: 'REVISE', dryRun: true }, actor, 'org');
-    expect(revise.rows[0]).toMatchObject({ status: 'READY', revision: true, effectiveFrom: '2026-11-23' });
+    expect(revise.rows[0]).toMatchObject({ status: 'READY', revision: true, effectiveFrom: todayInOrgTz('Asia/Kolkata') });
   });
   it('reports each bad row clearly, and one bad row does not stop another', async () => {
     const one = async (row: Record<string, unknown>) => (await build().svc.process({ rows: [row as never], existing: 'SKIP', dryRun: true }, actor, 'org')).rows[0];

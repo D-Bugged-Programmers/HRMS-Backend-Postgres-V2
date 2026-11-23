@@ -20,6 +20,7 @@ import { holidayInEffect } from '../holidays/holiday-in-effect';
 import {
   isWeeklyOff,
   resolveShiftConfig,
+  resolveShiftConfigFor,
   type OrganizationAttendancePrefs,
 } from '../attendance/attendance-shift-config';
 import {
@@ -113,6 +114,7 @@ export class CheckInReminderService {
         gender: true,
         departmentId: true,
         department: true,
+        weeklyOffsOverride: true,
       },
     });
     if (employees.length === 0) return 0;
@@ -125,9 +127,11 @@ export class CheckInReminderService {
     const due = employees
       .map((e) => ({
         ...e,
-        shift: resolveShiftConfig(shiftDepartmentFor(e.department, e, shiftRules), orgPrefs, timezone),
+        shift: resolveShiftConfigFor(shiftDepartmentFor(e.department, e, shiftRules), e, orgPrefs, timezone),
       }))
       .filter((e) => {
+        // A flexible shift has no start time to remind about.
+        if (e.shift.flexible) return false;
         const start = minutesOfDay(e.shift.shiftStartTime);
         return (
           start !== null &&
@@ -257,15 +261,15 @@ export class CheckInReminderService {
       select: {
         employeeId: true,
         date: true,
-        employee: { select: { gender: true, department: true } },
+        employee: { select: { gender: true, department: true, weeklyOffsOverride: true } },
       },
     });
 
     const shiftRules = await this.scopedPrisma.shiftRule.findMany({ where: { organizationId, isActive: true } });
     let sent = 0;
     for (const row of open) {
-      const shift = resolveShiftConfig(
-        shiftDepartmentFor(row.employee.department, row.employee, shiftRules),
+      const shift = resolveShiftConfigFor(
+        shiftDepartmentFor(row.employee.department, row.employee, shiftRules), row.employee,
         orgPrefs,
         timezone,
       );
@@ -353,15 +357,15 @@ export class CheckInReminderService {
       select: {
         employeeId: true,
         date: true,
-        employee: { select: { gender: true, department: true } },
+        employee: { select: { gender: true, department: true, weeklyOffsOverride: true } },
       },
     });
 
     const shiftRules = await this.scopedPrisma.shiftRule.findMany({ where: { organizationId, isActive: true } });
     let sent = 0;
     for (const row of open) {
-      const shift = resolveShiftConfig(
-        shiftDepartmentFor(row.employee.department, row.employee, shiftRules),
+      const shift = resolveShiftConfigFor(
+        shiftDepartmentFor(row.employee.department, row.employee, shiftRules), row.employee,
         orgPrefs,
         timezone,
       );

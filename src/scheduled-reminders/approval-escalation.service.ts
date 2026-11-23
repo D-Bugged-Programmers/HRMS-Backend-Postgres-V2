@@ -6,6 +6,7 @@
 // leave encashment, resignation) escalate to Admin, falling back to HR. One digest per recipient per day.
 // Important: re-escalates every threshold-days after the first time (3, 6, 9 days...) by deriving it from the
 // request's age, so no escalation marker is stored. Nobody is ever escalated their own request.
+import { isOvertimePayEnabled } from '../overtime/overtime-pay';
 import { REQUEST_TYPE_MODULE, disabledModulesOf } from '../module-access/module-gate';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
@@ -229,10 +230,12 @@ export class ApprovalEscalationService {
         where: { ...base, workArrangementStatus: WfhApprovalStatus.PENDING },
         include: { employee: who },
       }),
-      p.overtimeRecord.findMany({
-        where: { ...base, status: OvertimeStatus.PENDING },
-        include: { employee: who },
-      }),
+      (await isOvertimePayEnabled(p, organizationId))
+        ? p.overtimeRecord.findMany({
+            where: { ...base, status: OvertimeStatus.PENDING },
+            include: { employee: who },
+          })
+        : Promise.resolve([]),
       p.compOff.findMany({
         where: { ...base, status: CompOffStatus.PENDING },
         include: { employee: who },
