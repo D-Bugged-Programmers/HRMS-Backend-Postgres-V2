@@ -73,6 +73,11 @@ class BulkEmployeeRowDto {
   @IsOptional()
   workLocation?: unknown;
 
+  // Optional: an employee code to keep exactly as written (it must fit the company's ID format); blank = the next one of the series is issued.
+  @ApiPropertyOptional()
+  @IsOptional()
+  employeeCode?: unknown;
+
   // Optional: the company (sister-company name) to give the employee; blank = the default company, if any.
   @ApiPropertyOptional()
   @IsOptional()

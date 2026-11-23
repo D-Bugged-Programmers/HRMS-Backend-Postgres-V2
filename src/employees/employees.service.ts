@@ -9,6 +9,7 @@
 // just pre-checked by findByIdOrThrow — closing an actual tenant-isolation gap, not just a defensive
 // pre-check.
 import { placeholderEmailFor, readLoginPolicy } from '../common/no-email';
+import { codeFitsFormat } from './employee-code';
 import { inReviewerScope, reviewerScope } from '../common/dept-scope';
 import { summarizeDocumentReview, type DocumentReview } from './document-review';
 import { featureEnabledFor, sisterCompaniesOn } from '../module-access/module-gate';
@@ -186,7 +187,7 @@ export class EmployeesService {
     // below. Never set by the controller directly: CreateEmployeeDto (the
     // manual "Add Employee" form) has no such flag — its own Email/No-email
     // choice is expressed by whether personalEmail is present at all.
-    options?: { sendWelcomeEmail?: boolean; prepareHiringLetters?: boolean },
+    options?: { sendWelcomeEmail?: boolean; prepareHiringLetters?: boolean; employeeCode?: string },
   ) {
     const sendWelcomeEmail = options?.sendWelcomeEmail ?? true;
     const requestedRole = dto.role ?? Role.EMPLOYEE;
@@ -235,11 +236,10 @@ export class EmployeesService {
     let user: User;
     try {
       user = await this.scopedPrisma.$transaction(async (tx) => {
-        const employeeId = await this.employeeIdService.generate(
-          tx,
-          organizationId,
-          brandId,
-        );
+        // A code supplied by the bulk-import sheet is kept exactly as written; otherwise the next one of the series is issued.
+        const employeeId = options?.employeeCode
+          ? await this.employeeIdService.claim(tx, organizationId, brandId, options.employeeCode)
+          : await this.employeeIdService.generate(tx, organizationId, brandId);
         return tx.user.create({
           data: {
             organizationId,
@@ -651,6 +651,7 @@ export class EmployeesService {
       employeeCategory?: unknown;
       workLocation?: unknown;
       company?: unknown;
+      employeeCode?: unknown;
       role?: unknown;
       employeeType?: unknown;
       liveTracking?: unknown;
@@ -706,9 +707,18 @@ export class EmployeesService {
         }),
         this.scopedPrisma.companyBrand.findMany({
           where: { organizationId },
-          select: { id: true, name: true, isActive: true },
+          select: { id: true, name: true, isActive: true, isDefault: true, employeeIdFormat: true },
         }),
       ]);
+    // The organization-wide employee ID format: governs everyone whose company has no ID series of its own.
+    const orgIdFormat = ((await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { documentNumbering: true } }))
+      ?.documentNumbering as Record<string, { format?: string }> | null)?.employeeId?.format;
+    // The same code twice in one sheet: the second row is refused up front, with a clear message.
+    const codeCount = new Map<string, number>();
+    for (const r of rows) {
+      const c = asString(r.employeeCode).trim();
+      if (c) codeCount.set(c, (codeCount.get(c) ?? 0) + 1);
+    }
     const customEmployeeTypes =
       (org?.customEmployeeTypes as
         { value: string; label: string; isActive?: boolean }[] | null) ?? [];
@@ -841,6 +851,40 @@ export class EmployeesService {
         failed.push({ row, error: `Company "${companyName}" not found or inactive.` });
         return;
       }
+      // The optional Employee code column: kept exactly as written. It must fit the ID format of the row's company; a row with no company
+      // takes the company whose ID format the code fits (a code that fits none, or more than one, is refused).
+      const employeeCode = asString(row.employeeCode).trim();
+      let rowBrandId: string | null | undefined = company?.id;
+      if (employeeCode) {
+        const fits = (format: string | null | undefined) => (format ? codeFitsFormat(format, employeeCode) : !orgIdFormat || codeFitsFormat(orgIdFormat, employeeCode));
+        if ((codeCount.get(employeeCode) ?? 0) > 1) {
+          failed.push({ row, error: `Employee code ${employeeCode} appears more than once in this file.` });
+          return;
+        }
+        if (company) {
+          const own = company.employeeIdFormat;
+          if (!fits(own)) {
+            failed.push({ row, error: `Employee code ${employeeCode} does not fit ${company.name}'s ID format (${own || orgIdFormat}).` });
+            return;
+          }
+        } else {
+          const hits = brandsOn ? brandItems.filter((b) => b.isActive && b.employeeIdFormat && codeFitsFormat(b.employeeIdFormat, employeeCode)) : [];
+          if (hits.length > 1) {
+            failed.push({ row, error: `Employee code ${employeeCode} fits more than one company (${hits.map((b) => b.name).join(', ')}). Add the Company for this row.` });
+            return;
+          }
+          if (hits.length === 1) {
+            rowBrandId = hits[0].id;
+          } else if (fits(null)) {
+            // Fits the organization-wide format: the default company when it uses that format, else the organization itself.
+            const def = brandsOn ? brandItems.find((b) => b.isActive && b.isDefault) : undefined;
+            rowBrandId = def && !def.employeeIdFormat ? def.id : null;
+          } else {
+            failed.push({ row, error: `Employee code ${employeeCode} does not fit any company's ID format.` });
+            return;
+          }
+        }
+      }
       if (!employeeCategoryName) {
         failed.push({ row, error: 'Employee category is required.' });
         return;
@@ -897,7 +941,7 @@ export class EmployeesService {
         personalEmail: personalEmail || undefined,
         departmentId: department.id,
         workLocationId: workLocation.id,
-        brandId: company?.id,
+        brandId: rowBrandId,
         designation,
         employeeCategory: employeeCategory.name,
         contactNumber: formatIndianMobile(contactNumber),
@@ -922,7 +966,7 @@ export class EmployeesService {
           dto,
           actor,
           organizationId,
-          { sendWelcomeEmail, prepareHiringLetters: false },
+          { sendWelcomeEmail, prepareHiringLetters: false, ...(employeeCode ? { employeeCode } : {}) },
         );
         created.push({
           employeeId: employee.employeeId,
