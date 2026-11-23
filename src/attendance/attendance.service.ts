@@ -61,7 +61,7 @@ import {
   effectiveGeoFence,
   effectiveWorkLocation,
 } from '../common/effective-work-location';
-import { isKeyAllowedForOrg, signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
+import { isKeyAllowedForOrg, signFileToken, signProfilePhotoLink } from '../files/file-token';
 import {
   isInsideGeoFenceWithAccuracy,
   MAX_ACCURACY_ALLOWANCE_METERS,
@@ -3473,7 +3473,7 @@ export class AttendanceService {
         return {
           ...record,
           // The person's photo as a link the browser can load, for the Employee column.
-          employee: { ...record.employee, profileImage: record.employee.profileImage ? `/files/${signFileToken(record.organizationId, record.employee.profileImage, SESSION_ASSET_TTL_SECONDS)}` : null },
+          employee: { ...record.employee, profileImage: record.employee.profileImage ? signProfilePhotoLink(record.organizationId, record.employee.profileImage) : null },
           checkinSelfieUrl: signSelfieKey(
             record.organizationId,
             record.checkinSelfieUrl,

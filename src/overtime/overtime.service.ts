@@ -96,7 +96,7 @@ import {
 } from '../payroll/format-date';
 
 import { requireReason } from '../common/require-reason';
-import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
+import { signProfilePhotoLink } from '../files/file-token';
 type Actor = Omit<User, 'password'>;
 
 // Fallback multipliers, used only when the org has no PayrollSettings row yet
@@ -835,7 +835,7 @@ export class OvertimeService {
           ...r,
           employee: {
             ...r.employee,
-            profileImage: r.employee.profileImage ? `/files/${signFileToken(r.organizationId, r.employee.profileImage, SESSION_ASSET_TTL_SECONDS)}` : null,
+            profileImage: r.employee.profileImage ? signProfilePhotoLink(r.organizationId, r.employee.profileImage) : null,
           },
           estimatedAmount:
             r.status !== OvertimeStatus.REJECTED &&

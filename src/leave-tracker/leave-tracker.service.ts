@@ -62,7 +62,7 @@ import { ExportLeaveTrackerGridDto } from './dto/export-leave-tracker-grid.dto';
 import { ExportLeaveTrackerBalancesDto } from './dto/export-leave-tracker-balances.dto';
 import type { ReportColumn } from '../reports/report-export';
 import type { ReportPayload } from '../reports/reports.service';
-import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
+import { signProfilePhotoLink } from '../files/file-token';
 
 type Actor = Omit<User, 'password'>;
 
@@ -434,7 +434,7 @@ export class LeaveTrackerService {
         name: e.name,
         employeeId: e.employeeId,
         // A signed link the browser can load, like the Employee Directory sends (the stored value is a storage key, not a URL).
-        profileImage: e.profileImage ? `/files/${signFileToken(organizationId, e.profileImage, SESSION_ASSET_TTL_SECONDS)}` : null,
+        profileImage: e.profileImage ? signProfilePhotoLink(organizationId, e.profileImage) : null,
         // So the grid leaves the days before joining / after leaving blank instead of drawing a weekend there.
         joiningDate: joiningOf.get(e.id) ?? null,
         exitDate: e.exitDate ?? null,

@@ -14,6 +14,12 @@ import { getS3Bucket, getS3Client } from './s3-client';
 import { isKeyAllowedForOrg, verifyFileToken } from './file-token';
 import { INLINE_SAFE_EXTENSIONS, inlineContentType } from './file-signature';
 
+// A profile photo can be reused by the browser for an hour: a list of hundreds of people then downloads each photo once, not on every
+// refresh. `private` keeps shared proxies from storing it. Other files (documents, receipts, selfies) are never cached this way.
+function setPhotoCacheHeader(keyOrPath: string, res: Response) {
+  if (/[\\/]profile-photos[\\/]/.test(keyOrPath)) res.setHeader('Cache-Control', 'private, max-age=3600');
+}
+
 // Deliberately NOT behind the JwtAuthGuard — an <img src>, a
 // <link rel="icon">, or an embedded PDF viewer's <iframe> can't attach a
 // Bearer header, so the token itself (signed, tenant-bound, short-lived —
@@ -86,6 +92,7 @@ export class FileServeController {
       if (inlineType) res.setHeader('Content-Type', inlineType);
     }
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    setPhotoCacheHeader(filePath, res);
     res.setHeader(
       'Content-Disposition',
       `${inlineSafe ? 'inline' : 'attachment'}; filename="${path.basename(filePath)}"`,
@@ -114,6 +121,7 @@ export class FileServeController {
         res.setHeader('Content-Type', 'application/octet-stream');
       }
       res.setHeader('X-Content-Type-Options', 'nosniff');
+      setPhotoCacheHeader(relativeKey, res);
       res.setHeader(
         'Content-Disposition',
         `${inlineSafe ? 'inline' : 'attachment'}; filename="${path.basename(relativeKey)}"`,

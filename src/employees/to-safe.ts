@@ -9,7 +9,7 @@
 // signing, which made the profile photo appear to vanish right after Save Profile. This merged copy carries
 // the union of both: profileImage signing (always) and personalData masking (opt-in via `mask`, default false).
 import { User } from '@prisma/client';
-import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
+import { signProfilePhotoLink } from '../files/file-token';
 import { signPersonalDataFileUrls } from './personal-data';
 import { maskPersonalData, maskRevealable } from './personal-data-mask';
 import { isPlaceholderEmail } from '../common/no-email';
@@ -46,7 +46,7 @@ export function toSafe(user: User, mask = false) {
   if (safe.profileImage) {
     // Held in AuthContext for the whole session, not re-fetched on every
     // navigation — see SESSION_ASSET_TTL_SECONDS' comment.
-    safe.profileImage = `/files/${signFileToken(safe.organizationId, safe.profileImage, SESSION_ASSET_TTL_SECONDS)}`;
+    safe.profileImage = signProfilePhotoLink(safe.organizationId, safe.profileImage);
   }
   if (safe.personalData && typeof safe.personalData === 'object') {
     // PAN / Aadhaar / UAN / bank account are masked for everyone (see REVEALABLE_KEYS); `mask` masks the rest too.

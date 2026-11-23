@@ -7,7 +7,7 @@ import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nes
 import type { Request } from 'express';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
-import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
+import { signProfilePhotoLink } from '../files/file-token';
 
 const ROUTES = /^\/(leaves|leave-encashments|loans|reimbursements|comp-offs|payroll|performance|performance-ratings|performance-reviews|attendance|overtime|dashboard|leave-tracker|offboarding|resignations|settlements|employees\/(probation-tracker|role-history))(\/|$)/;
 const ALREADY_A_LINK = /^(https?:\/\/|\/files\/)/i;
@@ -25,7 +25,7 @@ export function signProfilePhotos(value: unknown, organizationId: string, depth 
   for (const [key, child] of Object.entries(obj)) {
     if (key === 'profileImage') {
       if (typeof child === 'string' && child !== '' && !ALREADY_A_LINK.test(child)) {
-        obj[key] = `/files/${signFileToken(organizationId, child, SESSION_ASSET_TTL_SECONDS)}`;
+        obj[key] = signProfilePhotoLink(organizationId, child);
       }
     } else if (child && typeof child === 'object') {
       signProfilePhotos(child, organizationId, depth + 1);

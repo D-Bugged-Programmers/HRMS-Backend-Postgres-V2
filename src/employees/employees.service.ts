@@ -91,7 +91,7 @@ import { DEFAULT_EMPLOYEE_TYPES } from '../organizations/employee-types';
 import { normalizeEmail } from '../common/normalize-input';
 import { LeaveBalanceService } from '../leave-balances/leave-balance.service';
 import { dmyText } from '../payroll/format-date';
-import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
+import { signFileToken, SESSION_ASSET_TTL_SECONDS, signProfilePhotoLink } from '../files/file-token';
 import { formatIndianMobile } from '../common/indian-mobile';
 
 const SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS ?? 10);
@@ -1223,7 +1223,7 @@ export class EmployeesService {
         department: r.department?.name ?? '',
         reportingManagerId: r.reportingManagerId,
         profileImage: r.profileImage
-          ? `/files/${signFileToken(organizationId, r.profileImage, SESSION_ASSET_TTL_SECONDS)}`
+          ? signProfilePhotoLink(organizationId, r.profileImage)
           : null,
       })),
     );

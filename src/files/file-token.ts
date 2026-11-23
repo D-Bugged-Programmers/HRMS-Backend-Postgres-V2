@@ -49,11 +49,16 @@ export function signFileToken(
   organizationId: string,
   relativeKey: string,
   ttlSeconds: number = DEFAULT_TTL_SECONDS,
+  // With a bucket, the expiry is counted from the start of the current bucket instead of from this instant, so the same file gets the
+  // SAME link for the whole bucket (the signature is deterministic). Lists of people use it for photos: the browser can then reuse a
+  // photo it already has instead of downloading it again on every refresh. The link is valid for at least ttl minus one bucket.
+  bucketSeconds = 0,
 ): string {
+  const now = bucketSeconds > 0 ? Math.floor(Date.now() / (bucketSeconds * 1000)) * bucketSeconds * 1000 : Date.now();
   const payload = {
     o: organizationId,
     p: relativeKey,
-    e: Date.now() + ttlSeconds * 1000,
+    e: now + ttlSeconds * 1000,
   };
   const json = base64url(JSON.stringify(payload));
   const sig = crypto
@@ -61,6 +66,11 @@ export function signFileToken(
     .update(json)
     .digest('base64url');
   return `${json}.${sig}`;
+}
+
+/** The link to a person's profile photo in a list: stable for an hour (so the browser can cache the photo), valid for 5 to 6 hours. */
+export function signProfilePhotoLink(organizationId: string, relativeKey: string): string {
+  return `/files/${signFileToken(organizationId, relativeKey, SESSION_ASSET_TTL_SECONDS, 3600)}`;
 }
 
 // Every write path that accepts one of these URL fields back from the

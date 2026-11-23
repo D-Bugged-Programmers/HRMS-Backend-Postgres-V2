@@ -3,6 +3,9 @@
 // and URL signing is file-token's; this is the thin glue between the two for the upload response shape.
 import { BadRequestException, Injectable } from '@nestjs/common';
 import * as fs from 'fs';
+import * as path from 'path';
+import { shrinkImage } from './image-shrink';
+import { DEFAULT_SETTINGS } from './shrink-uploads';
 import { relativeKeyFor } from './file-storage.config';
 import { signFileToken } from './file-token';
 import {
@@ -14,7 +17,7 @@ import {
 
 @Injectable()
 export class FilesService {
-  describeUpload(
+  async describeUpload(
     file: Express.Multer.File | undefined,
     category: string,
     organizationId: string,
@@ -51,6 +54,17 @@ export class FilesService {
         throw new BadRequestException(
           'The image must be a real JPEG or PNG whose file extension and type match.',
         );
+      }
+    }
+    // New profile photos and selfies are stored already shrunk (same limits as scripts/shrink-uploads.ts), so the folder never
+    // grows heavy. Disk driver only; any failure leaves the file exactly as uploaded.
+    const shrinkSettings = category === 'profile-photos' || category === 'selfies' ? DEFAULT_SETTINGS[category] : null;
+    if (file.path && shrinkSettings) {
+      try {
+        const result = await shrinkImage(fs.readFileSync(file.path), path.extname(file.path), shrinkSettings);
+        if (result) fs.writeFileSync(file.path, result.data);
+      } catch {
+        /* keep the original */
       }
     }
     const relativeKey = relativeKeyFor(organizationId, category, file);
