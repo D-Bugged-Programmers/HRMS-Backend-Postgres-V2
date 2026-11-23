@@ -4872,6 +4872,8 @@ model CcOrgProfile {
   tags           Json         @default("[]")
   notes          String       @default("")
   churnReason    String?
+  // Days after which the untouched selfie of a punch (the original, kept beside the stamped copy) is deleted for good. Null = keep forever.
+  selfieOriginalRetentionDays Int?
   updatedAt      DateTime     @updatedAt
 
   @@map("cc_org_profiles")

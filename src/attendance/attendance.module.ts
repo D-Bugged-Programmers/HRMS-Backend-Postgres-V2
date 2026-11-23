@@ -1,3 +1,4 @@
+import { SelfieRetentionService } from './selfie-retention.service';
 import { Module } from '@nestjs/common';
 import { AttendanceController } from './attendance.controller';
 import { AttendanceService } from './attendance.service';
@@ -17,7 +18,7 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
     AuditLogModule,
   ],
   controllers: [AttendanceController],
-  providers: [AttendanceService, SelfieStampService],
+  providers: [AttendanceService, SelfieStampService, SelfieRetentionService],
   // Exported so LeavesModule can inject AttendanceService for the
   // approval/cancellation integration hooks.
   exports: [AttendanceService],

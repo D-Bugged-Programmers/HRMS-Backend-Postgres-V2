@@ -201,13 +201,23 @@ export class CcCustomersService {
   /** What the platform team knows about this customer: account manager, contact, tags, notes. */
   async profile(organizationId: string) {
     const p = await this.prisma.ccOrgProfile.findUnique({ where: { organizationId } });
-    return { accountManager: p?.accountManager ?? null, contactName: p?.contactName ?? null, contactPhone: p?.contactPhone ?? null, tags: (p?.tags as string[]) ?? [], notes: p?.notes ?? '', churnReason: p?.churnReason ?? null, updatedAt: p?.updatedAt.toISOString() ?? null };
+    return { accountManager: p?.accountManager ?? null, contactName: p?.contactName ?? null, contactPhone: p?.contactPhone ?? null, tags: (p?.tags as string[]) ?? [], notes: p?.notes ?? '', churnReason: p?.churnReason ?? null, selfieOriginalRetentionDays: p?.selfieOriginalRetentionDays ?? null, updatedAt: p?.updatedAt.toISOString() ?? null };
   }
 
-  async saveProfile(organizationId: string, b: { accountManager?: string; contactName?: string; contactPhone?: string; tags?: string[]; notes?: string; churnReason?: string }) {
+  async saveProfile(organizationId: string, b: { accountManager?: string; contactName?: string; contactPhone?: string; tags?: string[]; notes?: string; churnReason?: string; selfieOriginalRetentionDays?: number | null }) {
     if (!(await this.prisma.organization.findFirst({ where: { id: organizationId }, select: { id: true } }))) throw new NotFoundException('Organization not found.');
     const clean = (v?: string) => (v?.trim() ? v.trim() : null);
+    let selfieDays: number | null | undefined;
+    if ('selfieOriginalRetentionDays' in b) {
+      const raw = b.selfieOriginalRetentionDays;
+      if (raw === null || raw === undefined || (raw as unknown) === '') selfieDays = null;
+      else {
+        selfieDays = Number(raw);
+        if (!Number.isInteger(selfieDays) || selfieDays < 7 || selfieDays > 3650) throw new BadRequestException('Selfie retention must be a whole number of days between 7 and 3650, or empty to keep selfies forever.');
+      }
+    }
     const data = {
+      ...(selfieDays !== undefined ? { selfieOriginalRetentionDays: selfieDays } : {}),
       ...('accountManager' in b ? { accountManager: clean(b.accountManager) } : {}), ...('contactName' in b ? { contactName: clean(b.contactName) } : {}),
       ...('contactPhone' in b ? { contactPhone: clean(b.contactPhone) } : {}), ...('churnReason' in b ? { churnReason: clean(b.churnReason) } : {}),
       ...('notes' in b ? { notes: (b.notes ?? '').slice(0, 5000) } : {}),
