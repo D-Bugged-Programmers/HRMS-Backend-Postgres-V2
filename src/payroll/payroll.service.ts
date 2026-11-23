@@ -2106,9 +2106,18 @@ export class PayrollService {
     };
   }
 
-  async previewStructure(dto: StructurePreviewDto, organizationId: string) {
+  /** The organisation's settings and components the structure calculator needs; a bulk upload reads them once for every row. */
+  structureContext(organizationId: string) {
+    return this.packageContext(organizationId);
+  }
+
+  async previewStructure(
+    dto: StructurePreviewDto,
+    organizationId: string,
+    context?: Awaited<ReturnType<PayrollService['packageContext']>>,
+  ) {
     const { settings, components, today } =
-      await this.packageContext(organizationId);
+      context ?? (await this.packageContext(organizationId));
     void today;
 
     // Where the employee is hired: their own work location, else the department's, else what was sent.

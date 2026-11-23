@@ -70,6 +70,7 @@ export class EmployeesController {
       caller,
       caller.organizationId,
       dto.sendWelcomeEmail ?? true,
+      dto.dryRun ?? false,
     );
   }
 

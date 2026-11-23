@@ -666,7 +666,13 @@ export class EmployeesService {
     // Every row is still created and gets a generated password regardless;
     // this only controls whether create() also fires the welcome email.
     sendWelcomeEmail: boolean = true,
+    // true: check every row and create nothing (the import dialog's first step).
+    dryRun: boolean = false,
   ) {
+    const ready: { name: string; email: string }[] = [];
+    // In a check-only run, the same email / phone / code twice in the file is caught here.
+    const seenEmails = new Set<string>();
+    const seenPhones = new Set<string>();
     const created: {
       employeeId: string;
       name: string;
@@ -975,6 +981,29 @@ export class EmployeesService {
         return;
       }
 
+      if (dryRun) {
+        try {
+          if (email) {
+            if (seenEmails.has(email)) throw new ConflictException('This email appears more than once in the file.');
+            seenEmails.add(email);
+            if (await this.usersService.findByEmail(email)) throw new ConflictException('An account with this email already exists.');
+          }
+          const phone = asString(row.contactNumber).trim();
+          if (phone) {
+            if (seenPhones.has(phone)) throw new ConflictException('This contact number appears more than once in the file.');
+            seenPhones.add(phone);
+          }
+          await this.assertContactNumberUnique(dto.contactNumber, organizationId);
+          if (employeeCode && (await this.scopedPrisma.user.findFirst({ where: { organizationId, employeeId: employeeCode }, select: { id: true } }))) {
+            throw new ConflictException(`Employee code ${employeeCode} is already in use.`);
+          }
+          ready.push({ name, email });
+        } catch (err) {
+          failed.push({ row, error: err instanceof Error ? err.message : 'This row could not be checked.' });
+        }
+        return;
+      }
+
       try {
         const { employee, generatedPassword } = await this.create(
           dto,
@@ -996,6 +1025,18 @@ export class EmployeesService {
       }
     });
 
+    if (dryRun) {
+      // The plan's employee limit, for the rows that passed: said before anything is created.
+      let limitError: string | null = null;
+      if (ready.length > 0) {
+        try {
+          await assertEmployeeRoom(organizationId, ready.length);
+        } catch (err) {
+          limitError = err instanceof Error ? err.message : 'The plan\'s employee limit would be passed.';
+        }
+      }
+      return { dryRun: true, ready, created: [], failed, limitError };
+    }
     return { created, failed };
   }
 

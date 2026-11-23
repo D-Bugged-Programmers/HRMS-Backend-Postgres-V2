@@ -27,6 +27,8 @@ import { DeleteMonthPayrollDto } from './dto/delete-month-payroll.dto';
 import { DraftPayrollDto } from './dto/draft-payroll.dto';
 import { AttendanceGapsQueryDto } from './dto/attendance-gaps-query.dto';
 import { StructurePreviewDto } from './dto/structure-preview.dto';
+import { SalaryUploadDto } from './dto/salary-upload.dto';
+import { SalaryStructureUploadService } from './salary-structure-upload.service';
 import { CalculatePayrollDto } from './dto/calculate-payroll.dto';
 import { QueryPayrollDto } from './dto/query-payroll.dto';
 import { AdjustPayrollDto } from './dto/adjust-payroll.dto';
@@ -58,6 +60,7 @@ export class PayrollController {
     private readonly payrollService: PayrollService,
     private readonly payslipPdfService: PayslipPdfService,
     private readonly privacyAudit: PrivacyAuditService,
+    private readonly salaryStructureUpload: SalaryStructureUploadService,
   ) {}
 
   // No @Roles() — any authenticated caller, self/dept-scoped inline in
@@ -311,6 +314,15 @@ export class PayrollController {
     @CurrentUser() caller: Caller,
   ) {
     return this.payrollService.previewStructure(dto, caller.organizationId);
+  }
+
+  // Many employees' salary structures from one sheet (annual CTC / monthly gross / component amounts per row). `dryRun: true` checks and
+  // calculates every row and saves nothing; without it the rows are saved through the same per-employee save as the Salary tab.
+  @Post('salary-upload')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  salaryUpload(@Body() dto: SalaryUploadDto, @CurrentUser() caller: Caller) {
+    return this.salaryStructureUpload.process(dto, { id: caller.id, role: caller.role }, caller.organizationId);
   }
 
   @Post('draft')

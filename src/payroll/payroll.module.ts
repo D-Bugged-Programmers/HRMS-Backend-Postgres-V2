@@ -16,6 +16,8 @@ import { EmailTemplatesModule } from '../email-templates/email-templates.module'
 import { OpeningBalancesController } from './opening-balances.controller';
 import { OpeningBalancesService } from './opening-balances.service';
 import { LoansModule } from '../loans/loans.module';
+import { EmployeeSalaryComponentsModule } from '../employee-salary-components/employee-salary-components.module';
+import { SalaryStructureUploadService } from './salary-structure-upload.service';
 
 @Module({
   imports: [
@@ -26,6 +28,7 @@ import { LoansModule } from '../loans/loans.module';
     NotificationsModule,
     EmailTemplatesModule,
     LoansModule,
+    EmployeeSalaryComponentsModule,
     PrivacyModule,
     CompanyBrandsModule,
   ],
@@ -36,6 +39,7 @@ import { LoansModule } from '../loans/loans.module';
     PayslipPdfService,
     PayslipEmailQueueService,
     PayslipEmailWorker,
+    SalaryStructureUploadService,
   ],
   exports: [PayrollService, PayslipPdfService],
 })

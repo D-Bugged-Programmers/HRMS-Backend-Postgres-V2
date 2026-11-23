@@ -1084,6 +1084,17 @@ export class EmployeeSalaryComponentsService {
   // accepted and then silently ignored for those months. Rejected instead:
   // unlock the run to redo it, or date the revision after it and pay any
   // difference as arrears.
+  /** The reason a revision effective from this date is refused because that month's payroll is locked or paid, or null when it is allowed. */
+  async finalizedPayrollConflict(employeeId: string, effectiveFrom: string, organizationId: string): Promise<string | null> {
+    try {
+      await this.assertNoFinalizedPayrollFrom(employeeId, effectiveFrom, organizationId);
+      return null;
+    } catch (err) {
+      if (err instanceof BadRequestException) return err.message;
+      throw err;
+    }
+  }
+
   private async assertNoFinalizedPayrollFrom(
     employeeId: string,
     effectiveFrom: string,

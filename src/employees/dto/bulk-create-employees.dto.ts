@@ -125,4 +125,11 @@ export class BulkCreateEmployeesDto {
   @IsOptional()
   @IsBoolean()
   sendWelcomeEmail?: boolean;
+
+  // true: check every row (the same rules, plus duplicate email / phone / code in the file or already in use, and the plan's
+  // employee limit) and create nothing, so problems show before anyone is added or emailed.
+  @ApiPropertyOptional({ description: 'true: check every row and create nothing.' })
+  @IsOptional()
+  @IsBoolean()
+  dryRun?: boolean;
 }
