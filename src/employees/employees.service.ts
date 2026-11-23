@@ -2648,6 +2648,14 @@ export class EmployeesService {
     const failed: { employeeId: string; name: string; error: string }[] = [];
     for (const id of employeeIds) {
       try {
+        // Someone serving notice or who has left is never moved by accident from a bulk change (it would quietly cancel a
+        // resignation or reinstate them): that is done one person at a time, through Resignation / Offboarding or their own Edit screen.
+        if (patch.employmentStatus) {
+          const current = await this.scopedPrisma.user.findFirst({ where: { id, organizationId }, select: { employmentStatus: true } });
+          if (current && LEAVING_STATUSES.includes(current.employmentStatus)) {
+            throw new BadRequestException(`Is leaving or has left (${current.employmentStatus}). Change this from Resignation / Offboarding or their own Edit screen.`);
+          }
+        }
         await this.update(id, patch as UpdateEmployeeDto, actor, organizationId);
         updated.push(id);
       } catch (err) {

@@ -3,13 +3,17 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsIn,
   IsOptional,
   IsString,
   IsUUID,
   MaxLength,
 } from 'class-validator';
 
-/** Body of POST /employees/bulk-update - give several employees the same department, reporting manager, work location or designation. */
+// The statuses a bulk change may set. Resigned, Released, Terminated and Absconded go only through Resignation / Offboarding.
+export const BULK_EMPLOYMENT_STATUSES = ['ON_HOLD', 'ONBOARDING', 'PROBATION', 'EXTENDED_PROBATION', 'CONFIRMED'] as const;
+
+/** Body of POST /employees/bulk-update - give several employees the same department, reporting manager, work location, designation or employment status. */
 export class BulkUpdateEmployeesDto {
   @ApiProperty({ type: [String] })
   @IsArray()
@@ -26,4 +30,9 @@ export class BulkUpdateEmployeesDto {
   @IsString()
   @MaxLength(100)
   designation?: string;
+
+  @ApiPropertyOptional({ enum: BULK_EMPLOYMENT_STATUSES })
+  @IsOptional()
+  @IsIn(BULK_EMPLOYMENT_STATUSES as unknown as string[])
+  employmentStatus?: (typeof BULK_EMPLOYMENT_STATUSES)[number];
 }
