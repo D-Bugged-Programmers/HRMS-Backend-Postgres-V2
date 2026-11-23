@@ -37,7 +37,6 @@ const FIELDS: Field[] = [
   { key: 'profileImage', label: 'Profile photo', group: 'Personal' },
   { key: 'designation', label: 'Designation', group: 'Job' },
   { key: 'departmentId', label: 'Department', group: 'Job' },
-  { key: 'employeeCategory', label: 'Employee category', group: 'Job' },
   { key: 'workLocationId', label: 'Work location', group: 'Job' },
   { key: 'fatherName', label: "Father's name", group: 'Family' },
   { key: 'fatherContact', label: "Father's contact", group: 'Family' },

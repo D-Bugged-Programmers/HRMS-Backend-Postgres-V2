@@ -64,7 +64,7 @@ describe('isEligible', () => {
     ).toBe(false);
   });
 
-  it('non-empty applicableEmployeeTypes restricts to listed employee types', () => {
+  it('non-empty applicableEmployeeTypes restricts to listed employee categories', () => {
     const type = { ...baseType, applicableEmployeeTypes: ['contract'] };
     expect(isEligible(type, baseEmployee, asOf)).toBe(false);
   });

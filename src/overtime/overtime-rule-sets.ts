@@ -2,7 +2,7 @@
 //   types or individual people, on top of the company overtime policy.
 // Responsibilities: pickRuleSet finds the set that applies to a person on a date; applyRuleSetPolicy / applyRuleSetRates
 //   lay its values over the company policy and pay multipliers; sanitizeRuleSetInput validates what an Admin saves.
-// Important: precedence is the person's own assignment, then their department, then their employee type; within one
+// Important: precedence is the person's own assignment, then their department, then their employee category; within one
 //   level the set with the latest effectiveFrom wins. A key left out of a set falls back to the company value, so a set
 //   only needs to state what differs. A set only counts for dates on or after effectiveFrom, so changing rules never
 //   rewrites an earlier month.

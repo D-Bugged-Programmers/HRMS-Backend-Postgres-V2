@@ -92,7 +92,7 @@ export class OrganizationsController {
   }
 
   // -- WFH / Regularization Auto-Approval --
-  // Own endpoints (same reasoning as Employee Types below) so Admin/HR can set the auto-approve-after-N-hours window
+  // Own endpoints (same reasoning as Employee Categories below) so Admin/HR can set the auto-approve-after-N-hours window
   // without needing the broad ADMIN-only settings/:section route; a Manager (who reviews these day to day) may read it. Declared before
   // that route's `:section` wildcard so `settings/auto-approval` matches
   // here first, not as section="auto-approval" on the generic ADMIN-only
@@ -270,9 +270,9 @@ export class OrganizationsController {
     return this.employmentStatusesService.delete(key, caller.organizationId, caller);
   }
 
-  // -- Employee Types --
+  // -- Employee Categories --
   // Own ADMIN/HR-scoped endpoints (rather than the broad ADMIN-only
-  // settings/:section route) so the Employment Types management screen has
+  // settings/:section route) so the Employee Categories management screen has
   // the same role split as Departments/OrgListItems — reads/writes the
   // same Organization.customEmployeeTypes field the Setup Wizard section
   // and Employees.tsx's inline "add new type" flow already use.

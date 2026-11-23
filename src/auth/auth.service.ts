@@ -287,7 +287,7 @@ export class AuthService {
         await this.emailTemplatesService.seedDefaults(tx, organization.id);
         await this.letterTemplatesService.seedDefaults(tx, organization.id);
         // Every new org also starts with the standard built-in Employee
-        // Category set (Full-Time/Part-Time/Contract/Intern) instead of an
+        // Category set (Management/Executive/Staff/Worker/Support) instead of an
         // empty Employee Categories page — admin can still add custom ones
         // alongside these, same registration-time integration point as the
         // seeds above.
@@ -781,7 +781,7 @@ export class AuthService {
           select: { id: true, name: true, employeeId: true },
         })
       : [];
-    // The profile form marks UAN required when PF applies to this person (company PF on, employment type covered).
+    // The profile form marks UAN required when PF applies to this person (company PF on, employee category covered).
     const payrollSettings = await this.scopedPrisma.payrollSettings.findFirst({
       where: { organizationId },
       select: { pfEnabled: true, esiEnabled: true },

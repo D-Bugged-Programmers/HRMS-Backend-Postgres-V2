@@ -149,7 +149,7 @@ export class CreateLeaveTypeDto {
 
   @ApiPropertyOptional({
     type: [String],
-    description: '[] = applies to all employee types',
+    description: '[] = applies to all employee categories',
   })
   @IsOptional()
   @IsArray()

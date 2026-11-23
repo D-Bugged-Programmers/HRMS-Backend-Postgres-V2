@@ -1,4 +1,4 @@
-// Purpose: Which statutory schemes an employee type starts with. A person hired as an intern, trainee or apprentice is on
+// Purpose: Which statutory schemes an employee category starts with. A person hired as an intern, trainee or apprentice is on
 //   a stipend (no PF, ESI, gratuity or statutory bonus); a consultant, freelancer or vendor resource is not on the payroll
 //   at all (professional fees, not salary); everyone else is an employee under the schemes.
 // Important: only a starting point - HR can tick or untick each scheme per employee when the salary structure is built.

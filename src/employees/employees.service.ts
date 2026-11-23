@@ -10,6 +10,7 @@
 // pre-check.
 import { placeholderEmailFor, readLoginPolicy } from '../common/no-email';
 import { codeFitsFormat } from './employee-code';
+import { startsOnProbation } from './probation-start';
 import { isBuiltinSwitchedOff, resolveChosenStatus } from '../organizations/employment-status-config';
 
 // What the import dialog sends in the Company column for "the main company itself" (not a sister company).
@@ -275,9 +276,9 @@ export class EmployeesService {
             additionalReportingManagerIds: extraManagers,
             employeeType: dto.employeeType ?? 'permanent',
             employmentStatus:
-              dto.employeeType === 'probation' ? 'PROBATION' : 'ONBOARDING',
+              startsOnProbation(dto) ? 'PROBATION' : 'ONBOARDING',
             // A probation hire gets the end date worked out from the joining date and the company's probation length.
-            ...(dto.employeeType === 'probation' && dto.joiningDate
+            ...(startsOnProbation(dto) && dto.joiningDate
               ? { probationEndDate: addMonthsYmd(String(dto.joiningDate), probationMonths) }
               : {}),
             // personalEmail rides along at creation (rather than only via the
@@ -937,20 +938,7 @@ export class EmployeesService {
           }
         }
       }
-      if (!employeeCategoryName && !lacks('Employee category')) {
-        failed.push({ row, error: 'Employee category is required.' });
-        return;
-      }
-      const employeeCategory = employeeCategoryName ? employeeCategoryItems.find(
-        (c) => c.name.toLowerCase() === employeeCategoryName.toLowerCase(),
-      ) : undefined;
-      if (employeeCategoryName && !employeeCategory) {
-        failed.push({
-          row,
-          error: `Employee category "${employeeCategoryName}" not found.`,
-        });
-        return;
-      }
+      // The old label-only Employee Category is retired: a column for it in an old file is ignored.
       if (!roleInput && !lacks('Role (set to Employee)')) {
         failed.push({ row, error: 'Role is required.' });
         return;
@@ -965,8 +953,8 @@ export class EmployeesService {
         });
         return;
       }
-      if (!employeeTypeInput && !lacks('Employee type (set to Permanent)')) {
-        failed.push({ row, error: 'Employee type is required.' });
+      if (!employeeTypeInput && !lacks('Employee category (set to Permanent)')) {
+        failed.push({ row, error: 'Employee category is required.' });
         return;
       }
       const employeeType = employeeTypeInput ? activeEmployeeTypes.find(
@@ -977,7 +965,7 @@ export class EmployeesService {
       if (employeeTypeInput && !employeeType) {
         failed.push({
           row,
-          error: `Employee type "${employeeTypeInput}" not found.`,
+          error: `Employee category "${employeeTypeInput}" not found.`,
         });
         return;
       }
@@ -1027,7 +1015,7 @@ export class EmployeesService {
         workLocationId: workLocation?.id,
         brandId: rowBrandId,
         designation,
-        employeeCategory: employeeCategory?.name ?? '',
+        employeeCategory: '',
         contactNumber: contactNumber ? formatIndianMobile(contactNumber) : '',
         gender,
         joiningDate: joiningDate || undefined,
@@ -1445,7 +1433,6 @@ export class EmployeesService {
     const requiredFields: [string, string][] = [
       ['departmentId', 'Department'],
       ['designation', 'Designation'],
-      ['employeeCategory', 'Employee category'],
       ['workLocationId', 'Work location'],
     ];
     const cleared = requiredFields.filter(([key]) => {
@@ -2187,7 +2174,7 @@ export class EmployeesService {
           newStatus: clean.employmentStatus,
           changedById,
           ...(clean.employeeType !== undefined && clean.employeeType !== before.employeeType
-            ? { note: `Employee type changed from ${before.employeeType} to ${clean.employeeType}.` }
+            ? { note: `Employee category changed from ${before.employeeType} to ${clean.employeeType}.` }
             : {}),
         },
       });
@@ -2204,7 +2191,7 @@ export class EmployeesService {
         performedById: changedById,
         description:
           `Employment status changed from ${label(before.employmentStatus)} to ${label(clean.employmentStatus)}.` +
-          (clean.employeeType !== undefined && clean.employeeType !== before.employeeType ? ` Employee type changed to ${clean.employeeType}.` : ''),
+          (clean.employeeType !== undefined && clean.employeeType !== before.employeeType ? ` Employee category changed to ${clean.employeeType}.` : ''),
       });
     }
   }

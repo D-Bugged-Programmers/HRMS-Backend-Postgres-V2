@@ -262,7 +262,8 @@ model Organization {
   // nowhere else on a built-in entry to persist an Active/Inactive flag.
   // Label/value stay immutable and undeletable either way; this only
   // gates whether one shows as active in the Employment Types list.
-  inactiveBuiltinEmployeeTypes String[] @default([])
+  // New companies start with Probation switched off as a category: it is a status (use "Start on probation" when hiring). Existing companies keep it.
+  inactiveBuiltinEmployeeTypes String[] @default(["probation"])
 
   // The company's own view of employment statuses: { custom: [{ key, label, behavior }], labels: { PROBATION: 'Trial' }, inactive: ['ON_HOLD'] }.
   // The EmploymentStatus enum still drives every rule; a custom status follows one built-in behaviour (see employment-status-config.ts).

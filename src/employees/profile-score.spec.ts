@@ -21,7 +21,7 @@ describe('profileScore', () => {
     void _ifsc; void _bg;
     const s = profileScore(rest, [], []);
     expect(s.missing.map((m) => m.key).sort()).toEqual(['bankIFSC', 'bloodGroup']);
-    expect(s.percent).toBe(Math.round((29 / 31) * 100));
+    expect(s.percent).toBe(Math.round((28 / 30) * 100));
     expect(s.payrollReady).toBe(false);
   });
 

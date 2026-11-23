@@ -26,11 +26,13 @@ type Actor = { id: string };
 
 // The only type with a built-in set — see OrgListItem.isSystemDefault's
 // schema comment. Designations/Grades stay fully free-form.
+// Groups of people for reporting, not contract kinds (Permanent, Contract, Intern... are Employee Categories): new companies start with these.
 export const BUILTIN_EMPLOYEE_CATEGORIES = [
-  'Full-Time',
-  'Part-Time',
-  'Contract',
-  'Intern',
+  'Management',
+  'Executive',
+  'Staff',
+  'Worker',
+  'Support',
 ];
 
 // Asset Inventory's category master — the second type with a built-in set.

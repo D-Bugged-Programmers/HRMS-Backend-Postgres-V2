@@ -8,7 +8,7 @@ export const YEARS_FOR_GRATUITY_ELIGIBILITY = 5;
 // continuous service (pro-rata to the contract), not five.
 export const YEARS_FOR_FIXED_TERM_GRATUITY = 1;
 
-// Built-in employee types that are fixed-term engagements — a contract or temporary employee. Interns, apprentices,
+// Built-in employee categories that are fixed-term engagements — a contract or temporary employee. Interns, apprentices,
 // trainees, freelancers and third-party payroll aren't the employer's employees for gratuity purposes. A custom
 // type whose name says fixed-term / contract / temporary counts too.
 export function isFixedTermEmployeeType(

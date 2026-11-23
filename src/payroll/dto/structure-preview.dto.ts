@@ -152,7 +152,7 @@ export class StructurePreviewDto {
 
   @ApiPropertyOptional({
     description:
-      'Which schemes apply; absent = the defaults of the employee type.',
+      'Which schemes apply; absent = the defaults of the employee category.',
   })
   @IsOptional()
   @ValidateNested()

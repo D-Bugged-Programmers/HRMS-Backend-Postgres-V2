@@ -149,7 +149,7 @@ describe('salary structure preview', () => {
     );
   });
 
-  it('a ticked scheme can be turned off for an employee type that has it', () => {
+  it('a ticked scheme can be turned off for an employee category that has it', () => {
     const p = preview({
       mode: 'CTC',
       annualCtc: 600000,

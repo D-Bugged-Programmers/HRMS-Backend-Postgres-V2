@@ -105,7 +105,7 @@ export class OvertimeRuleSetsService {
       !targets.designations.length
     ) {
       throw new BadRequestException(
-        'Choose who this applies to: departments, designations, employee types or specific people.',
+        'Choose who this applies to: departments, designations, employee categories or specific people.',
       );
     }
     if (
@@ -183,7 +183,7 @@ export class OvertimeRuleSetsService {
       !targets.designations.length
     ) {
       throw new BadRequestException(
-        'Choose who this applies to: departments, designations, employee types or specific people.',
+        'Choose who this applies to: departments, designations, employee categories or specific people.',
       );
     }
     await this.db.overtimeRuleSet.updateMany({

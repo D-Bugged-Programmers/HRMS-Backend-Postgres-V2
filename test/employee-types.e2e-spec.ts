@@ -22,7 +22,7 @@ interface EmployeeTypeBody {
 
 const PASSWORD = 'TestPass123!';
 
-describe('Employee Types (e2e)', () => {
+describe('Employee Categories (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: PrismaService;
 
@@ -46,7 +46,7 @@ describe('Employee Types (e2e)', () => {
     prisma = app.get(PrismaService);
 
     await request(app.getHttpServer()).post('/auth/register').send({
-      organizationName: 'Employee Types E2E Org',
+      organizationName: 'Employee Categories E2E Org',
       name: 'Founder',
       email: 'employeetypes-e2e-admin@example.test',
       password: PASSWORD,
@@ -67,7 +67,7 @@ describe('Employee Types (e2e)', () => {
     await app.close();
   });
 
-  it('a custom employee type assigned to an employee cannot be deleted, but can once reassigned', async () => {
+  it('a custom employee category assigned to an employee cannot be deleted, but can once reassigned', async () => {
     await request(app.getHttpServer())
       .post('/organizations/employee-types')
       .set('Authorization', `Bearer ${adminToken}`)
@@ -78,7 +78,7 @@ describe('Employee Types (e2e)', () => {
       .post('/employees')
       .set('Authorization', `Bearer ${adminToken}`)
       .send({
-        name: 'Employee Type User',
+        name: 'Employee Category User',
         email: 'employeetypes-e2e-emp@example.test',
         employeeType: 'freelance_contractor',
       })

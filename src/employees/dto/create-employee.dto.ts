@@ -163,11 +163,12 @@ export class CreateEmployeeDto {
   @IsString()
   gradeLevel?: string;
 
-  @ApiProperty()
+  // Retired: the old label-only Employee Category is no longer asked for (the stored value is kept). Employee Category is now "Employee Category".
+  @ApiProperty({ required: false })
+  @IsOptional()
   @Trim()
-  @IsNotEmpty({ message: 'Employee category is required.' })
   @IsString()
-  employeeCategory!: string;
+  employeeCategory?: string;
 
   // Not format-validated here — this endpoint (admin "Add Employee") always
   // gets plain 10-digit input from the frontend, but Profile.tsx's own
@@ -223,4 +224,11 @@ export class CreateEmployeeDto {
   @IsOptional()
   @IsString()
   employeeType?: string;
+
+  // Hire on probation: the status starts as Probation and the end date is worked out from the joining date (the same as choosing the
+  // "Probation" category, which older companies still use).
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  startOnProbation?: boolean;
 }

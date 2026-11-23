@@ -438,7 +438,7 @@ export function isProfileComplete(
 }
 
 // Aadhaar is the identity proof behind the PF and ESI registrations, so it is asked for only where one of them applies to this person: the company has
-// PF or ESI on and their employment type is covered by it. Otherwise it stays optional.
+// PF or ESI on and their employee category is covered by it. Otherwise it stays optional.
 export function aadhaarRequiredFor(input: {
   pfEnabled: boolean;
   esiEnabled: boolean;
@@ -448,7 +448,7 @@ export function aadhaarRequiredFor(input: {
   return (input.pfEnabled && d.pf) || (input.esiEnabled && d.esi);
 }
 
-// PF applies to this person: the company has PF on and their employment type is covered by it (an intern, trainee or
+// PF applies to this person: the company has PF on and their employee category is covered by it (an intern, trainee or
 // consultant is not - see statutoryDefaultsForType). Then a UAN is asked for on the profile.
 export function uanRequiredFor(input: {
   pfEnabled: boolean;

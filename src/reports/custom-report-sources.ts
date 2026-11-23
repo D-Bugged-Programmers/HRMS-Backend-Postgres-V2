@@ -83,7 +83,7 @@ const employeesSource: CustomReportSource<
     department: { header: 'Department', get: (r) => r.department?.name ?? '' },
     designation: { header: 'Designation', get: (r) => r.designation },
     role: { header: 'Role', get: (r) => r.role },
-    employeeType: { header: 'Employee Type', get: (r) => r.employeeType },
+    employeeType: { header: 'Employee Category', get: (r) => r.employeeType },
     joiningDate: {
       header: 'Joining Date',
       get: (r) => formatDateDisplay(r.joiningDate),

@@ -436,7 +436,7 @@ describe('assertContactNumbersDistinct', () => {
 });
 
 describe('UAN on the profile', () => {
-  it('is asked for only where PF applies: company PF on and an employment type PF covers', () => {
+  it('is asked for only where PF applies: company PF on and an employee category PF covers', () => {
     expect(uanRequiredFor({ pfEnabled: true, employeeType: 'permanent' })).toBe(
       true,
     );

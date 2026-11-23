@@ -1477,7 +1477,7 @@ describe('Employees + Departments (e2e)', () => {
         email: 'employees-e2e-no-location@example.test',
         departmentId: engDepartmentId,
         designation: 'Engineer',
-        employeeCategory: 'Full-Time',
+        employeeCategory: 'Staff',
       }).expect(400);
       expect(JSON.stringify(res.body)).toMatch(/Work location is required/);
     });
@@ -1523,7 +1523,7 @@ describe('Employees + Departments (e2e)', () => {
       department: 'Engineering',
       designation: 'Engineer',
       workLocation: BULK_LOCATION,
-      employeeCategory: 'Full-Time',
+      employeeCategory: 'Staff',
       role: 'EMPLOYEE',
       employeeType: 'permanent',
       gender: 'Female',
@@ -1617,7 +1617,7 @@ describe('Employees + Departments (e2e)', () => {
       expect(emp.departmentId).toBe(engDepartmentId);
       expect(emp.role).toBe('EMPLOYEE');
       expect(emp.employeeType).toBe('permanent');
-      expect(emp.employeeCategory).toBe('Full-Time');
+      expect(emp.employeeCategory).toBe('Staff');
 
       const detail = await request(app.getHttpServer())
         .get(`/employees/${emp.id}`)

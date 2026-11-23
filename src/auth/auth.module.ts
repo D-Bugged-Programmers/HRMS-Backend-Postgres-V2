@@ -53,7 +53,7 @@ import { PlatformInternalModule } from '../platform-internal/platform-internal.m
     // EmailTemplatesModule above.
     LetterTemplatesModule,
     // For OrgListItemsService.seedDefaults — every new org gets the
-    // standard built-in Employee Category set (Full-Time/Part-Time/
+    // standard built-in Employee Category set (Management/Executive/
     // Contract/Intern) at registration, same integration point as
     // LetterTemplatesModule above.
     OrgListItemsModule,

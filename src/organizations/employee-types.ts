@@ -1,4 +1,4 @@
-// Purpose: The 12 built-in Employee Type values, mirrored exactly from frontend/src/constants/
+// Purpose: The 12 built-in Employee Category values, mirrored exactly from frontend/src/constants/
 //   employeeTypes.tsx's DEFAULT_EMPLOYEE_TYPES.
 // Important: `value` is compared directly elsewhere ('probation' drives employmentStatus assignment at
 //   EmployeesService.create() time) — never rename an existing value here, only add new ones.

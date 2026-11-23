@@ -609,7 +609,7 @@ describe('Organization Settings / Setup Wizard (e2e)', () => {
     expect(body.sealUrl).toMatch(/^\/files\//);
   });
 
-  it('replaces custom employee types via the employeeTypes section', async () => {
+  it('replaces custom employee categories via the employeeTypes section', async () => {
     const res = await request(app.getHttpServer())
       .patch('/organizations/settings/employeeTypes')
       .set('Authorization', `Bearer ${adminToken}`)

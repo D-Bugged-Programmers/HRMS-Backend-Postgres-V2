@@ -45,7 +45,7 @@ export interface StructurePreviewInput {
   da?: { enabled?: boolean; amount?: number };
   /** Fixed monthly allowances that are switched on: component code -> monthly amount. */
   allowances?: Record<string, number>;
-  /** Which schemes apply; absent = the defaults of the employee type. */
+  /** Which schemes apply; absent = the defaults of the employee category. */
   statutory?: Partial<StatutoryDefaults> & { nps?: boolean };
 }
 

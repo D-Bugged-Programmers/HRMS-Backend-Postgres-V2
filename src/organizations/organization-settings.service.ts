@@ -328,7 +328,7 @@ export class OrganizationSettingsService {
 
   // Own narrow ADMIN/HR-scoped read/write (rather than the broad
   // ADMIN-only settings/:section route, or updateSection's full-org
-  // response) — same reasoning as Employee Types' own dedicated endpoints:
+  // response) — same reasoning as Employee Categories' own dedicated endpoints:
   // HR should be able to see and set this without also getting the rest
   // of Organization Settings (statutory numbers, email domain, etc.),
   // which stays ADMIN-only.

@@ -24,7 +24,7 @@ const set = (o: Partial<RuleSetRow>): RuleSetRow => ({
 
 describe('overtime rule sets', () => {
   const person = { id: 'e1', departmentId: 'd1', employeeType: 'permanent' };
-  it('person beats department beats employee type', () => {
+  it('person beats department beats employee category', () => {
     const byType = set({ id: 't', employeeTypes: ['permanent'] });
     const byDept = set({ id: 'd', departmentIds: ['d1'] });
     const byPerson = set({ id: 'p', employeeIds: ['e1'] });

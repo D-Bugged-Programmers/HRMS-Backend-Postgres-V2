@@ -361,7 +361,7 @@ export class EmployeeProfileService {
   // completes the profile even without a subsequent Save Profile click; a
   // document getting rejected, or a required upload being deleted, can
   // un-complete it the same way).
-  // Whether this person's profile asks for a UAN: PF is on for the company and their employment type is covered.
+  // Whether this person's profile asks for a UAN: PF is on for the company and their employee category is covered.
   private async uanRequired(
     employee: { employeeType: string | null },
     organizationId: string,
@@ -955,7 +955,7 @@ export class EmployeeProfileService {
           newStatus,
           note:
             (dto.effectiveDate ? `Effective ${dmyText(dto.effectiveDate)}. ` : '') +
-            (dto.decision === 'confirmed' && employee.employeeType === 'probation' ? 'Employee type changed from probation to permanent. ' : '') +
+            (dto.decision === 'confirmed' && employee.employeeType === 'probation' ? 'Employee category changed from probation to permanent. ' : '') +
             (dto.note ?? ''),
           changedById: actor.id,
         },

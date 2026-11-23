@@ -1,4 +1,4 @@
-// Purpose: Manage the org's Employee Type list — the 12 built-in defaults (undeletable/unrenameable,
+// Purpose: Manage the org's Employee Category list — the 12 built-in defaults (undeletable/unrenameable,
 //   business logic keys off their exact values, but deactivatable) plus whatever custom ones this org has
 //   added.
 // Responsibilities: Owns Organization.customEmployeeTypes (the same field the Setup Wizard's
@@ -93,7 +93,7 @@ export class EmployeeTypesService {
       custom.some((t) => t.value === value)
     ) {
       throw new BadRequestException(
-        'An employee type with this name already exists.',
+        'An employee category with this name already exists.',
       );
     }
 
@@ -129,7 +129,7 @@ export class EmployeeTypesService {
     if (DEFAULT_EMPLOYEE_TYPES.some((t) => t.value === value)) {
       if (updates.label !== undefined) {
         throw new BadRequestException(
-          "Built-in employee types can't be renamed.",
+          "Built-in employee categories can't be renamed.",
         );
       }
       if (updates.isActive !== undefined) {
@@ -149,7 +149,7 @@ export class EmployeeTypesService {
 
     const custom = await this.getCustomTypes(organizationId);
     if (!custom.some((t) => t.value === value)) {
-      throw new NotFoundException('Employee type not found.');
+      throw new NotFoundException('Employee category not found.');
     }
     const next = custom.map((t) =>
       t.value === value
@@ -220,13 +220,13 @@ export class EmployeeTypesService {
   async delete(value: string, organizationId: string, actor: Actor) {
     if (DEFAULT_EMPLOYEE_TYPES.some((t) => t.value === value)) {
       throw new BadRequestException(
-        "Built-in employee types can't be deleted.",
+        "Built-in employee categories can't be deleted.",
       );
     }
     const custom = await this.getCustomTypes(organizationId);
     const next = custom.filter((t) => t.value !== value);
     if (next.length === custom.length) {
-      throw new NotFoundException('Employee type not found.');
+      throw new NotFoundException('Employee category not found.');
     }
     // `value` is stored as a plain string on User.employeeType — block the
     // delete while anyone still has it, like every other master-data
@@ -237,7 +237,7 @@ export class EmployeeTypesService {
     });
     if (usageCount > 0) {
       throw new ConflictException(
-        `This employee type is assigned to ${usageCount} ${usageCount === 1 ? 'employee' : 'employees'} and can't be deleted — deactivate it instead.`,
+        `This employee category is assigned to ${usageCount} ${usageCount === 1 ? 'employee' : 'employees'} and can't be deleted — deactivate it instead.`,
       );
     }
     await this.prisma.organization.update({
@@ -253,7 +253,7 @@ export class EmployeeTypesService {
       details: { value },
     });
 
-    return { success: true, message: 'Employee type deleted' };
+    return { success: true, message: 'Employee category deleted' };
   }
 
   async bulkImport(labels: string[], organizationId: string, actor: Actor) {
@@ -275,7 +275,7 @@ export class EmployeeTypesService {
       if (!value || seen.has(value)) {
         skipped.push({
           name: label,
-          reason: 'An employee type with this name already exists.',
+          reason: 'An employee category with this name already exists.',
         });
         continue;
       }

@@ -36,7 +36,7 @@ describe('overtime: eligibility, day rules, quarter, night, delay', () => {
     expect(DEFAULT_OVERTIME_POLICY.eligible).toBe(true);
     expect(policy({ eligible: false }).eligible).toBe(false);
   });
-  it('a designation match sits between department and employee type', () => {
+  it('a designation match sits between department and employee category', () => {
     const person = {
       id: 'e',
       departmentId: 'd',

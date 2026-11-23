@@ -77,7 +77,7 @@ describe('Org List Items (e2e)', () => {
       .expect(200);
     const data = (res.body as { data: OrgListItemBody[] }).data;
     const names = data.map((i) => i.name).sort();
-    expect(names).toEqual(['Contract', 'Full-Time', 'Intern', 'Part-Time']);
+    expect(names).toEqual(['Executive', 'Management', 'Staff', 'Support', 'Worker']);
     expect(data.every((i) => i.isSystemDefault)).toBe(true);
   });
 
@@ -110,10 +110,11 @@ describe('Org List Items (e2e)', () => {
       .filter((i) => i.isSystemDefault)
       .map((i) => i.name);
     expect(builtInNames).toEqual([
-      'Contract',
-      'Full-Time',
-      'Intern',
-      'Part-Time',
+      'Executive',
+      'Management',
+      'Staff',
+      'Support',
+      'Worker',
     ]);
   });
 
@@ -133,7 +134,7 @@ describe('Org List Items (e2e)', () => {
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(200);
     const fullTime = (list.body as { data: OrgListItemBody[] }).data.find(
-      (i) => i.name === 'Full-Time',
+      (i) => i.name === 'Staff',
     );
     expect(fullTime).toBeDefined();
 

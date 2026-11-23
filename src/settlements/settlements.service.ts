@@ -401,7 +401,7 @@ export class SettlementsService {
         const rule = (leaveType.encashment ?? {}) as EncashmentRule;
         if (!rule.allowed) continue;
         // Only leave the employee actually has: an inactive type, one with no balance to speak of (comp-off, no
-        // allocation, unlimited), or one whose eligibility rules (gender, employee type, department, months of service
+        // allocation, unlimited), or one whose eligibility rules (gender, employee category, department, months of service
         // on the last working day) they do not meet is not paid - and no balance row is built for it, which would
         // otherwise credit a full-year quota that was never theirs.
         if (
