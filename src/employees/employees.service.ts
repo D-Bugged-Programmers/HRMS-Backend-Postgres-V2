@@ -76,7 +76,7 @@ import { UpdateEmployeeDto } from './dto/update-employee.dto';
 import { DeactivateEmployeeDto } from './dto/deactivate-employee.dto';
 import { ListEmployeesQueryDto } from './dto/list-employees-query.dto';
 import { lockedFieldAttempts, stripLockedFields } from './employee-field-lock';
-import { mergePersonalData } from './personal-data';
+import { assertValidDates, mergePersonalData } from './personal-data';
 import {
   Actor,
   collectReportingChain,
@@ -287,10 +287,10 @@ export class EmployeesService {
             // mandatoryDocumentsUploaded is always false here — harmless,
             // since isProfileComplete(...) is false too at this point
             // regardless (only personalEmail is set).
-            personalData: dto.personalEmail
+            personalData: dto.personalEmail || dto.dateOfBirth
               ? (mergePersonalData(
                   {},
-                  { personalEmail: dto.personalEmail },
+                  { ...(dto.personalEmail ? { personalEmail: dto.personalEmail } : {}), ...(dto.dateOfBirth ? { dateOfBirth: dto.dateOfBirth } : {}) },
                   false,
                 ) as Prisma.InputJsonValue)
               : undefined,
@@ -654,6 +654,8 @@ export class EmployeesService {
       employeeCategory?: unknown;
       workLocation?: unknown;
       company?: unknown;
+      reportingManager?: unknown;
+      dateOfBirth?: unknown;
       employeeCode?: unknown;
       role?: unknown;
       employeeType?: unknown;
@@ -668,8 +670,10 @@ export class EmployeesService {
     sendWelcomeEmail: boolean = true,
     // true: check every row and create nothing (the import dialog's first step).
     dryRun: boolean = false,
+    // true: rows missing required details are imported with them blank; each row reports what is missing.
+    allowIncomplete: boolean = false,
   ) {
-    const ready: { name: string; email: string }[] = [];
+    const ready: { name: string; email: string; missing: string[]; row: unknown }[] = [];
     // In a check-only run, the same email / phone / code twice in the file is caught here.
     const seenEmails = new Set<string>();
     const seenPhones = new Set<string>();
@@ -678,6 +682,7 @@ export class EmployeesService {
       name: string;
       email: string;
       generatedPassword: string;
+      missing: string[];
     }[] = [];
     const failed: { row: unknown; error: string }[] = [];
 
@@ -749,6 +754,14 @@ export class EmployeesService {
     // EmployeeIdService.generate's SELECT ... FOR UPDATE), so several
     // rows in flight at once just overlaps each row's independent work
     // (bcrypt hashing, etc.) instead of a fully sequential loop.
+    // The people a row can name as the reporting manager (looked up once for the whole file).
+    const managerCandidates = (
+      await this.scopedPrisma.user.findMany({
+        where: { organizationId, isActive: true },
+        select: { id: true, employeeId: true, name: true, email: true },
+      })
+    ).map((m) => ({ ...m, email: m.email ?? '' }));
+
     await mapWithConcurrency(rows, 5, async (row) => {
       const name = asString(row.name).trim();
       // Same normalization as the DTOs' @NormalizeEmail (trim + lowercase).
@@ -776,6 +789,16 @@ export class EmployeesService {
         failed.push({ row, error: 'Name is required.' });
         return;
       }
+      // Required details this row does not have: a failure normally, but with allowIncomplete the row is imported without them and the
+      // list says what to add later. A value that IS given but wrong still fails below.
+      const missing: string[] = [];
+      const missingProps = new Set<string>();
+      const lacks = (label: string, prop: string | null = null): boolean => {
+        if (!allowIncomplete) return false;
+        missing.push(label);
+        if (prop) missingProps.add(prop);
+        return true;
+      };
       if (email ? !isEmail(email) : !allowNoEmail) {
         failed.push({ row, error: 'A valid email is required.' });
         return;
@@ -787,16 +810,20 @@ export class EmployeesService {
         });
         return;
       }
+      if (!joiningDate && !lacks('Joining date (set to today)')) {
+        failed.push({ row, error: 'Joining date is required.' });
+        return;
+      }
       // Matches the manual "Add Employee" form's own required Gender field
       // — feeds LeaveType.applicableGenders eligibility, which has no other
       // way to be set at creation time. Accepts either the raw enum value
       // (MALE/FEMALE/OTHER/PREFER_NOT_TO_SAY) or its display label.
-      if (!genderInput) {
+      if (!genderInput && !lacks('Gender')) {
         failed.push({ row, error: 'Gender is required.' });
         return;
       }
-      const gender = GENDER_LABELS.get(genderInput.toLowerCase());
-      if (!gender) {
+      const gender = genderInput ? GENDER_LABELS.get(genderInput.toLowerCase()) : undefined;
+      if (genderInput && !gender) {
         failed.push({
           row,
           error: `Gender "${genderInput}" is not valid. Use one of: Male, Female, Other, Prefer not to say.`,
@@ -818,36 +845,40 @@ export class EmployeesService {
       // five fields — personalEmail is also what makes the welcome email
       // actually go out for bulk-imported rows (it was previously never
       // collected, so bulk-imported employees never got one).
-      if (personalEmail ? !isEmail(personalEmail) : !(allowNoEmail && !email)) {
+      if (personalEmail && !isEmail(personalEmail)) {
         failed.push({ row, error: 'A valid personal email is required.' });
         return;
       }
-      if (!departmentName) {
+      if (!personalEmail && !(allowNoEmail && !email) && !lacks('Personal email', 'personalEmail')) {
+        failed.push({ row, error: 'A valid personal email is required.' });
+        return;
+      }
+      if (!departmentName && !lacks('Department')) {
         failed.push({ row, error: 'Department is required.' });
         return;
       }
-      const department = departments.find(
+      const department = departmentName ? departments.find(
         (d) => d.name.toLowerCase() === departmentName.toLowerCase(),
-      );
-      if (!department) {
+      ) : undefined;
+      if (departmentName && !department) {
         failed.push({
           row,
           error: `Department "${departmentName}" not found.`,
         });
         return;
       }
-      if (!designation) {
+      if (!designation && !lacks('Designation')) {
         failed.push({ row, error: 'Designation is required.' });
         return;
       }
-      if (!workLocationName) {
+      if (!workLocationName && !lacks('Work location')) {
         failed.push({ row, error: 'Work location is required.' });
         return;
       }
-      const workLocation = workLocationItems.find(
+      const workLocation = workLocationName ? workLocationItems.find(
         (l) => l.name.toLowerCase() === workLocationName.toLowerCase(),
-      );
-      if (!workLocation) {
+      ) : undefined;
+      if (workLocationName && !workLocation) {
         failed.push({
           row,
           error: `Work location "${workLocationName}" not found.`,
@@ -905,44 +936,44 @@ export class EmployeesService {
           }
         }
       }
-      if (!employeeCategoryName) {
+      if (!employeeCategoryName && !lacks('Employee category')) {
         failed.push({ row, error: 'Employee category is required.' });
         return;
       }
-      const employeeCategory = employeeCategoryItems.find(
+      const employeeCategory = employeeCategoryName ? employeeCategoryItems.find(
         (c) => c.name.toLowerCase() === employeeCategoryName.toLowerCase(),
-      );
-      if (!employeeCategory) {
+      ) : undefined;
+      if (employeeCategoryName && !employeeCategory) {
         failed.push({
           row,
           error: `Employee category "${employeeCategoryName}" not found.`,
         });
         return;
       }
-      if (!roleInput) {
+      if (!roleInput && !lacks('Role (set to Employee)')) {
         failed.push({ row, error: 'Role is required.' });
         return;
       }
-      const role = validRoles.find(
+      const role = roleInput ? validRoles.find(
         (r) => r.toLowerCase() === roleInput.toLowerCase(),
-      );
-      if (!role) {
+      ) : Role.EMPLOYEE;
+      if (roleInput && !role) {
         failed.push({
           row,
           error: `Role "${roleInput}" is not valid. Use one of: ${validRoles.join(', ')}.`,
         });
         return;
       }
-      if (!employeeTypeInput) {
+      if (!employeeTypeInput && !lacks('Employee type (set to Permanent)')) {
         failed.push({ row, error: 'Employee type is required.' });
         return;
       }
-      const employeeType = activeEmployeeTypes.find(
+      const employeeType = employeeTypeInput ? activeEmployeeTypes.find(
         (t) =>
           t.value.toLowerCase() === employeeTypeInput.toLowerCase() ||
           t.label.toLowerCase() === employeeTypeInput.toLowerCase(),
-      );
-      if (!employeeType) {
+      ) : { value: 'permanent' };
+      if (employeeTypeInput && !employeeType) {
         failed.push({
           row,
           error: `Employee type "${employeeTypeInput}" not found.`,
@@ -951,31 +982,66 @@ export class EmployeesService {
       }
 
       // The Add Employee form requires a contact number, so a row without one is refused here too.
-      if (!contactNumber) {
+      if (!contactNumber && !lacks('Contact number', 'contactNumber')) {
         failed.push({ row, error: 'Contact number is required.' });
         return;
+      }
+      // Who the person reports to: by employee code, login email or a unique full name. Required for everyone but an Admin (the Add
+      // Employee form's rule). Someone created in this same file cannot be named here yet.
+      const managerInput = asString(row.reportingManager).trim();
+      let reportingManagerId: string | undefined;
+      if (managerInput) {
+        const key = managerInput.toLowerCase();
+        const hits = managerCandidates.filter((m) => m.employeeId.toLowerCase() === key || m.email.toLowerCase() === key);
+        const byName = hits.length ? hits : managerCandidates.filter((m) => m.name.toLowerCase() === key);
+        if (byName.length === 0) {
+          failed.push({ row, error: `Reporting manager "${managerInput}" not found. Use their employee code or email.` });
+          return;
+        }
+        if (byName.length > 1) {
+          failed.push({ row, error: `More than one person is named "${managerInput}": use their employee code or email.` });
+          return;
+        }
+        reportingManagerId = byName[0].id;
+      } else if (role !== Role.ADMIN && !lacks('Reporting manager')) {
+        failed.push({ row, error: 'Reporting manager is required (their employee code or email).' });
+        return;
+      }
+      // The optional date of birth: a real date, not in the future, and at least the minimum working age (the profile form's own rules).
+      const dateOfBirth = asString(row.dateOfBirth).trim();
+      if (dateOfBirth) {
+        try {
+          assertValidDates({ dateOfBirth });
+        } catch (err) {
+          failed.push({ row, error: err instanceof Error ? err.message.replace(/ \(DD-MM-YYYY\)\.?$/, '.') : 'Date of birth is not valid.' });
+          return;
+        }
       }
       const dto = {
         name,
         email: email || undefined,
         personalEmail: personalEmail || undefined,
-        departmentId: department.id,
-        workLocationId: workLocation.id,
+        ...(dateOfBirth ? { dateOfBirth } : {}),
+        departmentId: department?.id,
+        workLocationId: workLocation?.id,
         brandId: rowBrandId,
         designation,
-        employeeCategory: employeeCategory.name,
-        contactNumber: formatIndianMobile(contactNumber),
+        employeeCategory: employeeCategory?.name ?? '',
+        contactNumber: contactNumber ? formatIndianMobile(contactNumber) : '',
         gender,
         joiningDate: joiningDate || undefined,
+        ...(reportingManagerId ? { reportingManagerId } : {}),
         selfieRequirement,
         role,
-        employeeType: employeeType.value,
+        employeeType: employeeType?.value ?? 'permanent',
         ...(wantsTracking(liveTrackingInput) ? { fieldTrackingEnabled: true } : {}),
         ...(overtimeInput ? { overtimeEligibility: wantsTracking(overtimeInput) ? ('ELIGIBLE' as const) : ('NOT_ELIGIBLE' as const) } : {}),
       };
       // The same field rules the form's API enforces (name pattern and length, phone and email formats, lengths): an imported
       // row is held to exactly what a person typing it into the form would be.
-      const problems = validateSync(plainToInstance(CreateEmployeeDto, dto), { whitelist: false });
+      // A detail left blank on purpose (allowIncomplete) is not a field error: only the other fields are held to the form's rules.
+      const problems = validateSync(plainToInstance(CreateEmployeeDto, dto), { whitelist: false })
+        .filter((p) => !(missingProps.has(p.property) || (!dto[p.property as keyof typeof dto] && missing.length > 0)));
       if (problems.length > 0) {
         failed.push({ row, error: problems.flatMap((p) => Object.values(p.constraints ?? {}))[0] ?? 'A field is not valid.' });
         return;
@@ -997,7 +1063,7 @@ export class EmployeesService {
           if (employeeCode && (await this.scopedPrisma.user.findFirst({ where: { organizationId, employeeId: employeeCode }, select: { id: true } }))) {
             throw new ConflictException(`Employee code ${employeeCode} is already in use.`);
           }
-          ready.push({ name, email });
+          ready.push({ name, email, missing, row });
         } catch (err) {
           failed.push({ row, error: err instanceof Error ? err.message : 'This row could not be checked.' });
         }
@@ -1006,7 +1072,7 @@ export class EmployeesService {
 
       try {
         const { employee, generatedPassword } = await this.create(
-          dto,
+          dto as unknown as CreateEmployeeDto,
           actor,
           organizationId,
           { sendWelcomeEmail, prepareHiringLetters: false, ...(employeeCode ? { employeeCode } : {}) },
@@ -1016,6 +1082,7 @@ export class EmployeesService {
           name: employee.name,
           email: employee.email,
           generatedPassword,
+          missing,
         });
       } catch (err) {
         failed.push({

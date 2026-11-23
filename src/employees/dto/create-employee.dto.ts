@@ -22,6 +22,7 @@ import {
   SelfieRequirement,
 } from '@prisma/client';
 import { NormalizeEmail, Trim } from '../../common/normalize-input';
+import { IsValidCalendarDateString } from '../../common/is-valid-calendar-date.validator';
 import { IsReasonableJoiningDate } from '../../common/is-reasonable-joining-date.validator';
 import {
   PERSON_NAME_MAX_LENGTH,
@@ -45,6 +46,13 @@ export class CreateEmployeeDto {
   @ValidateIf((o: CreateEmployeeDto) => o.email !== '')
   @IsEmail()
   email?: string;
+
+  // Optional: the date of birth (YYYY-MM-DD), saved with the personal details. Sent by the Excel import; the Add Employee form leaves it to
+  // the profile. Age and "not in the future" are checked by the caller (personal-data.ts assertValidDates).
+  @ApiPropertyOptional({ example: '1995-03-05' })
+  @IsOptional()
+  @IsValidCalendarDateString()
+  dateOfBirth?: string;
 
   // Optional at this DTO/type level so bulkCreate's row shape (no
   // per-row personalEmail column in the Excel import) keeps working

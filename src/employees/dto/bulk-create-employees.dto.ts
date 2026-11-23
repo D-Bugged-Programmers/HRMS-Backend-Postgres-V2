@@ -73,6 +73,17 @@ class BulkEmployeeRowDto {
   @IsOptional()
   workLocation?: unknown;
 
+  // Optional: who the person reports to - an employee code, a login email or (when unique) a full name. Required for everyone but an
+  // Admin, like the Add Employee form, unless the import allows incomplete rows.
+  @ApiPropertyOptional()
+  @IsOptional()
+  reportingManager?: unknown;
+
+  // Optional: the date of birth (YYYY-MM-DD).
+  @ApiPropertyOptional()
+  @IsOptional()
+  dateOfBirth?: unknown;
+
   // Optional: an employee code to keep exactly as written (it must fit the company's ID format); blank = the next one of the series is issued.
   @ApiPropertyOptional()
   @IsOptional()
@@ -132,4 +143,11 @@ export class BulkCreateEmployeesDto {
   @IsOptional()
   @IsBoolean()
   dryRun?: boolean;
+
+  // true: a row that is missing required details (gender, department, designation...) is still imported with them left blank, to be added
+  // later; each row says what is missing. A value that is present but wrong (a department that does not exist...) is still refused.
+  @ApiPropertyOptional({ description: 'true: import rows that are missing required details and add them later.' })
+  @IsOptional()
+  @IsBoolean()
+  allowIncomplete?: boolean;
 }
