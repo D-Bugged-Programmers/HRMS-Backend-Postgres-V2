@@ -264,6 +264,10 @@ model Organization {
   // gates whether one shows as active in the Employment Types list.
   inactiveBuiltinEmployeeTypes String[] @default([])
 
+  // The company's own view of employment statuses: { custom: [{ key, label, behavior }], labels: { PROBATION: 'Trial' }, inactive: ['ON_HOLD'] }.
+  // The EmploymentStatus enum still drives every rule; a custom status follows one built-in behaviour (see employment-status-config.ts).
+  employmentStatusConfig Json @default("{}")
+
   // Bare enforcement hook for a future plan/billing system — high default
   // so nothing breaks until real billing exists.
   maxEmployees Int @default(999999)
@@ -514,6 +518,8 @@ model User {
   joiningDateChangedAt DateTime?
   employeeType         String           @default("permanent")
   employmentStatus     EmploymentStatus @default(ONBOARDING)
+  // Key of the company's own status this person holds (see Organization.employmentStatusConfig); null = the built-in one in employmentStatus.
+  employmentStatusKey  String?
 
   // Leave-policy source of truth — separate from whatever's mirrored in
   // personalData below (the old system had a redundant copy there too; a

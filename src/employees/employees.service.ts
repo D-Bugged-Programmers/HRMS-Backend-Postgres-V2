@@ -10,6 +10,7 @@
 // pre-check.
 import { placeholderEmailFor, readLoginPolicy } from '../common/no-email';
 import { codeFitsFormat } from './employee-code';
+import { isBuiltinSwitchedOff, resolveChosenStatus } from '../organizations/employment-status-config';
 
 // What the import dialog sends in the Company column for "the main company itself" (not a sister company).
 const MAIN_COMPANY_KEY = '__MAIN__';
@@ -1364,6 +1365,43 @@ export class EmployeesService {
     return { ...toSafe(employee, maskFor(actor, employee.id)), additionalReportingManagers };
   }
 
+  // A status picked from the company's own list (see organizations/employment-status-config.ts): a custom status is stored as the
+  // built-in status it follows plus its key, so every rule below keeps reading the built-in one. Choosing a built-in status clears the
+  // key. A built-in the company has switched off cannot be given to anyone new.
+  private async applyChosenStatus(
+    clean: UpdateEmployeeDto,
+    before: { employmentStatus: EmploymentStatus; employmentStatusKey?: string | null },
+    organizationId: string,
+  ) {
+    const key = clean.employmentStatusKey;
+    const changesBuiltin = clean.employmentStatus !== undefined && clean.employmentStatus !== before.employmentStatus;
+    if (key === undefined && !changesBuiltin) return;
+    if (key === null || key === '') {
+      clean.employmentStatusKey = null;
+      return;
+    }
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { employmentStatusConfig: true } });
+    const config = org?.employmentStatusConfig ?? {};
+    if (key) {
+      if (key === (before.employmentStatusKey ?? null)) {
+        delete clean.employmentStatusKey; // unchanged: nothing to resolve
+        return;
+      }
+      try {
+        const chosen = resolveChosenStatus(config, key);
+        clean.employmentStatus = chosen.employmentStatus;
+        clean.employmentStatusKey = chosen.employmentStatusKey;
+      } catch (err) {
+        throw new BadRequestException((err as Error).message);
+      }
+      return;
+    }
+    if (isBuiltinSwitchedOff(config, clean.employmentStatus as string)) {
+      throw new BadRequestException('That status is switched off for your company. Pick another status.');
+    }
+    clean.employmentStatusKey = null;
+  }
+
   async update(
     id: string,
     dto: UpdateEmployeeDto,
@@ -1436,6 +1474,7 @@ export class EmployeesService {
       );
     }
     const clean = stripLockedFields(updateFields, actor.role);
+    await this.applyChosenStatus(clean, before, organizationId);
     // Always-present: switching it on starts today unless a date is given; switching it off clears the date.
     if (clean.alwaysPresent === true && !clean.alwaysPresentFrom && !before.alwaysPresentFrom) {
       const tz = (await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { timezone: true } }))?.timezone ?? 'Asia/Kolkata';
@@ -2650,7 +2689,7 @@ export class EmployeesService {
       try {
         // Someone serving notice or who has left is never moved by accident from a bulk change (it would quietly cancel a
         // resignation or reinstate them): that is done one person at a time, through Resignation / Offboarding or their own Edit screen.
-        if (patch.employmentStatus) {
+        if (patch.employmentStatus || patch.employmentStatusKey) {
           const current = await this.scopedPrisma.user.findFirst({ where: { id, organizationId }, select: { employmentStatus: true } });
           if (current && LEAVING_STATUSES.includes(current.employmentStatus)) {
             throw new BadRequestException(`Is leaving or has left (${current.employmentStatus}). Change this from Resignation / Offboarding or their own Edit screen.`);

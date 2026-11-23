@@ -16,6 +16,8 @@ import { Role, User } from '@prisma/client';
 import { OrganizationsService } from './organizations.service';
 import { OrganizationSettingsService } from './organization-settings.service';
 import { EmployeeTypesService } from './employee-types.service';
+import { EmploymentStatusesService } from './employment-statuses.service';
+import { CreateEmploymentStatusDto, UpdateEmploymentStatusDto } from './dto/employment-status.dto';
 import { EmailDomainService } from './email-domain.service';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { CreateEmployeeTypeDto } from './dto/create-employee-type.dto';
@@ -41,6 +43,7 @@ export class OrganizationsController {
     private readonly organizationsService: OrganizationsService,
     private readonly organizationSettingsService: OrganizationSettingsService,
     private readonly employeeTypesService: EmployeeTypesService,
+    private readonly employmentStatusesService: EmploymentStatusesService,
     private readonly emailDomainService: EmailDomainService,
   ) {}
 
@@ -237,6 +240,34 @@ export class OrganizationsController {
   @UseGuards(RolesGuard)
   removeEmailDomain(@CurrentUser() caller: Caller) {
     return this.emailDomainService.remove(caller.organizationId);
+  }
+
+  // -- Employment Statuses --
+  // The company's own list of employment statuses. Any signed-in user may read it (screens show the company's names); only ADMIN/HR change it.
+  @Get('employment-statuses')
+  listEmploymentStatuses(@CurrentUser() caller: Caller) {
+    return this.employmentStatusesService.findAll(caller.organizationId);
+  }
+
+  @Post('employment-statuses')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  createEmploymentStatus(@Body() dto: CreateEmploymentStatusDto, @CurrentUser() caller: Caller) {
+    return this.employmentStatusesService.create(dto.label, dto.behavior, caller.organizationId, caller);
+  }
+
+  @Patch('employment-statuses/:key')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  updateEmploymentStatus(@Param('key') key: string, @Body() dto: UpdateEmploymentStatusDto, @CurrentUser() caller: Caller) {
+    return this.employmentStatusesService.update(key, dto, caller.organizationId, caller);
+  }
+
+  @Delete('employment-statuses/:key')
+  @Roles(Role.ADMIN, Role.HR)
+  @UseGuards(RolesGuard)
+  removeEmploymentStatus(@Param('key') key: string, @CurrentUser() caller: Caller) {
+    return this.employmentStatusesService.delete(key, caller.organizationId, caller);
   }
 
   // -- Employee Types --

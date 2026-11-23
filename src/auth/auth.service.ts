@@ -9,6 +9,7 @@
 // rotate on every use (revoke-and-reissue) to limit replay of a leaked token. forgotPassword() and
 // findRefreshTokenByHash() deliberately return the same response/bypass tenant scoping for tenant-unknown
 // lookups by design, not by oversight.
+import { statusLabel } from '../organizations/employment-status-config';
 import { ClientType, SIGNED_IN_ELSEWHERE_MESSAGE } from './client-type';
 import { isPlaceholderEmail, loginRefusal, readLoginPolicy } from '../common/no-email';
 import { EXIT_ACCESS_ENDED_MESSAGE, exitAccessEnded } from '../common/exit-access';
@@ -741,8 +742,10 @@ export class AuthService {
     // setting, else the org's) — the mobile app uses it to skip the camera.
     const org = await this.scopedPrisma.organization.findFirst({
       where: { id: organizationId },
-      select: { orgPayrollAttendancePrefs: true, policies: true },
+      select: { orgPayrollAttendancePrefs: true, policies: true, employmentStatusConfig: true },
     });
+    // What the company calls this person's employment status (the mobile app shows it as it is).
+    (safe as Record<string, unknown>).employmentStatusLabel = statusLabel(org?.employmentStatusConfig, user.employmentStatus, user.employmentStatusKey);
     (safe as Record<string, unknown>).loginMethod = readLoginPolicy(org?.policies).method;
     const selfieRequired = isSelfieRequired(
       user.selfieRequirement,

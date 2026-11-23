@@ -199,6 +199,14 @@ export class UpdateEmployeeDto {
   @IsEnum(EmploymentStatus)
   employmentStatus?: EmploymentStatus;
 
+  // The company's own status (Organization > People > Employment Statuses): its key, or a built-in status key. The employment status
+  // above is then set to the built-in one it follows. null puts the person back on a plain built-in status.
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  employmentStatusKey?: string | null;
+
   // The date the employee was confirmed from (only for a Confirmed employee; set automatically when the status changes).
   @ApiPropertyOptional({ example: '2026-10-01' })
   @IsOptional()

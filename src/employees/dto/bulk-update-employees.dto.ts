@@ -35,4 +35,11 @@ export class BulkUpdateEmployeesDto {
   @IsOptional()
   @IsIn(BULK_EMPLOYMENT_STATUSES as unknown as string[])
   employmentStatus?: (typeof BULK_EMPLOYMENT_STATUSES)[number];
+
+  // A status from the company's own list (a built-in key or one the company added); takes the place of employmentStatus above.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  employmentStatusKey?: string;
 }

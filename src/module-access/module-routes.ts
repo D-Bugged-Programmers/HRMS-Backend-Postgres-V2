@@ -36,6 +36,7 @@ export const ORG_ITEM_LABELS: Record<string, string> = {
   'module.org_reporting_structure': 'Organization: Reporting Structure',
   'module.org_employee_categories': 'Organization: Employee Categories',
   'module.org_employment_types': 'Organization: Employment Types',
+  'module.org_employment_statuses': 'Organization: Employment Statuses',
   'module.org_holidays': 'Organization: Holiday Calendar',
   'module.org_required_documents': 'Organization: Required Documents',
   'module.org_reasons_for_leaving': 'Organization: Reasons for Leaving',
