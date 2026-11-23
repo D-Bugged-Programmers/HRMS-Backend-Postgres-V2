@@ -20,6 +20,7 @@ import { UpdateHolidayDto } from './dto/update-holiday.dto';
 import { ListHolidaysQueryDto } from './dto/list-holidays-query.dto';
 import { BulkImportHolidaysDto } from './dto/bulk-import-holidays.dto';
 import { WeeklyOffCheckQueryDto } from './dto/weekly-off-check-query.dto';
+import { SetHolidayYearDto } from './dto/set-holiday-year.dto';
 import { AttendanceService } from '../attendance/attendance.service';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -46,6 +47,27 @@ export class HolidaysController {
   @Get('years')
   years(@CurrentUser() caller: Caller) {
     return this.holidaysService.years(caller.organizationId);
+  }
+
+  // The month the holiday calendar's year starts in, the current holiday year and its label: any signed-in user (the mobile app and
+  // the calendar label their year pickers from it).
+  @Get('year-setting')
+  yearSetting(@CurrentUser() caller: Caller) {
+    return this.holidaysService.yearSetting(caller.organizationId);
+  }
+
+  // Admin / HR: choose the month the holiday calendar's year starts in (1 = January).
+  @Put('year-setting')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN, Role.HR)
+  setYearSetting(@Body() dto: SetHolidayYearDto, @CurrentUser() caller: Caller) {
+    return this.holidaysService.setYearStartMonth(dto.startMonth, caller.organizationId, caller.id);
+  }
+
+  // The company's HOLIDAY years (see holiday-year.ts): the year picker of the Holiday Calendar. /years stays the calendar years.
+  @Get('holiday-years')
+  holidayYears(@CurrentUser() caller: Caller) {
+    return this.holidaysService.holidayYears(caller.organizationId);
   }
 
   // The company's weekly off days (0 = Sunday), for any signed-in user.

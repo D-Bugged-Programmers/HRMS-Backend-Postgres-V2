@@ -2,9 +2,13 @@ import { Role } from '@prisma/client';
 import { HolidayCalendarReminderService } from './holiday-calendar-reminder.service';
 
 // Fakes: holidays per year, and a notifier that records who was told what.
-function build(counts: Record<number, number>) {
+function build(counts: Record<number, number>, policies: unknown = {}) {
   const sent: { to: string; title: string; vars: Record<string, string> }[] = [];
-  const prisma = { holiday: { count: async ({ where }: { where: { year: number } }) => counts[where.year] ?? 0 } };
+  // The service counts by date range (the holiday year may span two calendar years): the year is read off the range's first day.
+  const prisma = {
+    organization: { findFirst: async () => ({ policies }) },
+    holiday: { count: async ({ where }: { where: { date: { gte: string } } }) => counts[Number(where.date.gte.slice(0, 4))] ?? 0 },
+  };
   const notifier = {
     activeUsers: async () => [
       { id: 'a', name: 'Admin', email: 'a@x.test', role: Role.ADMIN, reportingManagerId: null, notificationPreferences: null },
@@ -35,5 +39,13 @@ describe('HolidayCalendarReminderService', () => {
     expect(await build({ 2026: 12, 2027: 12 }).svc.remindForOrg('org', '2026-11-01')).toBe(0);
     expect(await build({ 2026: 12, 2027: 0 }).svc.remindForOrg('org', '2026-10-01')).toBe(0);
     expect(await build({ 2026: 12, 2027: 0 }).svc.remindForOrg('org', '2026-11-02')).toBe(0);
+  });
+  it('follows an April-March holiday year: asks in February and March, not November', async () => {
+    const april = { holidayYearStartMonth: 4 };
+    // 1 Feb 2027 is in the 2026 holiday year (Apr 2026 - Mar 2027); next year is 2027.
+    const { svc, sent } = build({ 2026: 12, 2027: 4 }, april);
+    expect(await svc.remindForOrg('org', '2027-02-01')).toBe(2);
+    expect(sent[0].title).toBe("Add 2027-28's holidays: 4 so far");
+    expect(await build({ 2026: 12, 2027: 4 }, april).svc.remindForOrg('org', '2026-11-01')).toBe(0);
   });
 });

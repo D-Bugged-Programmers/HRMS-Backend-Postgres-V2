@@ -8,6 +8,7 @@
 // existing DB rows and within the same batch.
 import { AttendanceService } from '../attendance/attendance.service';
 import { calendarStatus } from './holiday-calendar-status';
+import { holidayYearLabel, holidayYearOf, holidayYearRange, readHolidayYearStartMonth, sameDayInYear } from './holiday-year';
 import {
   BadRequestException,
   ConflictException,
@@ -82,6 +83,49 @@ export class HolidaysService {
     return org?.timezone ?? 'Asia/Kolkata';
   }
 
+  /** The month the company's holiday year starts in (1 = January), from its policies. */
+  async getHolidayYearStartMonth(organizationId: string): Promise<number> {
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+    return readHolidayYearStartMonth(org?.policies);
+  }
+
+  /** Holidays that count for a holiday year (active ones and reference ones): the numbers behind the "add next year" nudge. */
+  private countForHolidayYear(organizationId: string, year: number, startMonth: number) {
+    const { from, to } = holidayYearRange(year, startMonth);
+    return this.scopedPrisma.holiday.count({ where: { organizationId, date: { gte: from, lte: to }, OR: [{ isActive: true }, { isReference: true }] } });
+  }
+
+  /** The start month, the current holiday year and its label, for the Holiday Calendar and the mobile app. */
+  async yearSetting(organizationId: string) {
+    const startMonth = await this.getHolidayYearStartMonth(organizationId);
+    const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
+    const currentYear = holidayYearOf(today, startMonth);
+    const range = holidayYearRange(currentYear, startMonth);
+    return { startMonth, currentYear, currentLabel: holidayYearLabel(currentYear, startMonth), from: range.from, to: range.to };
+  }
+
+  /** Admin / HR: choose the month the holiday calendar's year starts in. Holidays keep their dates; only how they are grouped changes. */
+  async setYearStartMonth(startMonth: number, organizationId: string, actorId: string) {
+    if (!Number.isInteger(startMonth) || startMonth < 1 || startMonth > 12) {
+      throw new BadRequestException('Pick a month from January to December.');
+    }
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+    const policies = (org?.policies && typeof org.policies === 'object' ? org.policies : {}) as Record<string, unknown>;
+    const before = readHolidayYearStartMonth(policies);
+    await this.scopedPrisma.organization.updateMany({
+      where: { id: organizationId },
+      data: { policies: { ...policies, holidayYearStartMonth: startMonth } as Prisma.InputJsonValue },
+    });
+    await this.auditLogService.log({
+      actorId,
+      action: 'HOLIDAY_YEAR_CHANGED',
+      module: 'HOLIDAY',
+      organizationId,
+      details: { from: before, to: startMonth },
+    });
+    return this.yearSetting(organizationId);
+  }
+
   // India's 3 fixed National Holidays (Republic Day, Independence Day,
   // Gandhi Jayanti) — same date every year, mandated for every
   // establishment, distinct from festival/restricted holidays which shift
@@ -125,11 +169,13 @@ export class HolidaysService {
    */
   async calendarStatus(organizationId: string) {
     const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
-    const year = Number(today.slice(0, 4));
-    const count = (y: number) =>
-      this.scopedPrisma.holiday.count({ where: { organizationId, year: y, OR: [{ isActive: true }, { isReference: true }] } });
-    const [thisYear, nextYear] = await Promise.all([count(year), count(year + 1)]);
-    return calendarStatus(today, nextYear, thisYear);
+    const startMonth = await this.getHolidayYearStartMonth(organizationId);
+    const year = holidayYearOf(today, startMonth);
+    const [thisYear, nextYear] = await Promise.all([
+      this.countForHolidayYear(organizationId, year, startMonth),
+      this.countForHolidayYear(organizationId, year + 1, startMonth),
+    ]);
+    return { ...calendarStatus(today, nextYear, thisYear, startMonth), startMonth };
   }
 
   /** Every year that has at least one holiday, plus this year and next, oldest first: the Holiday Calendar's year picker. */
@@ -138,6 +184,15 @@ export class HolidaysService {
     const year = Number(today.slice(0, 4));
     const rows = await this.scopedPrisma.holiday.groupBy({ by: ['year'], where: { organizationId }, _count: { _all: true } });
     return [...new Set([...rows.map((r) => r.year), year, year + 1])].sort((a, b) => a - b);
+  }
+
+  /** Every HOLIDAY year (see holiday-year.ts) that has a holiday, plus this one and next, oldest first: the calendar's year picker. */
+  async holidayYears(organizationId: string): Promise<number[]> {
+    const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
+    const startMonth = await this.getHolidayYearStartMonth(organizationId);
+    const year = holidayYearOf(today, startMonth);
+    const rows = await this.scopedPrisma.holiday.groupBy({ by: ['date'], where: { organizationId }, _count: { _all: true } });
+    return [...new Set([...rows.map((r) => holidayYearOf(r.date, startMonth)), year, year + 1])].sort((a, b) => a - b);
   }
 
   // The company's weekly off days (0 = Sunday ... 6 = Saturday), so the calendar can say when a holiday falls on one.
@@ -202,16 +257,18 @@ export class HolidaysService {
       throw new BadRequestException('Pick two different years.');
     }
     const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
-    const source = await this.scopedPrisma.holiday.findMany({ where: { organizationId, year: fromYear } });
+    const startMonth = await this.getHolidayYearStartMonth(organizationId);
+    const { from, to } = holidayYearRange(fromYear, startMonth);
+    const source = await this.scopedPrisma.holiday.findMany({ where: { organizationId, date: { gte: from, lte: to } } });
     let created = 0;
     let skipped = 0;
     for (const h of source) {
-      const date = `${toYear}${h.date.slice(4)}`;
-      const valid = !Number.isNaN(new Date(`${date}T00:00:00Z`).getTime()) && new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) === date;
-      const exists = valid && (await this.scopedPrisma.holiday.findFirst({ where: { organizationId, date, name: h.name } }));
-      if (!valid || date < today || exists) { skipped++; continue; }
+      // The same day one holiday year later (a holiday year can run across two calendar years, so shift by the year difference).
+      const date = sameDayInYear(h.date, Number(h.date.slice(0, 4)) + (toYear - fromYear));
+      const exists = date && (await this.scopedPrisma.holiday.findFirst({ where: { organizationId, date, name: h.name } }));
+      if (!date || date < today || exists) { skipped++; continue; }
       await this.scopedPrisma.holiday.create({
-        data: { organizationId, name: h.name, date, departmentId: h.departmentId, year: toYear, isOptional: h.isOptional, type: h.type, state: h.state, description: h.description, isActive: h.isActive },
+        data: { organizationId, name: h.name, date, departmentId: h.departmentId, year: Number(date.slice(0, 4)), isOptional: h.isOptional, type: h.type, state: h.state, description: h.description, isActive: h.isActive },
       });
       created++;
     }
@@ -268,10 +325,14 @@ export class HolidaysService {
   }
 
   async findAll(query: ListHolidaysQueryDto, organizationId: string) {
+    // `year` is the CALENDAR year (unchanged, so every existing screen and app build keeps working); `holidayYear` is the company's holiday
+    // year: the twelve months from its start month (April 2026 - March 2027 is 2026 when the year starts in April).
+    const range = query.holidayYear ? holidayYearRange(query.holidayYear, await this.getHolidayYearStartMonth(organizationId)) : null;
     const data = await this.scopedPrisma.holiday.findMany({
       where: {
         organizationId,
         ...(query.year && { year: query.year }),
+        ...(range && { date: { gte: range.from, lte: range.to } }),
         ...(query.department && {
           OR: [{ departmentId: query.department }, { departmentId: null }],
         }),

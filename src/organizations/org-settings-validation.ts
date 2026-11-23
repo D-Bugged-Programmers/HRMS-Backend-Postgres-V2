@@ -189,6 +189,7 @@ export function assertIndianPhone(field: string, value: unknown): void {
 }
 
 function validatePolicies(p: Record<string, unknown>) {
+  checkNumber(p, 'holidayYearStartMonth', 'policies.holidayYearStartMonth', { min: 1, max: 12, integer: true });
   checkNumber(
     p,
     'financialYearStartMonth',

@@ -13,6 +13,7 @@ import { auditSensitive } from '../common/sensitive-audit';
 import { EXTERNAL_URL_RE, extractPdfText } from './policy-text';
 import { moduleEnabledFor } from '../module-access/module-gate';
 import { todayInOrgTz } from '../common/org-date';
+import { holidayYearOf, holidayYearRange, readHolidayYearStartMonth } from '../holidays/holiday-year';
 import { EMPLOYEE_VISIBLE_STATUSES } from '../payroll/payroll.service';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
@@ -65,7 +66,11 @@ export class AskHrService {
       if (hit(types.flatMap((t) => [t.name, t.code]))) intents.push('balance');
     }
     if (!has('holiday')) {
-      const hs = await this.scopedPrisma.holiday.findMany({ where: { organizationId, year: Number(today.slice(0, 4)) }, select: { name: true } });
+      // This holiday year (the company's calendar year, or April-March etc.), found by date.
+      const orgPolicies = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+      const holidayStart = readHolidayYearStartMonth(orgPolicies?.policies);
+      const holidayRange = holidayYearRange(holidayYearOf(today, holidayStart), holidayStart);
+      const hs = await this.scopedPrisma.holiday.findMany({ where: { organizationId, date: { gte: holidayRange.from, lte: holidayRange.to } }, select: { name: true } });
       if (hit(hs.map((h) => h.name))) intents.push('holiday');
     }
     let letterCard: AskHrCard | null = null;

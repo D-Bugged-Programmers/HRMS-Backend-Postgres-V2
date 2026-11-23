@@ -17,7 +17,7 @@ describe('holiday calendar status', () => {
     expect(calendarStatus('2026-12-31', 0, 12).nextYear).toBe(2027);
   });
   it('sends on 1 Nov, 1 Dec and 20 Dec only', () => {
-    expect(['2026-11-01', '2026-12-01', '2026-12-20'].every(isReminderDay)).toBe(true);
-    expect(['2026-11-02', '2026-10-01', '2026-12-25'].some(isReminderDay)).toBe(false);
+    expect(['2026-11-01', '2026-12-01', '2026-12-20'].every((d) => isReminderDay(d))).toBe(true);
+    expect(['2026-11-02', '2026-10-01', '2026-12-25'].some((d) => isReminderDay(d))).toBe(false);
   });
 });

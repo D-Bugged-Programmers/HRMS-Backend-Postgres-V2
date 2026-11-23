@@ -1,7 +1,9 @@
 // Purpose: when to nudge HR/Admin that next year's holiday calendar is still empty or thin, and the numbers behind the nudge.
 // Important: holidays are entered by hand each year (floating festivals change date), nothing rolls over by itself, and
-//   attendance / leave / payroll treat a missing holiday as a working day. So in November and December we ask for next year's list.
+//   attendance / leave / payroll treat a missing holiday as a working day. So in the last two months of the holiday year (November and
+//   December for a January-December year) we ask for next year's list.
 //   Pure functions only; HolidaysService reads the counts.
+import { DEFAULT_HOLIDAY_YEAR_START_MONTH, holidayReminderDays, holidayYearOf, inHolidayPrepWindow } from './holiday-year';
 
 export interface CalendarStatus {
   /** The year being prepared (this year + 1). */
@@ -20,17 +22,22 @@ export const inPrepWindow = (month: number): boolean => month === 11 || month ==
 export const calendarLooksIncomplete = (nextYearCount: number, thisYearCount: number): boolean =>
   nextYearCount === 0 || nextYearCount < thisYearCount;
 
-export function calendarStatus(todayYmd: string, nextYearCount: number, thisYearCount: number): CalendarStatus {
-  const year = Number(todayYmd.slice(0, 4));
-  const month = Number(todayYmd.slice(5, 7));
+export function calendarStatus(
+  todayYmd: string,
+  nextYearCount: number,
+  thisYearCount: number,
+  startMonth: number = DEFAULT_HOLIDAY_YEAR_START_MONTH,
+): CalendarStatus {
+  const year = holidayYearOf(todayYmd, startMonth);
   return {
     nextYear: year + 1,
     nextYearCount,
     thisYearCount,
-    due: inPrepWindow(month) && calendarLooksIncomplete(nextYearCount, thisYearCount),
+    due: inHolidayPrepWindow(todayYmd, startMonth) && calendarLooksIncomplete(nextYearCount, thisYearCount),
   };
 }
 
-/** The days the reminder is sent (MM-DD): the start of November, the start of December, and a last call on 20 December. */
+/** The days the reminder is sent (MM-DD): the start of each of the last two months of the holiday year, and a last call on the 20th of the final one. */
 export const REMINDER_DAYS = ['11-01', '12-01', '12-20'];
-export const isReminderDay = (todayYmd: string): boolean => REMINDER_DAYS.includes(todayYmd.slice(5, 10));
+export const isReminderDay = (todayYmd: string, startMonth: number = DEFAULT_HOLIDAY_YEAR_START_MONTH): boolean =>
+  holidayReminderDays(startMonth).includes(todayYmd.slice(5, 10));

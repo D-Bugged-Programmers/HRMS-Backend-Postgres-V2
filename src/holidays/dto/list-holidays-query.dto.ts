@@ -12,6 +12,14 @@ export class ListHolidaysQueryDto {
   @Max(2100)
   year?: number;
 
+  @ApiPropertyOptional({ description: "The company's holiday year (named by the calendar year it starts in), e.g. 2026 = Apr 2026 - Mar 2027 for an April start." })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(2000)
+  @Max(2100)
+  holidayYear?: number;
+
   @ApiPropertyOptional({
     description: 'Returns holidays for this department OR company-wide',
   })

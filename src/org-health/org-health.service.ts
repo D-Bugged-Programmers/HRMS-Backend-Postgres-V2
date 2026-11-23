@@ -11,6 +11,7 @@ import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PayrollSettingsService } from '../payroll-settings/payroll-settings.service';
+import { holidayYearOf, holidayYearRange, readHolidayYearStartMonth } from '../holidays/holiday-year';
 import { todayInOrgTz } from '../common/org-date';
 import { managerIdsOf } from '../common/managers';
 import { resolveShiftConfig, type OrganizationAttendancePrefs } from '../attendance/attendance-shift-config';
@@ -37,17 +38,19 @@ export class OrgHealthService {
   async get(organizationId: string) {
     const org = await this.scopedPrisma.organization.findFirst({
       where: { id: organizationId },
-      select: { timezone: true, attendancePayrollPrefs: true, epfoEstablishmentCode: true, esicEmployerCode: true, ptRegistrationNumber: true },
+      select: { timezone: true, policies: true, attendancePayrollPrefs: true, epfoEstablishmentCode: true, esicEmployerCode: true, ptRegistrationNumber: true },
     });
     const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
-    const year = Number(today.slice(0, 4));
+    // The holiday year may run across two calendar years (e.g. April-March): count this holiday year's holidays by date.
+    const holidayStart = readHolidayYearStartMonth(org?.policies);
+    const holidayRange = holidayYearRange(holidayYearOf(today, holidayStart), holidayStart);
     const [workLocations, workSchedules, departments, designations, leaveTypes, holidaysThisYear, salaryComponents, documentRequirements, employees] = await Promise.all([
       this.scopedPrisma.workLocation.count({ where: { organizationId } }),
       this.scopedPrisma.workSchedule.count({ where: { organizationId } }),
       this.scopedPrisma.department.count({ where: { organizationId, isActive: true } }),
       this.scopedPrisma.orgListItem.count({ where: { organizationId, type: OrgListType.DESIGNATION, isActive: true } }),
       this.scopedPrisma.leaveType.count({ where: { organizationId, isActive: true } }),
-      this.scopedPrisma.holiday.count({ where: { organizationId, year } }),
+      this.scopedPrisma.holiday.count({ where: { organizationId, date: { gte: holidayRange.from, lte: holidayRange.to } } }),
       this.scopedPrisma.salaryComponent.count({ where: { organizationId } }),
       this.scopedPrisma.documentRequirement.count({ where: { organizationId, isActive: true } }),
       this.scopedPrisma.user.count({ where: { organizationId, isActive: true } }),
