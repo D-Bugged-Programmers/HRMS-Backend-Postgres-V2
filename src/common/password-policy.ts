@@ -136,19 +136,16 @@ export function IsStrongPassword(options?: ValidationOptions) {
   };
 }
 
-// Short, easy-to-read words for the temporary password (all 4-6 letters).
-const TEMP_PASSWORD_WORDS = ['Apple', 'Arrow', 'Beach', 'Bison', 'Blaze', 'Bloom', 'Brave', 'Bread', 'Brook', 'Candy', 'Cedar', 'Charm', 'Cherry', 'Cloud', 'Clover', 'Coral', 'Crane', 'Daisy', 'Dance', 'Eagle', 'Earth', 'Ember', 'Fairy', 'Falcon', 'Fern', 'Field', 'Flame', 'Flora', 'Forest', 'Frost', 'Garden', 'Ginger', 'Glade', 'Globe', 'Grape', 'Green', 'Happy', 'Harbor', 'Hazel', 'Heart', 'Honey', 'Horse', 'Ivory', 'Jolly', 'Jungle', 'Kitten', 'Lemon', 'Light', 'Lilac', 'Lotus', 'Lucky', 'Magic', 'Mango', 'Maple', 'Meadow', 'Melon', 'Mint', 'Moon', 'Ocean', 'Olive', 'Orange', 'Otter', 'Panda', 'Peach', 'Pearl', 'Pebble', 'Pilot', 'Plum', 'Polar', 'Pond', 'Poppy', 'Puppy', 'Quail', 'Quiet', 'Rabbit', 'Rain', 'River', 'Robin', 'Rocket', 'Rose', 'Ruby', 'Sandy', 'Shell', 'Silver', 'Sky', 'Smile', 'Snow', 'Solar', 'Spark', 'Spice', 'Spring', 'Star', 'Stone', 'Storm', 'Sunny', 'Swan', 'Sweet', 'Tiger', 'Tulip', 'Turtle', 'Velvet', 'Violet', 'Walnut', 'Water', 'Willow', 'Wind', 'Winter', 'Zebra'];
+// Short, easy-to-read words for the temporary password (all 5-6 letters, so the whole password meets the minimum length).
+const TEMP_PASSWORD_WORDS = ['Apple', 'Arrow', 'Beach', 'Bison', 'Blaze', 'Bloom', 'Brave', 'Bread', 'Brook', 'Candy', 'Cedar', 'Charm', 'Cherry', 'Cloud', 'Clover', 'Coral', 'Crane', 'Daisy', 'Dance', 'Eagle', 'Earth', 'Ember', 'Fairy', 'Falcon', 'Field', 'Flame', 'Flora', 'Forest', 'Frost', 'Garden', 'Ginger', 'Glade', 'Globe', 'Grape', 'Green', 'Happy', 'Harbor', 'Hazel', 'Heart', 'Honey', 'Horse', 'Ivory', 'Jolly', 'Jungle', 'Kitten', 'Lemon', 'Light', 'Lilac', 'Lotus', 'Lucky', 'Magic', 'Mango', 'Maple', 'Meadow', 'Melon', 'Ocean', 'Olive', 'Orange', 'Otter', 'Panda', 'Peach', 'Pearl', 'Pebble', 'Pilot', 'Polar', 'Poppy', 'Puppy', 'Quail', 'Quiet', 'Rabbit', 'River', 'Robin', 'Rocket', 'Sandy', 'Shell', 'Silver', 'Smile', 'Solar', 'Spark', 'Spice', 'Spring', 'Stone', 'Storm', 'Sunny', 'Sweet', 'Tiger', 'Tulip', 'Turtle', 'Velvet', 'Violet', 'Walnut', 'Water', 'Willow', 'Winter', 'Zebra'];
 
 /**
- * A simple temporary password people can read out and type: two words and four digits, e.g. "Tiger-Maple-4827".
- * It always satisfies the policy (a capital, a lowercase letter, a digit, a hyphen as the symbol, 14+ characters).
+ * A short temporary password people can read out and type: one word and five digits, e.g. "Coral-48271" (11-12 characters).
+ * It always satisfies the policy (a capital, a lowercase letter, a digit, a hyphen as the symbol, at least 10 characters).
  * It is single-use: the person must choose their own password at first sign-in, and repeated wrong tries lock the account.
  */
 export function generatePolicyPassword(): string {
-  const word = () => TEMP_PASSWORD_WORDS[crypto.randomInt(TEMP_PASSWORD_WORDS.length)];
-  const first = word();
-  let second = word();
-  while (second === first) second = word();
-  const digits = String(crypto.randomInt(1000, 10000));
-  return `${first}-${second}-${digits}`;
+  const word = TEMP_PASSWORD_WORDS[crypto.randomInt(TEMP_PASSWORD_WORDS.length)];
+  const digits = String(crypto.randomInt(10000, 100000));
+  return `${word}-${digits}`;
 }
