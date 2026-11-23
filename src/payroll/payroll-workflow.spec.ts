@@ -191,6 +191,33 @@ describe('payroll workflow: the sign-off chain', () => {
     );
   });
 
+  it('a month that is still running can be approved but not locked or paid', async () => {
+    // "Today" is 10 Oct 2026, so October is still running.
+    const approved = build([run({ month: 10, status: 'APPROVED' })]);
+    await expect(approved.service.lock('r1', hr('l1'), 'org')).rejects.toThrow(
+      /still running/,
+    );
+    const locked = build([
+      run({ month: 10, status: 'LOCKED', lockEffectsAppliedAt: new Date() }),
+    ]);
+    await expect(locked.service.pay('r1', hr('p1'), 'org')).rejects.toThrow(
+      /still running/,
+    );
+  });
+
+  it('the last day of the month is still running; the day after it ends the month', async () => {
+    jest.setSystemTime(new Date('2026-09-30T08:00:00Z'));
+    const onLastDay = build([run({ status: 'APPROVED' })]);
+    await expect(
+      onLastDay.service.lock('r1', hr('l1'), 'org'),
+    ).rejects.toThrow(/still running/);
+    jest.setSystemTime(new Date('2026-10-01T08:00:00Z'));
+    const nextDay = build([run({ status: 'APPROVED' })]);
+    await expect(
+      nextDay.service.lock('r1', hr('l1'), 'org'),
+    ).resolves.toBeDefined();
+  });
+
   it('a final-settlement payslip is managed from Settlements, not here', async () => {
     const { service } = build([run({ isFinalSettlement: true })]);
     await expect(service.verify('r1', hr('v1'), 'org')).rejects.toThrow(

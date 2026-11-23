@@ -4852,6 +4852,21 @@ export class PayrollService {
         });
         continue;
       }
+      // A month still running is calculated only up to yesterday, and locking it freezes attendance, leave and overtime
+      // for the month - the days to come would stay unpaid until an Admin unlocks it. So it can be approved (with a
+      // warning) but not locked or paid until the month has ended.
+      if (
+        (config.toStatus === PayrollRunStatus.LOCKED ||
+          config.toStatus === PayrollRunStatus.PAID) &&
+        lastDayOfMonth(run.month, run.year) >= orgToday
+      ) {
+        skipped.push({
+          id: run.id,
+          status: 'month_not_ended',
+          reason: `${run.month}/${run.year} is still running, so its payroll cannot be ${config.toStatus === PayrollRunStatus.LOCKED ? 'locked' : 'paid'} yet. Recalculate and ${config.toStatus === PayrollRunStatus.LOCKED ? 'lock' : 'pay'} it after the month ends.`,
+        });
+        continue;
+      }
       // A payroll run that would pay a negative amount (e.g. a full-LOP
       // month with a loan EMI still due) is blocked from progressing any
       // further — "paying" a negative salary isn't a meaningful instruction
