@@ -61,7 +61,7 @@ export class HolidaysController {
   @UseGuards(RolesGuard)
   @Roles(Role.ADMIN, Role.HR)
   setYearSetting(@Body() dto: SetHolidayYearDto, @CurrentUser() caller: Caller) {
-    return this.holidaysService.setYearStartMonth(dto.startMonth, caller.organizationId, caller.id);
+    return this.holidaysService.setYearStartMonth(dto, caller.organizationId, caller.id);
   }
 
   // The company's HOLIDAY years (see holiday-year.ts): the year picker of the Holiday Calendar. /years stays the calendar years.

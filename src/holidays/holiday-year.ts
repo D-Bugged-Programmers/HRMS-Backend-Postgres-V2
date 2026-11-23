@@ -7,8 +7,23 @@
 
 export const DEFAULT_HOLIDAY_YEAR_START_MONTH = 1;
 
-/** The start month from stored policies (1-12); anything else reads as January. */
+/** The value stored in the setting when the holiday year is linked to the financial year ("Same as financial year"). */
+export const HOLIDAY_YEAR_SAME_AS_FINANCIAL = 'FY';
+
+/** True when the holiday year is linked to the financial year, so it starts in whatever month that does. */
+export function holidayYearFollowsFinancialYear(policies: unknown): boolean {
+  return (policies as { holidayYearStartMonth?: unknown } | null | undefined)?.holidayYearStartMonth === HOLIDAY_YEAR_SAME_AS_FINANCIAL;
+}
+
+/** The company's financial year start month (1-12) from its policies; April when unset, like the rest of the app. */
+export function readFinancialYearStartMonth(policies: unknown): number {
+  const n = Number((policies as { financialYearStartMonth?: unknown } | null | undefined)?.financialYearStartMonth);
+  return Number.isInteger(n) && n >= 1 && n <= 12 ? n : 4;
+}
+
+/** The start month from stored policies (1-12): the chosen month, or the financial year's when linked to it; anything else reads as January. */
 export function readHolidayYearStartMonth(policies: unknown): number {
+  if (holidayYearFollowsFinancialYear(policies)) return readFinancialYearStartMonth(policies);
   const raw = (policies as { holidayYearStartMonth?: unknown } | null | undefined)?.holidayYearStartMonth;
   const n = Number(raw);
   return Number.isInteger(n) && n >= 1 && n <= 12 ? n : DEFAULT_HOLIDAY_YEAR_START_MONTH;

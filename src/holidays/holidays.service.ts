@@ -8,7 +8,7 @@
 // existing DB rows and within the same batch.
 import { AttendanceService } from '../attendance/attendance.service';
 import { calendarStatus } from './holiday-calendar-status';
-import { holidayYearLabel, holidayYearOf, holidayYearRange, readHolidayYearStartMonth, sameDayInYear } from './holiday-year';
+import { HOLIDAY_YEAR_SAME_AS_FINANCIAL, holidayYearFollowsFinancialYear, holidayYearLabel, holidayYearOf, holidayYearRange, readFinancialYearStartMonth, readHolidayYearStartMonth, sameDayInYear } from './holiday-year';
 import {
   BadRequestException,
   ConflictException,
@@ -97,31 +97,44 @@ export class HolidaysService {
 
   /** The start month, the current holiday year and its label, for the Holiday Calendar and the mobile app. */
   async yearSetting(organizationId: string) {
-    const startMonth = await this.getHolidayYearStartMonth(organizationId);
+    const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
+    const startMonth = readHolidayYearStartMonth(org?.policies);
     const today = todayInOrgTz(await this.getOrgTimezone(organizationId));
     const currentYear = holidayYearOf(today, startMonth);
     const range = holidayYearRange(currentYear, startMonth);
-    return { startMonth, currentYear, currentLabel: holidayYearLabel(currentYear, startMonth), from: range.from, to: range.to };
+    return {
+      startMonth,
+      // True when the holiday year is linked to the financial year ("Same as financial year"); the financial year's own month is shown beside it.
+      sameAsFinancialYear: holidayYearFollowsFinancialYear(org?.policies),
+      financialYearStartMonth: readFinancialYearStartMonth(org?.policies),
+      currentYear,
+      currentLabel: holidayYearLabel(currentYear, startMonth),
+      from: range.from,
+      to: range.to,
+    };
   }
 
   /** Admin / HR: choose the month the holiday calendar's year starts in. Holidays keep their dates; only how they are grouped changes. */
-  async setYearStartMonth(startMonth: number, organizationId: string, actorId: string) {
-    if (!Number.isInteger(startMonth) || startMonth < 1 || startMonth > 12) {
-      throw new BadRequestException('Pick a month from January to December.');
+  async setYearStartMonth(choice: { startMonth?: number; sameAsFinancialYear?: boolean }, organizationId: string, actorId: string) {
+    const linked = choice.sameAsFinancialYear === true;
+    const startMonth = choice.startMonth;
+    if (!linked && (startMonth === undefined || !Number.isInteger(startMonth) || startMonth < 1 || startMonth > 12)) {
+      throw new BadRequestException('Pick a month from January to December, or choose "Same as financial year".');
     }
     const org = await this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } });
     const policies = (org?.policies && typeof org.policies === 'object' ? org.policies : {}) as Record<string, unknown>;
-    const before = readHolidayYearStartMonth(policies);
+    const before = holidayYearFollowsFinancialYear(policies) ? HOLIDAY_YEAR_SAME_AS_FINANCIAL : readHolidayYearStartMonth(policies);
+    const stored = linked ? HOLIDAY_YEAR_SAME_AS_FINANCIAL : (startMonth as number);
     await this.scopedPrisma.organization.updateMany({
       where: { id: organizationId },
-      data: { policies: { ...policies, holidayYearStartMonth: startMonth } as Prisma.InputJsonValue },
+      data: { policies: { ...policies, holidayYearStartMonth: stored } as Prisma.InputJsonValue },
     });
     await this.auditLogService.log({
       actorId,
       action: 'HOLIDAY_YEAR_CHANGED',
       module: 'HOLIDAY',
       organizationId,
-      details: { from: before, to: startMonth },
+      details: { from: before, to: stored },
     });
     return this.yearSetting(organizationId);
   }

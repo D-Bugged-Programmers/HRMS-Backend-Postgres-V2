@@ -1,4 +1,5 @@
 import {
+  holidayYearFollowsFinancialYear,
   holidayReminderDays,
   holidayYearLabel,
   holidayYearOf,
@@ -46,5 +47,15 @@ describe('holiday year', () => {
   it('copies a day into another year, refusing 29 February where it does not exist', () => {
     expect(sameDayInYear('2026-10-02', 2027)).toBe('2027-10-02');
     expect(sameDayInYear('2028-02-29', 2029)).toBeNull();
+  });
+  it('can be linked to the financial year ("Same as financial year")', () => {
+    const linked = { holidayYearStartMonth: 'FY', financialYearStartMonth: 4 };
+    expect(holidayYearFollowsFinancialYear(linked)).toBe(true);
+    expect(readHolidayYearStartMonth(linked)).toBe(4);
+    // It follows the financial year when that changes, and reads April when the financial year was never set.
+    expect(readHolidayYearStartMonth({ holidayYearStartMonth: 'FY', financialYearStartMonth: 1 })).toBe(1);
+    expect(readHolidayYearStartMonth({ holidayYearStartMonth: 'FY' })).toBe(4);
+    expect(holidayYearFollowsFinancialYear({ holidayYearStartMonth: 4 })).toBe(false);
+    expect(readHolidayYearStartMonth({ holidayYearStartMonth: 7, financialYearStartMonth: 4 })).toBe(7);
   });
 });

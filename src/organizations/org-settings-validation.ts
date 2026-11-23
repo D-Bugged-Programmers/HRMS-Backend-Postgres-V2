@@ -189,7 +189,8 @@ export function assertIndianPhone(field: string, value: unknown): void {
 }
 
 function validatePolicies(p: Record<string, unknown>) {
-  checkNumber(p, 'holidayYearStartMonth', 'policies.holidayYearStartMonth', { min: 1, max: 12, integer: true });
+  // A month (1-12), or 'FY' = the same as the financial year (see holidays/holiday-year.ts).
+  if (p.holidayYearStartMonth !== 'FY') checkNumber(p, 'holidayYearStartMonth', 'policies.holidayYearStartMonth', { min: 1, max: 12, integer: true });
   checkNumber(
     p,
     'financialYearStartMonth',
