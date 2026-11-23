@@ -10,6 +10,9 @@
 // pre-check.
 import { placeholderEmailFor, readLoginPolicy } from '../common/no-email';
 import { codeFitsFormat } from './employee-code';
+
+// What the import dialog sends in the Company column for "the main company itself" (not a sister company).
+const MAIN_COMPANY_KEY = '__MAIN__';
 import { inReviewerScope, reviewerScope } from '../common/dept-scope';
 import { summarizeDocumentReview, type DocumentReview } from './document-review';
 import { featureEnabledFor, sisterCompaniesOn } from '../module-access/module-gate';
@@ -703,6 +706,8 @@ export class EmployeesService {
           select: {
             customEmployeeTypes: true,
             inactiveBuiltinEmployeeTypes: true,
+            name: true,
+            companyName: true,
           },
         }),
         this.scopedPrisma.companyBrand.findMany({
@@ -847,21 +852,30 @@ export class EmployeesService {
       const company = companyName && brandsOn
         ? brandItems.find((b) => b.isActive && b.name.toLowerCase() === companyName.toLowerCase())
         : undefined;
-      if (companyName && brandsOn && !company) {
+      // The main company itself (the organization, not a sister company): by its own name, or the import dialog's "Main company" choice.
+      // Such a person belongs to no sister company and takes the organization-wide employee ID series.
+      const wantsMain = !!companyName && brandsOn && !company
+        && (companyName === MAIN_COMPANY_KEY || [org?.companyName, org?.name].some((n) => !!n && n.trim().toLowerCase() === companyName.toLowerCase()));
+      if (companyName && brandsOn && !company && !wantsMain) {
         failed.push({ row, error: `Company "${companyName}" not found or inactive.` });
         return;
       }
       // The optional Employee code column: kept exactly as written. It must fit the ID format of the row's company; a row with no company
       // takes the company whose ID format the code fits (a code that fits none, or more than one, is refused).
       const employeeCode = asString(row.employeeCode).trim();
-      let rowBrandId: string | null | undefined = company?.id;
+      let rowBrandId: string | null | undefined = wantsMain ? null : company?.id;
       if (employeeCode) {
         const fits = (format: string | null | undefined) => (format ? codeFitsFormat(format, employeeCode) : !orgIdFormat || codeFitsFormat(orgIdFormat, employeeCode));
         if ((codeCount.get(employeeCode) ?? 0) > 1) {
           failed.push({ row, error: `Employee code ${employeeCode} appears more than once in this file.` });
           return;
         }
-        if (company) {
+        if (wantsMain) {
+          if (!fits(null)) {
+            failed.push({ row, error: `Employee code ${employeeCode} does not fit the main company's ID format (${orgIdFormat}).` });
+            return;
+          }
+        } else if (company) {
           const own = company.employeeIdFormat;
           if (!fits(own)) {
             failed.push({ row, error: `Employee code ${employeeCode} does not fit ${company.name}'s ID format (${own || orgIdFormat}).` });
