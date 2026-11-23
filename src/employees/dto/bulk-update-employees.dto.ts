@@ -1,8 +1,10 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { AttendanceMethod } from '@prisma/client';
 import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsEnum,
   IsIn,
   IsOptional,
   IsString,
@@ -42,4 +44,10 @@ export class BulkUpdateEmployeesDto {
   @IsString()
   @MaxLength(60)
   employmentStatusKey?: string;
+
+  // How attendance is marked for everyone selected: the app, the office device, either, or the company default.
+  @ApiPropertyOptional({ enum: AttendanceMethod })
+  @IsOptional()
+  @IsEnum(AttendanceMethod)
+  attendanceMethod?: AttendanceMethod;
 }

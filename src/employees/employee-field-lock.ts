@@ -21,6 +21,7 @@ const LOCKED_FIELDS_FOR_EMPLOYEE: (keyof UpdateEmployeeDto)[] = [
   'requireWorkLocationForPunch',
   'selfieRequirement',
   'locationRequirement',
+  'attendanceMethod',
   'designation',
   // gradeLevel/employeeCategory added alongside designation/departmentId —
   // same class of structural classification, not something an employee

@@ -19,6 +19,7 @@ import {
   EmploymentStatus,
   Gender,
   Role,
+  AttendanceMethod,
   LocationRequirement,
   SelfieRequirement,
 } from '@prisma/client';
@@ -94,6 +95,12 @@ export class UpdateEmployeeDto {
   @IsOptional()
   @IsEnum(LocationRequirement)
   locationRequirement?: LocationRequirement;
+
+  // HR/Admin only (see employee-field-lock.ts). DEFAULT follows the organization's attendance setting.
+  @ApiPropertyOptional({ enum: AttendanceMethod })
+  @IsOptional()
+  @IsEnum(AttendanceMethod)
+  attendanceMethod?: AttendanceMethod;
 
   // Locked for self-update, AND locked for HR (Admin only) — mirrors the
   // original release exactly: even hr_admin couldn't change designation.

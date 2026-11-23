@@ -262,6 +262,7 @@ export class EmployeesService {
               dto.requireWorkLocationForPunch ?? undefined,
             selfieRequirement: dto.selfieRequirement ?? undefined,
             locationRequirement: dto.locationRequirement ?? undefined,
+            attendanceMethod: dto.attendanceMethod ?? undefined,
             designation: dto.designation ?? '',
             gradeLevel: dto.gradeLevel ?? '',
             employeeCategory: dto.employeeCategory ?? '',

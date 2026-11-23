@@ -102,6 +102,7 @@ import { SelfPunchDto } from './dto/self-punch.dto';
 import { SetWorkArrangementDto } from './dto/set-work-arrangement.dto';
 import { SelfieStampService } from './selfie-stamp.service';
 import { resolveLocationMode } from '../common/location-requirement';
+import { appPunchAllowed, resolveAttendanceMethod } from '../common/attendance-method';
 import { PreviewWfhDaysQueryDto } from './dto/preview-wfh-days-query.dto';
 import {
   calendarSpan,
@@ -1795,6 +1796,16 @@ export class AttendanceService {
         companyName: true,
       },
     });
+    // Someone whose attendance is marked on the office device does not punch in the app.
+    if (
+      !appPunchAllowed(
+        resolveAttendanceMethod(employee?.attendanceMethod, orgForPunch?.orgPayrollAttendancePrefs),
+      )
+    ) {
+      throw new ForbiddenException(
+        'Your attendance is marked on the biometric device, so the app does not take a punch. Ask HR if this is wrong.',
+      );
+    }
     const locationMode = resolveLocationMode(
       employee?.locationRequirement,
       orgForPunch?.orgPayrollAttendancePrefs,

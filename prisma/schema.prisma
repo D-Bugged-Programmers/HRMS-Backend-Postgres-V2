@@ -570,6 +570,8 @@ model User {
   // What location the punch needs: DEFAULT follows the org's attendance prefs (locationMode); ENFORCED / RECORD_ONLY /
   // NOT_NEEDED override it. See common/location-requirement.ts.
   locationRequirement         LocationRequirement @default(DEFAULT)
+  // How this person marks attendance: the app, the biometric device or either (DEFAULT follows the organization). See common/attendance-method.ts.
+  attendanceMethod            AttendanceMethod    @default(DEFAULT)
 
   reportingManagerId            String?
   reportingManager              User?    @relation("ReportingManager", fields: [reportingManagerId], references: [id])
@@ -4326,6 +4328,15 @@ model AssetDocument {
 
   @@index([organizationId, assetId])
   @@map("asset_documents")
+}
+
+// How an employee marks attendance (User.attendanceMethod); DEFAULT follows the organization's default. MOBILE = the app, BIOMETRIC = the
+// office device (the app's punch is not offered), BOTH = either.
+enum AttendanceMethod {
+  DEFAULT
+  MOBILE
+  BIOMETRIC
+  BOTH
 }
 
 // Per-employee location rule for check-in/out (User.locationRequirement); DEFAULT follows the organization.

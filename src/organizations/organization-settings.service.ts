@@ -448,6 +448,7 @@ export class OrganizationSettingsService {
       enableTaxDeclaration?: boolean;
       requireSelfieForPunch?: boolean;
       locationMode?: string;
+      attendanceMethod?: string;
     };
     return {
       isInitialized: org.isInitialized,
@@ -514,6 +515,11 @@ export class OrganizationSettingsService {
       )
         ? attendancePayrollPrefs.locationMode
         : 'ENFORCED',
+      // Org default for how attendance is marked (unset = BOTH: the app and the office device). An employee's own setting can
+      // override it - see common/attendance-method.ts.
+      attendanceMethod: ['MOBILE', 'BIOMETRIC', 'BOTH'].includes(attendancePayrollPrefs.attendanceMethod as string)
+        ? attendancePayrollPrefs.attendanceMethod
+        : 'BOTH',
       // Lets Leave Types disable its manual "Run Year-End Carry Forward"
       // button when the automatic Jan 1st cron already covers it, without
       // needing ADMIN-only access to the full /organizations/settings

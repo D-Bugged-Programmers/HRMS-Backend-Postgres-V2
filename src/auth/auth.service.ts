@@ -73,6 +73,7 @@ import {
 } from './auth.constants';
 import { isSelfieRequired } from '../common/selfie-requirement';
 import { resolveLocationMode } from '../common/location-requirement';
+import { resolveAttendanceMethod } from '../common/attendance-method';
 
 const SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS ?? 10);
 // 30 minutes — matches the original release's window exactly.
@@ -757,6 +758,9 @@ export class AuthService {
       user.locationRequirement,
       org?.orgPayrollAttendancePrefs,
     );
+    // How this person marks attendance (their own setting, else the company's): MOBILE, BIOMETRIC or BOTH. The mobile app hides
+    // its punch for BIOMETRIC.
+    const punchMethod = resolveAttendanceMethod(user.attendanceMethod, org?.orgPayrollAttendancePrefs);
     (safe as Record<string, unknown>).hasEmail = !isPlaceholderEmail(safe.email);
     // profileImage is a durable relativeKey (never a signed URL — see
     // file-token.ts), so it's signed fresh on every read. This is what
@@ -800,6 +804,7 @@ export class AuthService {
       ...safe,
       selfieRequired,
       locationMode,
+      punchMethod,
       additionalReportingManagers,
       uanRequired,
       aadhaarRequired,

@@ -17,6 +17,7 @@ import {
 } from 'class-validator';
 import {
   Gender,
+  AttendanceMethod,
   LocationRequirement,
   Role,
   SelfieRequirement,
@@ -150,6 +151,15 @@ export class CreateEmployeeDto {
   @IsOptional()
   @IsEnum(LocationRequirement)
   locationRequirement?: LocationRequirement;
+
+  @ApiPropertyOptional({
+    enum: AttendanceMethod,
+    default: AttendanceMethod.DEFAULT,
+    description: 'How attendance is marked: DEFAULT follows the company setting; MOBILE (the app), BIOMETRIC (the office device) or BOTH override it for this employee.',
+  })
+  @IsOptional()
+  @IsEnum(AttendanceMethod)
+  attendanceMethod?: AttendanceMethod;
 
   @ApiProperty()
   @Trim()

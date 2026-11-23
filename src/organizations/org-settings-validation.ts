@@ -549,6 +549,12 @@ function validateAttendancePrefs(p: Record<string, unknown>) {
     bad(`${path('locationMode')} must be ENFORCED, RECORD_ONLY or NOT_NEEDED.`);
   }
   if (
+    p.attendanceMethod !== undefined &&
+    !['MOBILE', 'BIOMETRIC', 'BOTH'].includes(p.attendanceMethod as string)
+  ) {
+    bad(`${path('attendanceMethod')} must be MOBILE, BIOMETRIC or BOTH.`);
+  }
+  if (
     p.notifySalaryRevision !== undefined &&
     typeof p.notifySalaryRevision !== 'boolean'
   ) {
