@@ -96,6 +96,7 @@ import {
 } from '../payroll/format-date';
 
 import { requireReason } from '../common/require-reason';
+import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
 type Actor = Omit<User, 'password'>;
 
 // Fallback multipliers, used only when the org has no PayrollSettings row yet
@@ -793,7 +794,8 @@ export class OvertimeService {
         this.scopedPrisma.overtimeRecord.findMany({
           where,
           include: {
-            employee: { select: { id: true, name: true, employeeId: true } },
+            // profileImage: the photo's storage key, signed below for the Employee column (initials when there is none).
+            employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
             // Who decided it, so the employee's list can say "Approved by ...".
             approvedBy: { select: { id: true, name: true } },
           },
@@ -831,6 +833,10 @@ export class OvertimeService {
         const basic = basics.get(r.employeeId);
         return {
           ...r,
+          employee: {
+            ...r.employee,
+            profileImage: r.employee.profileImage ? `/files/${signFileToken(r.organizationId, r.employee.profileImage, SESSION_ASSET_TTL_SECONDS)}` : null,
+          },
           estimatedAmount:
             r.status !== OvertimeStatus.REJECTED &&
             canSeePay(r.employeeId) &&

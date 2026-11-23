@@ -302,7 +302,7 @@ export class ResignationsService {
         employee: reportsToWhere(actor.id),
       },
       include: {
-        employee: { select: { id: true, name: true, employeeId: true } },
+        employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
       },
       orderBy: { createdAt: 'desc' },
       take: 100,
@@ -345,7 +345,7 @@ export class ResignationsService {
     const record = await this.scopedPrisma.resignation.findFirst({
       where: { id, organizationId: actor.organizationId },
       include: {
-        employee: { select: { id: true, name: true, employeeId: true } },
+        employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
       },
     });
     if (!record) throw new NotFoundException('Resignation not found.');

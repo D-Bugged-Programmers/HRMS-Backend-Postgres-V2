@@ -203,7 +203,7 @@ export class SettlementsService {
           await this.scopedPrisma.settlement.findMany({
             where,
             include: {
-              employee: { select: { id: true, name: true, employeeId: true } },
+              employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
               offboardingCases: { select: { status: true } },
             },
             orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { createdAt: 'desc' }],

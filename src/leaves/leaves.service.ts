@@ -572,7 +572,7 @@ export class LeavesService {
           await this.scopedPrisma.leave.findMany({
           where,
           include: {
-            employee: { select: { id: true, name: true, employeeId: true } },
+            employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
             leaveType: {
               select: {
                 id: true,
@@ -803,7 +803,7 @@ export class LeavesService {
     return this.scopedPrisma.leave.findMany({
       where,
       include: {
-        employee: { select: { id: true, name: true, employeeId: true } },
+        employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
         leaveType: { select: { id: true, name: true, color: true } },
       },
       orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { startDate: 'asc' }],
@@ -841,6 +841,7 @@ export class LeavesService {
             id: true,
             name: true,
             employeeId: true,
+            profileImage: true,
             department: { select: { name: true } },
           },
         },
@@ -853,6 +854,7 @@ export class LeavesService {
         employeeId: l.employee.id,
         employeeCode: l.employee.employeeId,
         name: l.employee.name,
+        profileImage: l.employee.profileImage ?? null,
         department: l.employee.department?.name ?? null,
         startDate: l.startDate,
         endDate: l.endDate,

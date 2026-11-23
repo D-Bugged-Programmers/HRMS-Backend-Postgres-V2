@@ -62,6 +62,7 @@ import { ExportLeaveTrackerGridDto } from './dto/export-leave-tracker-grid.dto';
 import { ExportLeaveTrackerBalancesDto } from './dto/export-leave-tracker-balances.dto';
 import type { ReportColumn } from '../reports/report-export';
 import type { ReportPayload } from '../reports/reports.service';
+import { signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
 
 type Actor = Omit<User, 'password'>;
 
@@ -432,7 +433,8 @@ export class LeaveTrackerService {
         id: e.id,
         name: e.name,
         employeeId: e.employeeId,
-        profileImage: e.profileImage ?? null,
+        // A signed link the browser can load, like the Employee Directory sends (the stored value is a storage key, not a URL).
+        profileImage: e.profileImage ? `/files/${signFileToken(organizationId, e.profileImage, SESSION_ASSET_TTL_SECONDS)}` : null,
         // So the grid leaves the days before joining / after leaving blank instead of drawing a weekend there.
         joiningDate: joiningOf.get(e.id) ?? null,
         exitDate: e.exitDate ?? null,
@@ -491,6 +493,8 @@ export class LeaveTrackerService {
         exitDate: true,
         // Shown by the Employee Leave Stat page.
         designation: true,
+        // Shown instead of the initials when the person has a photo.
+        profileImage: true,
         // Their own weekly offs, when set, replace the department's.
         weeklyOffsOverride: true,
         // The name is shown; the whole row also carries the shift that decides this person's weekly offs.
@@ -845,6 +849,7 @@ export class LeaveTrackerService {
       employeeId: string;
       // Display code (e.g. "DP-00001"); `employeeId` above is the User.id join key.
       employeeCode: string;
+      profileImage?: string | null;
       name: string;
       department: string | null;
       designation: string;
@@ -982,6 +987,7 @@ export class LeaveTrackerService {
         employeeId: employee.id,
         employeeCode: employee.employeeId,
         name: employee.name,
+        profileImage: employee.profileImage ?? null,
         department: employee.department?.name ?? null,
         designation: employee.designation,
         isActive: employee.isActive,

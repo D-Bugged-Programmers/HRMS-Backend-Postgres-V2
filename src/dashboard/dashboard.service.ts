@@ -990,7 +990,7 @@ export class DashboardService {
     const WANT = options?.page ? wanted(options.page) : LIMIT;
     const scope = this.pendingScope(organizationId, employeeIds);
     const where = this.pendingWhere(scope, viewer);
-    const employeeSelect = { select: { name: true, employeeId: true } } as const;
+    const employeeSelect = { select: { name: true, employeeId: true, profileImage: true } } as const;
     const off = await disabledModulesOf(organizationId);
     const [leaves, regularizations, wfh, overtime, compOffs] =
       await Promise.all([
@@ -1079,6 +1079,7 @@ export class DashboardService {
         id: r.id,
         employee: r.employee.name,
         employeeId: r.employee.employeeId,
+        profileImage: r.employee.profileImage ?? null,
         summary: `Reimbursement (${r.amount})`,
         date: r.claimDate,
         endDate: null as string | null,
@@ -1089,6 +1090,7 @@ export class DashboardService {
         id: l.id,
         employee: l.employee.name,
         employeeId: l.employee.employeeId,
+        profileImage: l.employee.profileImage ?? null,
         summary: `${l.loanType === 'ADVANCE' ? 'Advance' : 'Loan'} (${l.principal})`,
         // What the approver needs to set the repayment terms (the mobile sheet decides without opening the loan).
         loanType: l.loanType,
@@ -1104,6 +1106,7 @@ export class DashboardService {
         id: e.id,
         employee: e.employee.name,
         employeeId: e.employee.employeeId,
+        profileImage: e.employee.profileImage ?? null,
         summary: `Leave encashment (${days(e.days)})`,
         date: e.createdAt.toISOString().slice(0, 10),
         endDate: null as string | null,
@@ -1116,6 +1119,7 @@ export class DashboardService {
               id: r.id,
               employee: r.employee.name,
               employeeId: r.employee.employeeId,
+              profileImage: r.employee.profileImage ?? null,
               summary: 'Withdrawal of approved resignation',
               date: (r.withdrawalRequestedAt ?? r.createdAt)
                 .toISOString()
@@ -1128,6 +1132,7 @@ export class DashboardService {
               id: r.id,
               employee: r.employee.name,
               employeeId: r.employee.employeeId,
+              profileImage: r.employee.profileImage ?? null,
               summary: 'Resignation, last working day',
               date: r.requestedLwd,
               endDate: null as string | null,
@@ -1142,6 +1147,7 @@ export class DashboardService {
         id: l.id,
         employee: l.employee.name,
         employeeId: l.employee.employeeId,
+        profileImage: l.employee.profileImage ?? null,
         // An approved leave in this list is a cancellation request: it is decided on its own endpoint.
         cancellation: l.status === LeaveStatus.APPROVED,
         cancelReason:
@@ -1185,6 +1191,7 @@ export class DashboardService {
           id: a.id,
           employee: a.employee.name,
           employeeId: a.employee.employeeId,
+          profileImage: a.employee.profileImage ?? null,
           summary: `Attendance regularization (actual ${actual}; requested ${asked})`,
           date: a.date,
           endDate: null,
@@ -1215,6 +1222,7 @@ export class DashboardService {
         id: o.id,
         employee: o.employee.name,
         employeeId: o.employee.employeeId,
+        profileImage: o.employee.profileImage ?? null,
         summary: `Overtime (${o.hours}h)`,
         date: o.date,
         endDate: null,
@@ -1228,6 +1236,7 @@ export class DashboardService {
         id: c.id,
         employee: c.employee.name,
         employeeId: c.employee.employeeId,
+        profileImage: c.employee.profileImage ?? null,
         summary: `Comp-off (${days(c.daysEarned)})`,
         date: c.earnedForDate,
         endDate: null,
@@ -1826,7 +1835,7 @@ export class DashboardService {
           employmentStatus: { in: probationStatuses },
           probationEndDate: { gte: today, lte: in7 },
         },
-        select: { id: true, name: true, employeeId: true, probationEndDate: true },
+        select: { id: true, name: true, employeeId: true, profileImage: true, probationEndDate: true },
         orderBy: { probationEndDate: 'asc' },
         take: 10,
       }),
@@ -1910,6 +1919,7 @@ export class DashboardService {
           id: u.id,
           name: u.name,
           employeeId: u.employeeId,
+          profileImage: u.profileImage,
           date: u.probationEndDate,
         })),
       },
@@ -2050,10 +2060,11 @@ export class DashboardService {
         id: string;
         name: string;
         employeeId: string;
+        profileImage: string | null;
         joiningDate: Date;
         dateOfBirth: string | null;
       }[]
-    >`SELECT "id", "name", "employeeId", "joiningDate",
+    >`SELECT "id", "name", "employeeId", "profileImage", "joiningDate",
              "personalData"->>'dateOfBirth' AS "dateOfBirth"
         FROM "users"
        WHERE "organizationId" = ${organizationId} AND "isActive" = true
@@ -2065,6 +2076,7 @@ export class DashboardService {
       id: string;
       name: string;
       employeeId: string;
+      profileImage: string | null;
       daysAway: number;
       // YYYY-MM-DD of the coming anniversary.
       date: string;
@@ -2074,6 +2086,7 @@ export class DashboardService {
       id: string;
       name: string;
       employeeId: string;
+      profileImage: string | null;
       daysAway: number;
       // YYYY-MM-DD of the coming birthday.
       date: string;
@@ -2100,6 +2113,7 @@ export class DashboardService {
             id: e.id,
             name: e.name,
             employeeId: e.employeeId,
+            profileImage: e.profileImage,
             daysAway: days,
             date: dateAfter(days),
             years,
@@ -2121,6 +2135,7 @@ export class DashboardService {
             id: e.id,
             name: e.name,
             employeeId: e.employeeId,
+            profileImage: e.profileImage,
             daysAway: birthdayDays,
             date: dateAfter(birthdayDays),
           });

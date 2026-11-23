@@ -3503,6 +3503,7 @@ export class PayrollService {
                 name: true,
                 employeeId: true,
                 departmentId: true,
+                profileImage: true,
               },
             },
           },

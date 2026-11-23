@@ -771,6 +771,7 @@ export class EmployeeProfileService {
             name: true,
             employeeId: true,
             role: true,
+            profileImage: true,
             department: { select: { name: true } },
           },
         },

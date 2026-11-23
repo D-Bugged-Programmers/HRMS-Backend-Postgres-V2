@@ -117,7 +117,7 @@ export class LeaveEncashmentsService {
         this.scopedPrisma.leaveEncashment.findMany({
           where,
           include: {
-            employee: { select: { id: true, name: true, employeeId: true } },
+            employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
             leaveType: { select: { id: true, name: true, code: true } },
             // Who decided it, so the approvals lists can show a Decided by column.
             approvedBy: { select: { id: true, name: true } },

@@ -112,7 +112,7 @@ export class OffboardingService {
         this.scopedPrisma.offboardingCase.findMany({
           where,
           include: {
-            employee: { select: { id: true, name: true, employeeId: true } },
+            employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
             settlement: true,
           },
           orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { createdAt: 'desc' }],
@@ -160,7 +160,7 @@ export class OffboardingService {
     const today = todayInOrgTz(org?.timezone ?? 'Asia/Kolkata');
     const cases = await this.scopedPrisma.offboardingCase.findMany({
       where: { organizationId, status: { in: OPEN_STATUSES } },
-      include: { employee: { select: { id: true, name: true, employeeId: true } }, settlement: true },
+      include: { employee: { select: { id: true, name: true, employeeId: true, profileImage: true } }, settlement: true },
     });
     const rows = await Promise.all(
       cases.map(async (c) => {
@@ -408,7 +408,7 @@ export class OffboardingService {
     const record = await this.scopedPrisma.offboardingCase.findFirst({
       where: { id, organizationId },
       include: {
-        employee: { select: { id: true, name: true, employeeId: true } },
+        employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
         settlement: true,
       },
     });

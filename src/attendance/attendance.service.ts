@@ -61,7 +61,7 @@ import {
   effectiveGeoFence,
   effectiveWorkLocation,
 } from '../common/effective-work-location';
-import { isKeyAllowedForOrg, signFileToken } from '../files/file-token';
+import { isKeyAllowedForOrg, signFileToken, SESSION_ASSET_TTL_SECONDS } from '../files/file-token';
 import {
   isInsideGeoFenceWithAccuracy,
   MAX_ACCURACY_ALLOWANCE_METERS,
@@ -187,6 +187,8 @@ const ATTENDANCE_LIST_EMPLOYEE_SELECT = {
   id: true,
   name: true,
   employeeId: true,
+  // The profile photo's storage key: the list signs it for the Employee column (initials when there is none).
+  profileImage: true,
   workLocation: true,
   department: { include: { workLocation: true } },
 } satisfies Prisma.UserSelect;
@@ -2875,7 +2877,7 @@ export class AttendanceService {
     const rows = await this.scopedPrisma.attendance.findMany({
       where,
       include: {
-        employee: { select: { id: true, name: true, employeeId: true } },
+        employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
       },
       orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { date: 'desc' }],
     });
@@ -2942,7 +2944,7 @@ export class AttendanceService {
     const rows = await this.scopedPrisma.attendance.findMany({
       where,
       include: {
-        employee: { select: { id: true, name: true, employeeId: true } },
+        employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
       },
       orderBy: [...EMPLOYEE_RELATION_ORDER_BY, { date: 'desc' }],
     });
@@ -3470,6 +3472,8 @@ export class AttendanceService {
 
         return {
           ...record,
+          // The person's photo as a link the browser can load, for the Employee column.
+          employee: { ...record.employee, profileImage: record.employee.profileImage ? `/files/${signFileToken(record.organizationId, record.employee.profileImage, SESSION_ASSET_TTL_SECONDS)}` : null },
           checkinSelfieUrl: signSelfieKey(
             record.organizationId,
             record.checkinSelfieUrl,

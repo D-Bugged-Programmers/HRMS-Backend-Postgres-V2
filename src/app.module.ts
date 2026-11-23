@@ -8,6 +8,7 @@ import {
 import { requestContextMiddleware } from './common/request-context';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { RequestSanityInterceptor } from './common/request-sanity.interceptor';
+import { ProfilePhotoSigningInterceptor } from './common/profile-photo-signing.interceptor';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { LoggerModule } from 'nestjs-pino';
@@ -198,6 +199,8 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     // the opposite of the original release where each route file had to
     // remember to add `protect` itself.
     { provide: APP_INTERCEPTOR, useClass: RequestSanityInterceptor },
+    // Signs profile-photo keys in the approvals / payroll / performance / attendance lists (see the interceptor).
+    { provide: APP_INTERCEPTOR, useClass: ProfilePhotoSigningInterceptor },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     // Runs after JwtAuthGuard in the guard chain (registration order),
     // so an already-401'd request doesn't also consume a rate-limit slot.

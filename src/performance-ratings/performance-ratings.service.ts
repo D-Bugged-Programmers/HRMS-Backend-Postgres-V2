@@ -95,7 +95,7 @@ export class PerformanceRatingsService {
         this.scopedPrisma.performanceRating.findMany({
           where,
           include: {
-            employee: { select: { id: true, name: true, employeeId: true } },
+            employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
             // Who gave the rating, so a self-rating (an Admin may rate themselves) is visible as such.
             ratedBy: { select: { id: true, name: true } },
           },

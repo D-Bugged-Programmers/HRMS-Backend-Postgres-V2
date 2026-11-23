@@ -212,7 +212,7 @@ export class LoansService {
         this.scopedPrisma.loan.findMany({
           where,
           include: {
-            employee: { select: { id: true, name: true, employeeId: true } },
+            employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
             // closureReason/closedAt are plain scalars on Loan and flow
             // through automatically, but closedBy is a relation — needs an
             // explicit include or the History modal's "Closed by" always

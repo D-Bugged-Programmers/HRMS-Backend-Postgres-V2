@@ -256,7 +256,7 @@ export class CompOffService {
         this.scopedPrisma.compOff.findMany({
           where,
           include: {
-            employee: { select: { id: true, name: true, employeeId: true } },
+            employee: { select: { id: true, name: true, employeeId: true, profileImage: true } },
             // Who decided it, so the approvals lists can show a Decided by column.
             approvedBy: { select: { id: true, name: true } },
           },
