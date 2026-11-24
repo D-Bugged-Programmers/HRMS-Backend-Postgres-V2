@@ -30,6 +30,10 @@ export const STATUTORY_GATED_KEYS: StatutoryKey[] = [
   StatutoryKey.BONUS,
 ];
 
+// Employer charges that sit under PF but that a company may choose not to pay (or may pay in another way): each has its own on/off switch
+// in Salary Components, in addition to the PF switch. Switched off, payroll and the salary structure leave them out.
+export const INDEPENDENT_STATUTORY_CODES = ['EDLI_EMPLOYER', 'EPF_ADMIN_EMPLOYER'];
+
 /** Enabled/disabled per statutory key as of today; keys with no version yet are omitted. */
 export async function statutoryEnabledToday(
   db: ExtendedPrismaClient | Prisma.TransactionClient,

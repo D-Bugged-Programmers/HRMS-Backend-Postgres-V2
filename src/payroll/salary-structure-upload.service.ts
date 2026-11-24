@@ -30,6 +30,8 @@ export interface SalaryUploadRowResult {
   revision: boolean;
   /** Their current monthly gross, for a revision: shown beside the new one so a big jump is seen before saving. */
   currentMonthlyGross: number | null;
+  /** For a row that gave an amount per salary component: exactly what will be saved, so the figures can be compared with the sheet. */
+  components?: { name: string; amount: number; kind: 'EARNING' | 'DEDUCTION' | 'EMPLOYER' }[];
   warnings: string[];
 }
 
@@ -89,6 +91,13 @@ export class SalaryStructureUploadService {
       componentByKey.set(c.code.toLowerCase(), c.code);
       componentByKey.set(c.name.toLowerCase(), c.code);
     }
+    // Every component of the company (also the switched-off ones), so a column for one can be named properly instead of "unknown".
+    const anyComponentByKey = new Map<string, (typeof context.components)[number]>();
+    for (const c of context.components) {
+      anyComponentByKey.set(c.code.toLowerCase(), c);
+      anyComponentByKey.set(c.name.toLowerCase(), c);
+    }
+    const componentOf = new Map(context.components.map((c) => [c.code, c]));
 
     const codes = [...new Set(dto.rows.map((r) => text(r.employeeCode)).filter(Boolean))];
     // Codes match whatever the case (sis2-0001 = SIS2-0001): look up the typed form and its upper / lower case.
@@ -174,19 +183,34 @@ export class SalaryStructureUploadService {
       let lines: { componentCode: string; valueType: 'FIXED' | 'MANUAL' | 'PERCENTAGE'; fixedAmount?: number; percentageValue?: number; percentageOf?: string; amountBasis?: 'MONTHLY' | 'ANNUAL'; isEnabled: boolean }[] = [];
       if (componentEntries.length > 0) {
         const unknown: string[] = [];
-        let total = 0;
+        const switchedOff: string[] = [];
+        let gross = 0;
+        let employer = 0;
+        const breakdown: NonNullable<SalaryUploadRowResult['components']> = [];
         for (const [key, v] of componentEntries) {
           const componentCode = componentByKey.get(key.trim().toLowerCase());
           const amount = money(v);
-          if (!componentCode) { unknown.push(key); continue; }
+          if (!componentCode) {
+            // A component the company has, but switched off: say so instead of calling it unknown.
+            if (anyComponentByKey.has(key.trim().toLowerCase())) switchedOff.push(anyComponentByKey.get(key.trim().toLowerCase())!.name);
+            else unknown.push(key);
+            continue;
+          }
           if (amount === null || Number.isNaN(amount)) { fail(`${key} must be an amount.`); break; }
-          total += amount;
+          const comp = componentOf.get(componentCode);
+          // The monthly gross is what the person earns; deductions and what the employer pays on top are not part of it.
+          const kind = comp?.isEmployerContribution ? 'EMPLOYER' : comp?.type === 'DEDUCTION' ? 'DEDUCTION' : 'EARNING';
+          if (kind === 'EARNING') gross += amount;
+          else if (kind === 'EMPLOYER') employer += amount;
+          breakdown.push({ name: comp?.name ?? componentCode, amount, kind });
           lines.push({ componentCode, valueType: 'FIXED', fixedAmount: amount, amountBasis: 'MONTHLY', isEnabled: true });
         }
         if (result.message) continue;
+        if (switchedOff.length > 0) { fail(`${switchedOff.join(', ')} ${switchedOff.length === 1 ? 'is' : 'are'} switched off in Salary Components. Switch ${switchedOff.length === 1 ? 'it' : 'them'} on first, or leave the column empty.`); continue; }
         if (unknown.length > 0) { fail(`Unknown salary component: ${unknown.join(', ')}.`); continue; }
-        result.monthlyGross = Math.round(total);
-        result.ctcAnnual = Math.round(total * 12);
+        result.components = breakdown;
+        result.monthlyGross = Math.round(gross);
+        result.ctcAnnual = Math.round((gross + employer) * 12);
       } else {
         if ((annualCtc ?? 0) > 0 && (monthlyGross ?? 0) > 0) { fail('Give either Annual CTC or Monthly gross, not both.'); continue; }
         if (!((annualCtc ?? 0) > 0) && !((monthlyGross ?? 0) > 0)) { fail('Annual CTC or Monthly gross is required (or the salary component amounts).'); continue; }

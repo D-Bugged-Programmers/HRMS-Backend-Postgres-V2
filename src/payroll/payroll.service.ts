@@ -76,6 +76,7 @@ import { HoldPayrollDto } from './dto/hold-payroll.dto';
 import {
   computeStructurePreview,
   employerLinesForStructure,
+  employeeContributionLinesForStructure,
   monthlyFiguresForStructure,
 } from './structure-preview';
 import { StructurePreviewDto } from './dto/structure-preview.dto';
@@ -1765,6 +1766,8 @@ export class PayrollService {
       employeeId: string;
       employerMonthly: number;
       lines: { code: string; name: string; amount: number }[];
+      /** The employee's own PF and ESI (deducted from their pay). */
+      employeeLines: { code: string; name: string; amount: number }[];
     }[]
   > {
     const { settings, components, today } =
@@ -1802,10 +1805,16 @@ export class PayrollService {
         settings,
         rows: current,
       });
+      const employeeLines = employeeContributionLinesForStructure({
+        components: withCityHra(components, cityClass),
+        settings,
+        rows: current,
+      });
       return {
         employeeId: u.id,
         employerMonthly: lines.reduce((s, l) => s + l.amount, 0),
         lines,
+        employeeLines,
       };
     });
   }

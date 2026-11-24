@@ -11,6 +11,7 @@ import {
   CalcType,
   PayFrequency,
   SalaryComponentType,
+  StatutoryKey,
   type EmployeeSalaryComponent,
   type SalaryComponent,
 } from '@prisma/client';
@@ -215,6 +216,23 @@ function evaluateStructure(
     1,
     Math.round,
   );
+  // The employee's own share of PF and ESI, worked out from the same wages (what is deducted from their pay).
+  const employeeComponents = components.filter(
+    (c) =>
+      c.type === SalaryComponentType.DEDUCTION &&
+      (c.statutoryKey === StatutoryKey.PF || c.statutoryKey === StatutoryKey.ESI) &&
+      isComponentApplicable(c, overrides.get(c.code) ?? null, PREVIEW_MONTH, settings),
+  );
+  const employee = resolveGroup(
+    employeeComponents,
+    overrides,
+    { ...afterEarnings, TOTAL_DEDUCTIONS: 0 },
+    1,
+    Math.round,
+  );
+  const employeeLines = employee.results
+    .map((l) => ({ code: l.code, name: l.name, amount: Math.round(l.amount) }))
+    .filter((l) => l.amount > 0);
   const employerLines = employer.results
     .map((l) => ({
       code: l.code,
@@ -230,6 +248,7 @@ function evaluateStructure(
     })),
     gross,
     employerLines,
+    employeeLines,
     employerTotal: employerLines.reduce((s, l) => s + l.amount, 0),
   };
 }
@@ -264,8 +283,25 @@ export function employerLinesForStructure(args: {
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
 }): { code: string; name: string; amount: number }[] {
+  return evaluateSavedStructure(args)?.employerLines ?? [];
+}
+
+/** The employee's own PF and ESI for a saved structure, line by line: what is deducted from their pay each month. */
+export function employeeContributionLinesForStructure(args: {
+  components: SalaryComponent[];
+  settings: OverlaidSettings;
+  rows: SavedStructureRow[];
+}): { code: string; name: string; amount: number }[] {
+  return evaluateSavedStructure(args)?.employeeLines ?? [];
+}
+
+function evaluateSavedStructure(args: {
+  components: SalaryComponent[];
+  settings: OverlaidSettings;
+  rows: SavedStructureRow[];
+}) {
   const components = args.components.filter((c) => c.isActive);
-  if (!args.rows.some((r) => r.isEnabled !== false)) return [];
+  if (!args.rows.some((r) => r.isEnabled !== false)) return null;
   const overrides = new Map<string, EmployeeSalaryComponent>();
   for (const r of args.rows) {
     overrides.set(
@@ -285,7 +321,7 @@ export function employerLinesForStructure(args: {
     args.settings,
     overrides,
     fullMonthBase(args.settings),
-  ).employerLines;
+  );
 }
 
 /**

@@ -279,6 +279,19 @@ describe('salary components: switching off and deleting', () => {
     );
   });
 
+  it('Employer EDLI and the EPF admin charge have their own switch even though they are PF components', async () => {
+    const { service, store } = build([
+      { code: 'EDLI_EMPLOYER', name: 'Employer EDLI Contribution', type: 'EARNING', statutoryKey: 'PF', isEmployerContribution: true },
+      { code: 'EPF_ADMIN_EMPLOYER', name: 'EPF Administration Charges', type: 'EARNING', statutoryKey: 'PF', isEmployerContribution: true },
+    ]);
+    await service.toggle('c1', 'org');
+    expect(store[0].isActive).toBe(false);
+    await service.toggle('c2', 'org');
+    expect(store[1].isActive).toBe(false);
+    await service.toggle('c1', 'org');
+    expect(store[0].isActive).toBe(true);
+  });
+
   it('switching a component back on cannot sneak a loop in', async () => {
     const { service } = build([
       {

@@ -32,6 +32,7 @@ import {
 import { SALARY_COMPONENT_DEFAULTS } from './salary-component-defaults';
 import {
   STATUTORY_GATED_KEYS,
+  INDEPENDENT_STATUTORY_CODES,
   statutoryEnabledToday,
 } from './statutory-activation';
 import { AuditLogService } from '../audit-log/audit-log.service';
@@ -168,7 +169,13 @@ export class SalaryComponentsService {
     return wrapAll(
       data.map((c) =>
         c.statutoryKey && enabledToday.has(c.statutoryKey)
-          ? { ...c, isActive: enabledToday.get(c.statutoryKey) === true }
+          ? {
+              ...c,
+              // EDLI and the EPF admin charge also have their own switch: on only while PF is on AND this one is.
+              isActive:
+                enabledToday.get(c.statutoryKey) === true &&
+                (!INDEPENDENT_STATUTORY_CODES.includes(c.code) || c.isActive),
+            }
           : c,
       ),
     );
@@ -405,7 +412,8 @@ export class SalaryComponentsService {
     // contradict it (and payroll), so the switch there is the only control.
     if (
       existing.statutoryKey &&
-      STATUTORY_GATED_KEYS.includes(existing.statutoryKey)
+      STATUTORY_GATED_KEYS.includes(existing.statutoryKey) &&
+      !INDEPENDENT_STATUTORY_CODES.includes(existing.code)
     ) {
       throw new BadRequestException(
         `${existing.name} is controlled by Statutory Compliance — enable or disable it there.`,

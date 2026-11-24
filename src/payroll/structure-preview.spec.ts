@@ -14,6 +14,8 @@ import { applyStatutoryOverrides } from './statutory-overlay';
 import {
   computeStructurePreview,
   employerMonthlyForStructure,
+  employeeContributionLinesForStructure,
+  employerLinesForStructure,
   monthlyFiguresForStructure,
   type StructureLineToSave,
   type StructurePreviewInput,
@@ -513,5 +515,33 @@ describe('monthlyFiguresForStructure (the regular month, for tax estimates)', ()
         rows: [],
       }),
     ).toEqual({ gross: 0, basic: 0, da: 0, hra: 0, lta: 0 });
+  });
+});
+
+describe('the employee and employer share of PF and ESI for a saved structure', () => {
+  const lines = (input: StructurePreviewInput) => {
+    const p = preview(input);
+    const args = { components: components(), settings: settings(), rows: p.lines };
+    return { employee: employeeContributionLinesForStructure(args), employer: employerLinesForStructure(args) };
+  };
+  it('gives the employee PF and the employer PF from the same wages, line by line', () => {
+    const { employee, employer } = lines({ mode: 'CTC', annualCtc: 1200000, cityClass: 'METRO' });
+    const pf = employee.find((l) => l.code === 'PF');
+    const pfEr = employer.find((l) => l.code === 'PF_EMPLOYER');
+    expect(pf?.amount).toBeGreaterThan(0);
+    // 12% each side by default, so the two shares are the same amount.
+    expect(pf?.amount).toBe(pfEr?.amount);
+  });
+  it('gives ESI on both sides for low pay (employee 0.75%, employer 3.25%) and none above the ceiling', () => {
+    const low = lines({ mode: 'CTC', annualCtc: 220000, cityClass: 'NON_METRO' });
+    const esi = low.employee.find((l) => l.code === 'ESI')?.amount ?? 0;
+    const esiEr = low.employer.find((l) => l.code === 'ESI_EMPLOYER')?.amount ?? 0;
+    expect(esi).toBeGreaterThan(0);
+    expect(esiEr).toBeGreaterThan(esi);
+    const high = lines({ mode: 'CTC', annualCtc: 1200000, cityClass: 'METRO' });
+    expect(high.employee.find((l) => l.code === 'ESI')).toBeUndefined();
+  });
+  it('has nothing for a structure with nothing switched on', () => {
+    expect(employeeContributionLinesForStructure({ components: components(), settings: settings(), rows: [] })).toEqual([]);
   });
 });

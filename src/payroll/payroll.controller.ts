@@ -134,7 +134,14 @@ export class PayrollController {
       caller.id,
     );
     // The total and the lines it is made of (PF, ESI, NPS, ...), so an app can name what the company pays.
-    return { employerMonthly: mine?.employerMonthly ?? 0, lines: mine?.lines ?? [] };
+    // Also the employee's own PF and ESI (deducted from their pay), so their salary structure can show both sides.
+    const employeeLines = mine?.employeeLines ?? [];
+    return {
+      employerMonthly: mine?.employerMonthly ?? 0,
+      lines: mine?.lines ?? [],
+      employeeMonthly: employeeLines.reduce((s, l) => s + l.amount, 0),
+      employeeLines,
+    };
   }
 
   // The checklist before running a month: missing salary structures, bank details, unmarked attendance, joiners and
