@@ -78,6 +78,7 @@ import {
   employerLinesForStructure,
   employeeContributionLinesForStructure,
   monthlyFiguresForStructure,
+  type SavedStructureRow,
 } from './structure-preview';
 import { StructurePreviewDto } from './dto/structure-preview.dto';
 import type { CityClassName } from '../common/hra-cities';
@@ -1817,6 +1818,42 @@ export class PayrollService {
         employeeLines,
       };
     });
+  }
+
+  // The employee's own and the employer's PF / ESI (and the other employer lines) for salary lines about to be saved, so an
+  // upload preview can show them before saving. The work location decides HRA, the same as everywhere else.
+  async contributionLinesForRows(
+    rows: SavedStructureRow[],
+    employee: { workLocationId?: string | null; departmentId?: string | null },
+    organizationId: string,
+    context: Awaited<ReturnType<PayrollService['packageContext']>>,
+  ): Promise<{
+    employeeLines: { code: string; name: string; amount: number }[];
+    employerLines: { code: string; name: string; amount: number }[];
+  }> {
+    let cityClass: CityClassName = 'NON_METRO';
+    if (employee.workLocationId) {
+      const loc = await this.scopedPrisma.workLocation.findFirst({
+        where: { id: employee.workLocationId, organizationId },
+        select: { cityClass: true },
+      });
+      if (loc) cityClass = loc.cityClass;
+    } else if (employee.departmentId) {
+      const dep = await this.scopedPrisma.department.findFirst({
+        where: { id: employee.departmentId, organizationId },
+        select: { workLocation: { select: { cityClass: true } } },
+      });
+      if (dep?.workLocation) cityClass = dep.workLocation.cityClass;
+    }
+    const args = {
+      components: withCityHra(context.components, cityClass),
+      settings: context.settings,
+      rows,
+    };
+    return {
+      employeeLines: employeeContributionLinesForStructure(args),
+      employerLines: employerLinesForStructure(args),
+    };
   }
 
   // "Which regime saves more": the tax for the whole financial year under the Old and the New regime, worked out with the

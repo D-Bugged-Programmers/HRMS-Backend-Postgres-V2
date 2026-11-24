@@ -31,7 +31,7 @@ export interface SalaryUploadRowResult {
   /** Their current monthly gross, for a revision: shown beside the new one so a big jump is seen before saving. */
   currentMonthlyGross: number | null;
   /** For a row that gave an amount per salary component: exactly what will be saved, so the figures can be compared with the sheet. */
-  components?: { name: string; amount: number; kind: 'EARNING' | 'DEDUCTION' | 'EMPLOYER' }[];
+  components?: { name: string; amount: number; kind: 'EARNING' | 'DEDUCTION' | 'EMPLOYER'; /** True when the system worked it out (not typed in the sheet). */ calculated?: boolean }[];
   warnings: string[];
 }
 
@@ -239,6 +239,16 @@ export class SalaryStructureUploadService {
         }
       }
       if (lines.length === 0) { fail('There is nothing to save for this row.'); continue; }
+
+      // Show the employee's own and the employer's PF / ESI too (worked out from what is being saved), so nothing is a surprise later.
+      try {
+        const extra = await this.payroll.contributionLinesForRows(lines, employee, organizationId, context);
+        const shown = new Set((result.components ?? []).map((c) => c.name));
+        const add: NonNullable<SalaryUploadRowResult['components']> = [];
+        for (const l of extra.employeeLines) if (!shown.has(l.name)) add.push({ name: l.name, amount: l.amount, kind: 'DEDUCTION', calculated: true });
+        for (const l of extra.employerLines) if (!shown.has(l.name)) add.push({ name: l.name, amount: l.amount, kind: 'EMPLOYER', calculated: true });
+        if (add.length > 0) result.components = [...(result.components ?? []), ...add];
+      } catch { /* the preview still works without this extra detail */ }
 
       // Look-wrong amounts: a warning on the row, never a block.
       result.warnings.push(...sanityWarnings(annualCtc, monthlyGross));

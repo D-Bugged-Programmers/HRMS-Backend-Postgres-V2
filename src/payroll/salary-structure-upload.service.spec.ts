@@ -13,6 +13,7 @@ function build(components?: object[]) {
   };
   const payroll = {
     structureContext: async () => ({ components: components ?? [{ code: 'BASIC', name: 'Basic Salary', isActive: true }, { code: 'HRA', name: 'House Rent Allowance', isActive: true }], settings: {}, today: '2026-11-23' }),
+    contributionLinesForRows: async () => ({ employeeLines: [{ code: 'PF', name: 'Provident Fund', amount: 1800 }, { code: 'ESI', name: 'ESI', amount: 75 }], employerLines: [{ code: 'PF_EMPLOYER', name: 'Employer PF Contribution', amount: 2400 }, { code: 'ESI_EMPLOYER', name: 'Employer ESI', amount: 325 }] }),
     previewStructure: async (dto: { annualCtc?: number; monthlyGross?: number }) => ({
       lines: [{ componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 1, isEnabled: true }],
       grossMonthly: dto.monthlyGross ?? (dto.annualCtc as number) / 12,
@@ -124,6 +125,8 @@ describe('SalaryStructureUploadService', () => {
         { name: 'Basic Salary', amount: 20000, kind: 'EARNING' },
         { name: 'Provident Fund', amount: 1800, kind: 'DEDUCTION' },
         { name: 'Employer PF Contribution', amount: 2400, kind: 'EMPLOYER' },
+        { name: 'ESI', amount: 75, kind: 'DEDUCTION', calculated: true },
+        { name: 'Employer ESI', amount: 325, kind: 'EMPLOYER', calculated: true },
       ]);
     });
     it('names a switched-off component instead of calling it unknown', async () => {
