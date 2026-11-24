@@ -131,7 +131,7 @@ function wholeHraStep(hraPercent: number): number {
 }
 
 // A month of full attendance with no Labour Welfare Fund instalment - what a package is worked out on.
-function fullMonthBase(settings: OverlaidSettings): Record<string, number> {
+function fullMonthBase(settings: OverlaidSettings, profile?: { state?: string | null; gender?: string | null }): Record<string, number> {
   const attendance = computeAttendanceSummary(
     [],
     [],
@@ -143,11 +143,14 @@ function fullMonthBase(settings: OverlaidSettings): Record<string, number> {
   attendance.presentDays = attendance.totalDaysInMonth;
   attendance.workingDays = attendance.totalDaysInMonth;
   return buildBaseContext(attendance, settings, PREVIEW_MONTH, {
-    state: null,
-    gender: null,
+    state: profile?.state ?? null,
+    gender: profile?.gender ?? null,
     lwfExempt: true,
   });
 }
+
+const pfWageCodesOf = (components: SalaryComponent[]) =>
+  components.filter((c) => (c as { countsTowardsPfWages?: boolean }).countsTowardsPfWages).map((c) => c.code);
 
 // The part of the calculation payroll itself runs for a month with full attendance: the monthly earnings from these
 // overrides, then what the employer pays on top. Shared by the builder (which solves for the amounts) and by the CTC
@@ -190,7 +193,7 @@ function evaluateStructure(
     (afterEarnings.BASIC ?? 0) + (afterEarnings.DA ?? 0);
   Object.assign(
     afterEarnings,
-    deriveStatutoryContext(afterEarnings, settings, false),
+    deriveStatutoryContext(afterEarnings, settings, false, pfWageCodesOf(components)),
   );
   if (settings.pfOnActualWages && settings.pfEnabled) {
     afterEarnings.PF_WAGE_CEILING = Math.max(
@@ -216,11 +219,11 @@ function evaluateStructure(
     1,
     Math.round,
   );
-  // The employee's own share of PF and ESI, worked out from the same wages (what is deducted from their pay).
+  // The employee's own PF, ESI and Professional Tax, worked out from the same wages (what is deducted from their pay).
   const employeeComponents = components.filter(
     (c) =>
       c.type === SalaryComponentType.DEDUCTION &&
-      (c.statutoryKey === StatutoryKey.PF || c.statutoryKey === StatutoryKey.ESI) &&
+      (c.statutoryKey === StatutoryKey.PF || c.statutoryKey === StatutoryKey.ESI || c.statutoryKey === StatutoryKey.PT) &&
       isComponentApplicable(c, overrides.get(c.code) ?? null, PREVIEW_MONTH, settings),
   );
   const employee = resolveGroup(
@@ -291,6 +294,8 @@ export function employeeContributionLinesForStructure(args: {
   components: SalaryComponent[];
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
+  /** Where the employee works and their gender: Professional Tax follows the state's ladder. */
+  profile?: { state?: string | null; gender?: string | null };
 }): { code: string; name: string; amount: number }[] {
   return evaluateSavedStructure(args)?.employeeLines ?? [];
 }
@@ -299,6 +304,7 @@ function evaluateSavedStructure(args: {
   components: SalaryComponent[];
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
+  profile?: { state?: string | null; gender?: string | null };
 }) {
   const components = args.components.filter((c) => c.isActive);
   if (!args.rows.some((r) => r.isEnabled !== false)) return null;
@@ -320,7 +326,7 @@ function evaluateSavedStructure(args: {
     components,
     args.settings,
     overrides,
-    fullMonthBase(args.settings),
+    fullMonthBase(args.settings, args.profile),
   );
 }
 

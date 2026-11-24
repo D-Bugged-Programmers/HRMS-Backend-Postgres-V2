@@ -119,10 +119,15 @@ export function deriveStatutoryContext(
   context: Record<string, number>,
   settings: OverlaidSettings,
   hadEsiThisPeriod: boolean,
+  /** Earnings counted in the PF wages besides Basic and DA (the component's "Counts towards PF wages" switch). */
+  extraPfWageCodes: string[] = [],
 ): Record<string, number> {
   const basicDa = (context.BASIC ?? 0) + (context.DA ?? 0);
+  const extraPf = extraPfWageCodes
+    .filter((c) => c !== 'BASIC' && c !== 'DA')
+    .reduce((s, c) => s + (context[c] ?? 0), 0);
   const pfBase =
-    basicDa + (settings.pfIncludeArrears ? (context.ARREARS ?? 0) : 0);
+    basicDa + extraPf + (settings.pfIncludeArrears ? (context.ARREARS ?? 0) : 0);
   const floor = (context.GROSS_EARNINGS ?? 0) * 0.5;
   const wages = (useRule: boolean, base: number) =>
     useRule ? Math.max(base, floor) : base;

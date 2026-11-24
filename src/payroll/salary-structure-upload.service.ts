@@ -105,7 +105,7 @@ export class SalaryStructureUploadService {
     const employees = codes.length
       ? await this.scopedPrisma.user.findMany({
           where: { organizationId, employeeId: { in: lookupCodes } },
-          select: { id: true, employeeId: true, name: true, isActive: true, joiningDate: true, workLocationId: true, departmentId: true, employeeType: true },
+          select: { id: true, employeeId: true, name: true, isActive: true, joiningDate: true, workLocationId: true, departmentId: true, employeeType: true, gender: true },
         })
       : [];
     const byCode = new Map(employees.map((e) => [e.employeeId.toUpperCase(), e]));

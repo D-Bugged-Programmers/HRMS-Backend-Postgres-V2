@@ -1127,6 +1127,9 @@ export class PayrollService {
               organizationId,
             )
           : false,
+        allComponents
+          .filter((c) => c.countsTowardsPfWages)
+          .map((c) => c.code),
       ),
     );
     // Charge the month's PF wages at each period's own ceiling (see pf-ceiling-split.ts). The blended figure stands in
@@ -1781,9 +1784,10 @@ export class PayrollService {
       },
       select: {
         id: true,
-        workLocation: { select: { cityClass: true } },
+        gender: true,
+        workLocation: { select: { cityClass: true, state: true } },
         department: {
-          select: { workLocation: { select: { cityClass: true } } },
+          select: { workLocation: { select: { cityClass: true, state: true } } },
         },
       },
     });
@@ -1810,6 +1814,7 @@ export class PayrollService {
         components: withCityHra(components, cityClass),
         settings,
         rows: current,
+        profile: { state: effectiveWorkLocation(u)?.state ?? null, gender: u.gender },
       });
       return {
         employeeId: u.id,
@@ -1824,7 +1829,7 @@ export class PayrollService {
   // upload preview can show them before saving. The work location decides HRA, the same as everywhere else.
   async contributionLinesForRows(
     rows: SavedStructureRow[],
-    employee: { workLocationId?: string | null; departmentId?: string | null },
+    employee: { workLocationId?: string | null; departmentId?: string | null; gender?: string | null },
     organizationId: string,
     context: Awaited<ReturnType<PayrollService['packageContext']>>,
   ): Promise<{
@@ -1832,18 +1837,19 @@ export class PayrollService {
     employerLines: { code: string; name: string; amount: number }[];
   }> {
     let cityClass: CityClassName = 'NON_METRO';
+    let state: string | null = null;
     if (employee.workLocationId) {
       const loc = await this.scopedPrisma.workLocation.findFirst({
         where: { id: employee.workLocationId, organizationId },
-        select: { cityClass: true },
+        select: { cityClass: true, state: true },
       });
-      if (loc) cityClass = loc.cityClass;
+      if (loc) { cityClass = loc.cityClass; state = loc.state ?? null; }
     } else if (employee.departmentId) {
       const dep = await this.scopedPrisma.department.findFirst({
         where: { id: employee.departmentId, organizationId },
-        select: { workLocation: { select: { cityClass: true } } },
+        select: { workLocation: { select: { cityClass: true, state: true } } },
       });
-      if (dep?.workLocation) cityClass = dep.workLocation.cityClass;
+      if (dep?.workLocation) { cityClass = dep.workLocation.cityClass; state = dep.workLocation.state ?? null; }
     }
     const args = {
       components: withCityHra(context.components, cityClass),
@@ -1851,7 +1857,7 @@ export class PayrollService {
       rows,
     };
     return {
-      employeeLines: employeeContributionLinesForStructure(args),
+      employeeLines: employeeContributionLinesForStructure({ ...args, profile: { state, gender: employee.gender ?? null } }),
       employerLines: employerLinesForStructure(args),
     };
   }

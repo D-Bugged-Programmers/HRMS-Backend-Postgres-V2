@@ -541,6 +541,26 @@ describe('the employee and employer share of PF and ESI for a saved structure', 
     const high = lines({ mode: 'CTC', annualCtc: 1200000, cityClass: 'METRO' });
     expect(high.employee.find((l) => l.code === 'ESI')).toBeUndefined();
   });
+  it('includes Professional Tax in the employee deductions when PT is on and the pay is in a slab', () => {
+    const ptSettings = applyStatutoryOverrides(defaultSettings({ pfEnabled: true, esiEnabled: true, ptEnabled: true }) as never, {});
+    const p = computeStructurePreview({ input: { mode: 'CTC', annualCtc: 1200000, cityClass: 'METRO' }, components: components(), settings: ptSettings });
+    const emp = employeeContributionLinesForStructure({ components: components(), settings: ptSettings, rows: p.lines });
+    expect(emp.find((l) => l.code === 'PT')?.amount).toBeGreaterThan(0);
+  });
+  it('PF follows an allowance switched on as counting towards PF wages', () => {
+    const rows = [
+      { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 14100, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'HRA', valueType: 'FIXED', fixedAmount: 7050, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'SPECIAL_ALLOWANCE', valueType: 'FIXED', fixedAmount: 7050, amountBasis: 'MONTHLY', isEnabled: true },
+    ];
+    const pfOf = (flag: boolean) => {
+      const comps = (components() as unknown as { code: string }[]).map((c) => (c.code === 'SPECIAL_ALLOWANCE' ? { ...c, countsTowardsPfWages: flag } : c));
+      return employeeContributionLinesForStructure({ components: comps as never, settings: settings(), rows }).find((l) => l.code === 'PF')?.amount ?? 0;
+    };
+    const ceiling = settings().pfWageCeiling;
+    expect(pfOf(false)).toBe(Math.round(Math.min(14100, ceiling) * 0.12));
+    expect(pfOf(true)).toBe(Math.round(Math.min(21150, ceiling) * 0.12));
+  });
   it('has nothing for a structure with nothing switched on', () => {
     expect(employeeContributionLinesForStructure({ components: components(), settings: settings(), rows: [] })).toEqual([]);
   });

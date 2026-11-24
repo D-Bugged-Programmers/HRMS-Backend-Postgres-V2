@@ -1699,6 +1699,8 @@ model SalaryComponent {
   includeInCTC           Boolean       @default(true)
   isEmployerContribution Boolean       @default(false)
   showOnPayslip          Boolean       @default(true)
+  // An earning counted in the PF wages besides Basic and DA (which always count), e.g. an Other Allowance paid to everyone.
+  countsTowardsPfWages   Boolean       @default(false)
   isStatutory            Boolean       @default(false)
   statutoryKey           StatutoryKey?
   payFrequency           PayFrequency  @default(MONTHLY)

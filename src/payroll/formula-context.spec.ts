@@ -303,6 +303,15 @@ describe('deriveStatutoryContext', () => {
     expect(d.GRATUITY_WAGES).toBe(25000);
   });
 
+  it('adds an earning that counts towards PF wages (Basic and DA always count; gratuity and NPS wages are unchanged)', () => {
+    const d = deriveStatutoryContext({ ...ctx, OTHER_ALLOWANCE: 7000, HRA: 9000 }, settings(), false, ['OTHER_ALLOWANCE']);
+    expect(d.PF_WAGES).toBe(32000);
+    expect(d.GRATUITY_WAGES).toBe(25000);
+    expect(d.NPS_WAGES).toBe(25000);
+    // Naming Basic or DA again does not count them twice.
+    expect(deriveStatutoryContext(ctx, settings(), false, ['BASIC', 'DA']).PF_WAGES).toBe(25000);
+  });
+
   it('lifts PF / gratuity wages to 50% of gross only where the module opted in', () => {
     const d = deriveStatutoryContext(
       ctx,
