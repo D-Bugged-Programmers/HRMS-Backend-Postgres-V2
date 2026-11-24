@@ -180,3 +180,30 @@ describe('letter stages', () => {
     ).toBe('HIRING');
   });
 });
+
+describe('letterFlowStatus: letters the company has switched off are never due', () => {
+  const off = (...keys: string[]) => new Set(keys);
+  it('hiring: no offer letter due when the offer letter is switched off', () => {
+    const s = letterFlowStatus(emp(EmploymentStatus.ONBOARDING), issued(), off('offerLetter'));
+    expect(s.text).toBe('Appointment letter due');
+    expect(s.due).toBe(true);
+  });
+  it('hiring: nothing due when both are switched off', () => {
+    const s = letterFlowStatus(emp(EmploymentStatus.ONBOARDING), issued(), off('offerLetter', 'appointmentLetter'));
+    expect(s.due).toBe(false);
+    expect(s.text).toMatch(/switched off/);
+  });
+  it('hiring: an offer letter still due when only the appointment letter is off', () => {
+    const s = letterFlowStatus(emp(EmploymentStatus.ONBOARDING), issued(), off('appointmentLetter'));
+    expect(s).toMatchObject({ text: 'Offer letter due', due: true });
+  });
+  it('probation and exit follow the same rule', () => {
+    expect(letterFlowStatus(emp(EmploymentStatus.PROBATION), issued(), off('confirmationLetter')).text).toBe('On probation');
+    const exit = letterFlowStatus(emp(EmploymentStatus.RELEASED, false), issued(), off('relievingLetter'));
+    expect(exit.text).toBe('Experience certificate due');
+    expect(letterFlowStatus(emp(EmploymentStatus.RELEASED, false), issued(), off('relievingLetter', 'experienceCertificate')).due).toBe(false);
+  });
+  it('with nothing switched off it behaves exactly as before', () => {
+    expect(letterFlowStatus(emp(EmploymentStatus.ONBOARDING), issued())).toMatchObject({ text: 'Offer letter due', due: true });
+  });
+});

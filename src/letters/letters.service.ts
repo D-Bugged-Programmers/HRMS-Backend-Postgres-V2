@@ -263,7 +263,7 @@ export class LettersService {
   async overview(
     organizationId: string,
   ): Promise<Record<string, LetterFlowStatus & { approval: { awaiting: number; approved: number; declined: number } }>> {
-    const [people, issuedRows, issueRecords, grants] = await Promise.all([
+    const [people, issuedRows, issueRecords, grants, templates] = await Promise.all([
       this.scopedPrisma.user.findMany({
         where: { organizationId },
         select: { id: true, employmentStatus: true, isActive: true },
@@ -283,7 +283,12 @@ export class LettersService {
         select: { employeeId: true, key: true, approvedAt: true, declinedAt: true, supersededAt: true },
       }),
       this.scopedPrisma.employeeLetterAccess.findMany({ where: { organizationId, enabled: true }, select: { employeeId: true, key: true } }),
+      this.scopedPrisma.letterTemplate.findMany({ where: { organizationId }, select: { key: true, isActive: true } }),
     ]);
+    // Letters the company has switched off (every template of that letter is inactive) are never shown as due.
+    const everKeys = new Set(templates.map((t) => baseKeyOf(t.key)));
+    const activeKeys = new Set(templates.filter((t) => t.isActive).map((t) => baseKeyOf(t.key)));
+    const switchedOff = new Set([...everKeys].filter((k) => !activeKeys.has(k)));
     // Where each person's letters stand with their own approval: waiting for their signature (switched on, not yet answered),
     // approved and signed, or declined. A replaced letter is not counted.
     const visible = new Set(grants.map((g) => `${g.employeeId}|${g.key}`));
@@ -311,7 +316,7 @@ export class LettersService {
       people.map((p) => [
         p.id,
         {
-          ...letterFlowStatus(p, byPerson.get(p.id) ?? new Map<string, IssuedLetter>()),
+          ...letterFlowStatus(p, byPerson.get(p.id) ?? new Map<string, IssuedLetter>(), switchedOff),
           approval: approvalOf.get(p.id) ?? { awaiting: 0, approved: 0, declined: 0 },
         },
       ]),

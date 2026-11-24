@@ -56,6 +56,7 @@ import {
   AttendanceStatus,
   PayrollRunStatus,
   Role,
+  AttendanceMethod,
   SelfieRequirement,
   User,
 } from '@prisma/client';
@@ -115,6 +116,22 @@ const addDaysStr = (dateStr: string, days: number): string => {
 // below — this resolves either form case-insensitively.
 // Bulk import's optional "Selfie at Punch" column (blank = follow the org
 // setting). Accepts the label or the raw enum value.
+// What a sheet may say for "How attendance is marked" (blank = the company setting).
+export const ATTENDANCE_METHOD_LABELS = new Map<string, AttendanceMethod>([
+  ['company setting', AttendanceMethod.DEFAULT],
+  ['use company setting', AttendanceMethod.DEFAULT],
+  ['default', AttendanceMethod.DEFAULT],
+  ['mobile', AttendanceMethod.MOBILE],
+  ['mobile app', AttendanceMethod.MOBILE],
+  ['app', AttendanceMethod.MOBILE],
+  ['biometric', AttendanceMethod.BIOMETRIC],
+  ['biometric device', AttendanceMethod.BIOMETRIC],
+  ['device', AttendanceMethod.BIOMETRIC],
+  ['both', AttendanceMethod.BOTH],
+  ['either', AttendanceMethod.BOTH],
+  ['mobile app or biometric device', AttendanceMethod.BOTH],
+  ['mobile and biometric', AttendanceMethod.BOTH],
+]);
 const SELFIE_LABELS = new Map<string, SelfieRequirement>([
   ['company setting', SelfieRequirement.DEFAULT],
   ['use company setting', SelfieRequirement.DEFAULT],
@@ -652,6 +669,7 @@ export class EmployeesService {
       gender?: unknown;
       joiningDate?: unknown;
       selfieAtPunch?: unknown;
+      attendanceMethod?: unknown;
       personalEmail?: unknown;
       department?: unknown;
       employeeCategory?: unknown;
@@ -844,6 +862,17 @@ export class EmployeesService {
         });
         return;
       }
+      const attendanceInput = asString(row.attendanceMethod).trim();
+      const attendanceMethod = attendanceInput
+        ? ATTENDANCE_METHOD_LABELS.get(attendanceInput.toLowerCase())
+        : AttendanceMethod.DEFAULT;
+      if (!attendanceMethod) {
+        failed.push({
+          row,
+          error: `Attendance method "${attendanceInput}" is not valid. Use one of: Company setting, Mobile app, Biometric device, Both (or leave blank).`,
+        });
+        return;
+      }
       // Mirrors the manual "Add Employee" form, which requires these same
       // five fields — personalEmail is also what makes the welcome email
       // actually go out for bulk-imported rows (it was previously never
@@ -1022,6 +1051,7 @@ export class EmployeesService {
         joiningDate: joiningDate || undefined,
         ...(reportingManagerId ? { reportingManagerId } : {}),
         selfieRequirement,
+        attendanceMethod,
         role,
         employeeType: employeeType?.value ?? 'permanent',
         ...(wantsTracking(liveTrackingInput) ? { fieldTrackingEnabled: true } : {}),

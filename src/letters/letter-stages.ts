@@ -141,12 +141,14 @@ export interface LetterFlowStatus {
 
 /**
  * What to tell HR about a person's letters, from their stage and what has been issued so far (`issued` is keyed by letter key
- * and holds the most recent issue of each).
+ * and holds the most recent issue of each). `switchedOff` holds the letters the company has switched off: those are never "due".
  */
 export function letterFlowStatus(
   employee: { employmentStatus: EmploymentStatus; isActive: boolean },
   issued: Map<string, IssuedLetter>,
+  switchedOff: ReadonlySet<string> = new Set(),
 ): LetterFlowStatus {
+  const on = (key: string) => !switchedOff.has(key);
   const stage = currentLetterStage(employee);
   let latest: IssuedLetter | null = null;
   for (const l of issued.values()) if (!latest || l.at > latest.at) latest = l;
@@ -158,12 +160,14 @@ export function letterFlowStatus(
   });
 
   if (stage === 'HIRING') {
-    if (!issued.has('offerLetter')) return out('Offer letter due', true);
-    if (!issued.has('appointmentLetter'))
-      return out('Offer issued, appointment letter due', true);
+    if (!on('offerLetter') && !on('appointmentLetter')) return out('Offer and appointment letters are switched off');
+    if (on('offerLetter') && !issued.has('offerLetter')) return out('Offer letter due', true);
+    if (on('appointmentLetter') && !issued.has('appointmentLetter'))
+      return out(on('offerLetter') ? 'Offer issued, appointment letter due' : 'Appointment letter due', true);
     return out('Hiring letters issued');
   }
   if (stage === 'PROBATION') {
+    if (!on('confirmationLetter')) return out('On probation');
     return issued.has('confirmationLetter')
       ? out('Confirmation letter issued')
       : out('Awaiting confirmation letter');
@@ -172,9 +176,10 @@ export function letterFlowStatus(
     // Still working out the notice: the relieving letter and certificates come with the last day, so nothing is overdue yet.
     if (employee.isActive && !FINAL_EXIT.includes(employee.employmentStatus))
       return out('Serving notice, exit letters at relieving');
-    if (!issued.has('relievingLetter'))
+    if (!on('relievingLetter') && !on('experienceCertificate')) return out('Relieving letter and experience certificate are switched off');
+    if (on('relievingLetter') && !issued.has('relievingLetter'))
       return out('Relieving letter due', true);
-    if (!issued.has('experienceCertificate'))
+    if (on('experienceCertificate') && !issued.has('experienceCertificate'))
       return out('Experience certificate due', true);
     return out('Exit letters issued');
   }

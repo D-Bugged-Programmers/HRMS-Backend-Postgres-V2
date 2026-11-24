@@ -49,6 +49,11 @@ class BulkEmployeeRowDto {
   @IsOptional()
   selfieAtPunch?: unknown;
 
+  // Optional: Company setting / Mobile app / Biometric device / Both (blank = company setting).
+  @ApiPropertyOptional()
+  @IsOptional()
+  attendanceMethod?: unknown;
+
   // Matches the manual "Add Employee" form's own required fields — see
   // EmployeesService.bulkCreate's row-by-row validation, which requires
   // these the same way the form does (department/employeeCategory/
