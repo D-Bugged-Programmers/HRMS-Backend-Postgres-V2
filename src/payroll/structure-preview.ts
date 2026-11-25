@@ -17,7 +17,7 @@ import {
 } from '@prisma/client';
 import { BadRequestException } from '@nestjs/common';
 import { defaultHraPercent, type CityClassName } from '../common/hra-cities';
-import { buildBaseContext, deriveStatutoryContext } from './formula-context';
+import { buildBaseContext, deriveStatutoryContext, esiWagesOf, isEsiExcludedEarning } from './formula-context';
 import { computeAttendanceSummary } from './attendance-summary';
 import { isComponentApplicable, resolveGroup } from './resolve-group';
 import type { OverlaidSettings } from './statutory-overlay';
@@ -189,9 +189,13 @@ function evaluateStructure(
   }
   afterEarnings.GROSS_EARNINGS = gross;
   const esiExcluded = new Set(
-    components.filter((c) => (c as { excludedFromEsiWages?: boolean }).excludedFromEsiWages).map((c) => c.code),
+    components.filter((c) => isEsiExcludedEarning(c)).map((c) => c.code),
   );
-  const esiWages = gross - earned.results.filter((l) => esiExcluded.has(l.code)).reduce((s, l) => s + Math.round(l.amount), 0);
+  const esiWages = esiWagesOf(
+    gross,
+    earned.results.filter((l) => esiExcluded.has(l.code)).reduce((s, l) => s + Math.round(l.amount), 0),
+    settings.esiUseWagesRule,
+  );
   afterEarnings.ESI_WAGES = esiWages;
   afterEarnings.FULL_MONTH_ESI_WAGES = esiWages;
   afterEarnings.FULL_MONTH_BASIC_DA =

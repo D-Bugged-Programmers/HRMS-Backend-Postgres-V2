@@ -42,6 +42,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
   {
     name: 'House Rent Allowance',
     code: 'HRA',
+    // Left out of the ESI wages (only Basic, DA and a retaining allowance always count); switch it off on the component to count it.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.PERCENTAGE,
     percentageOf: 'BASIC',
@@ -59,6 +61,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
   {
     name: 'Fixed Allowance',
     code: 'SPECIAL_ALLOWANCE',
+    // Left out of the ESI wages (only Basic, DA and a retaining allowance always count); switch it off on the component to count it.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FIXED,
     displayOrder: 4,
@@ -66,15 +70,17 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
   {
     name: 'Conveyance Allowance',
     code: 'CONVEYANCE',
+    // Left out of the ESI wages (only Basic, DA and a retaining allowance always count); switch it off on the component to count it.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FIXED,
-    // A travelling allowance: the ESI Act leaves it out of ESI wages.
-    excludedFromEsiWages: true,
     displayOrder: 5,
   },
   {
     name: 'Medical Allowance',
     code: 'MEDICAL_ALLOWANCE',
+    // Left out of the ESI wages (only Basic, DA and a retaining allowance always count); switch it off on the component to count it.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FIXED,
     displayOrder: 6,
@@ -82,6 +88,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
   {
     name: 'Incentive',
     code: 'INCENTIVE',
+    // Left out of the ESI wages (only Basic, DA and a retaining allowance always count); switch it off on the component to count it.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FIXED,
     displayOrder: 7,
@@ -89,6 +97,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
   {
     name: 'Commission',
     code: 'COMMISSION',
+    // Left out of the ESI wages (only Basic, DA and a retaining allowance always count); switch it off on the component to count it.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FIXED,
     displayOrder: 8,

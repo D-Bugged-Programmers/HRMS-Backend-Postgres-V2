@@ -4,6 +4,7 @@ import {
   buildBaseContext,
   deriveStatutoryContext,
   hasDisability,
+  esiWagesOf,
   resolvePtSlabs,
   splitEmployerPf,
 } from './formula-context';
@@ -363,6 +364,20 @@ describe('deriveStatutoryContext', () => {
     expect(deriveStatutoryContext(ctx, settings({}), false).ESI_EMPLOYEE_RATE).toBeUndefined();
     expect(deriveStatutoryContext(ctx, settings({ esiDailyWageExemption: 200 }), false).ESI_EMPLOYEE_RATE).toBe(0);
     expect(deriveStatutoryContext({ ...ctx, GROSS_EARNINGS: 5280, ESI_WAGES: 5280 }, settings({}), false).ESI_EMPLOYEE_RATE).toBe(0);
+  });
+
+  it('esiWagesOf: left-out earnings count only up to 50% of pay when the rule is on', () => {
+    expect(esiWagesOf(25500, 12750, true)).toBe(12750); // exactly half left out
+    expect(esiWagesOf(25500, 17000, true)).toBe(12750); // more than half left out: the rest is added back
+    expect(esiWagesOf(25500, 17000, false)).toBe(8500); // rule off: all of it is left out
+    expect(esiWagesOf(20000, 1600, true)).toBe(18400);
+  });
+
+  it('the disability ceiling follows the configured amount (default Rs 25,000)', () => {
+    const base = { GROSS_EARNINGS: 27000 };
+    expect(deriveStatutoryContext(base, settings({}), false, [], true).ESI_APPLICABLE).toBe(0);
+    expect(deriveStatutoryContext(base, settings({ esiDisabledWageCeiling: 30000 }), false, [], true).ESI_APPLICABLE).toBe(1);
+    expect(deriveStatutoryContext(base, settings({ esiDisabledWageCeiling: 30000 }), false, [], false).ESI_APPLICABLE).toBe(0);
   });
 
   it('overtime does not count when checking the ESI ceiling, when no full-month figure is given', () => {

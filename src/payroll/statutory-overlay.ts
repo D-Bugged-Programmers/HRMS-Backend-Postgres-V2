@@ -66,6 +66,10 @@ export interface OverlaidSettings {
   esiWageCeiling: number;
   /** ESI: an average daily wage up to this pays no employee share (the employer still pays). Unset = Rs 176. */
   esiDailyWageExemption?: number;
+  /** ESI wage ceiling for a person with a disability. Unset = Rs 25,000. */
+  esiDisabledWageCeiling?: number;
+  /** Labour Codes: the allowances left out of the ESI wages count only up to 50% of total pay; the rest is added back. */
+  esiUseWagesRule?: boolean;
   ptSlabs: PtSlab[];
   // Women's ladder for the org-wide default (undefined = women follow ptSlabs).
   ptWomenSlabs?: PtSlab[];
@@ -195,7 +199,12 @@ export function applyStatutoryOverrides(
       employerRate: number;
       wageCeiling: number;
       dailyWageExemption?: number;
+      disabledWageCeiling?: number;
+      applyFiftyPercentRule?: boolean;
     };
+    resolved.esiDisabledWageCeiling =
+      typeof c.disabledWageCeiling === 'number' ? c.disabledWageCeiling : undefined;
+    resolved.esiUseWagesRule = c.applyFiftyPercentRule === true;
     resolved.esiDailyWageExemption =
       typeof c.dailyWageExemption === 'number' ? c.dailyWageExemption : undefined;
     resolved.esiEmployeeRate = c.employeeRate;

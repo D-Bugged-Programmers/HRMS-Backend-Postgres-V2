@@ -586,6 +586,36 @@ describe('the employee and employer share of PF and ESI for a saved structure', 
     expect(esiOf(false)).toBe(0); // gross 21,500 is above the ceiling
     expect(esiOf(true)).toBe(Math.ceil((20000 * 0.75) / 100)); // 20,000 counts: 150
   });
+  it('a bonus saved as a monthly line is left out of the ESI wages', () => {
+    const rows = [
+      { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 14000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'HRA', valueType: 'FIXED', fixedAmount: 5000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'BONUS', valueType: 'FIXED', fixedAmount: 3000, amountBasis: 'MONTHLY', isEnabled: true },
+    ];
+    const esi = employeeContributionLinesForStructure({ components: components(), settings: settings(), rows }).find((l) => l.code === 'ESI')?.amount ?? 0;
+    expect(esi).toBe(Math.ceil((19000 * 0.75) / 100)); // 19,000 counts, the 3,000 bonus does not (gross 22,000 would be over the limit)
+  });
+  it('HRA is left out of the ESI wages by default', () => {
+    const rows = [
+      { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 14000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'HRA', valueType: 'FIXED', fixedAmount: 8000, amountBasis: 'MONTHLY', isEnabled: true },
+    ];
+    const comps = (components() as unknown as { code: string }[]).map((c) => (c.code === 'HRA' ? { ...c, excludedFromEsiWages: true } : c));
+    const esi = employeeContributionLinesForStructure({ components: comps as never, settings: settings(), rows }).find((l) => l.code === 'ESI')?.amount ?? 0;
+    expect(esi).toBe(Math.ceil((14000 * 0.75) / 100)); // gross 22,000 is over the limit, but ESI wages are 14,000
+  });
+  it('the 50% rule adds back what is left out of the ESI wages beyond half of the pay', () => {
+    const rows = [
+      { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 10000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'HRA', valueType: 'FIXED', fixedAmount: 7000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'SPECIAL_ALLOWANCE', valueType: 'FIXED', fixedAmount: 6000, amountBasis: 'MONTHLY', isEnabled: true },
+    ];
+    const comps = (components() as unknown as { code: string }[]).map((c) => (c.code === 'HRA' || c.code === 'SPECIAL_ALLOWANCE' ? { ...c, excludedFromEsiWages: true } : c));
+    const esiOf = (useRule: boolean) =>
+      employeeContributionLinesForStructure({ components: comps as never, settings: { ...settings(), esiUseWagesRule: useRule }, rows }).find((l) => l.code === 'ESI')?.amount ?? 0;
+    expect(esiOf(false)).toBe(Math.ceil((10000 * 0.75) / 100)); // 75: only Basic counts
+    expect(esiOf(true)).toBe(Math.ceil((11500 * 0.75) / 100)); // 87: wages lifted to 50% of the 23,000 pay
+  });
   it('has nothing for a structure with nothing switched on', () => {
     expect(employeeContributionLinesForStructure({ components: components(), settings: settings(), rows: [] })).toEqual([]);
   });

@@ -145,6 +145,8 @@ import {
   buildBaseContext,
   deriveStatutoryContext,
   hasDisability,
+  isEsiExcludedEarning,
+  esiWagesOf,
   splitEmployerPf,
   ageOnDate,
   EPS_PENSION_AGE,
@@ -1084,21 +1086,17 @@ export class PayrollService {
       if (line.component) afterEarnings[line.code] = line.amount;
     }
     afterEarnings.GROSS_EARNINGS = grossSalary;
-    // ESIC wages exclude non-monthly pay (annual bonus, variable payouts).
-    afterEarnings.ESI_WAGES = Math.max(
-      0,
-      grossSalary -
-        earningsLines
-          .filter(
-            (l) =>
-              l.component &&
-              // The bonus is a periodic payment whichever pay frequency it was seeded/configured with.
-              (l.component.payFrequency !== PayFrequency.MONTHLY ||
-                l.code === 'BONUS' ||
-                // Allowances the ESI Act leaves out of ESI wages (e.g. Conveyance).
-                (l.component as { excludedFromEsiWages?: boolean }).excludedFromEsiWages === true),
-          )
-          .reduce((s, l) => s + l.amount, 0),
+    // ESIC wages exclude non-monthly pay (annual bonus, variable payouts) and the earnings switched off for ESI (bonus,
+    // HRA, conveyance, ...), which count only up to 50% of pay when the Labour Codes rule is on.
+    const monthlyLines = earningsLines.filter(
+      (l) => l.component && l.component.payFrequency === PayFrequency.MONTHLY,
+    );
+    afterEarnings.ESI_WAGES = esiWagesOf(
+      monthlyLines.reduce((s, l) => s + l.amount, 0),
+      monthlyLines
+        .filter((l) => isEsiExcludedEarning(l.component!))
+        .reduce((s, l) => s + l.amount, 0),
+      settings.esiUseWagesRule,
     );
     // What the structure pays for a FULL month (no LOP/joining proration): ESI coverage and bonus eligibility are
     // judged on this rate, not on a part month's earnings.
@@ -1109,9 +1107,13 @@ export class PayrollService {
       roundAmount,
     );
     if (fullMonthLines) {
-      afterEarnings.FULL_MONTH_ESI_WAGES = fullMonthLines
-        .filter((l) => !(l.component as { excludedFromEsiWages?: boolean } | undefined)?.excludedFromEsiWages)
-        .reduce((sum, l) => sum + l.amount, 0);
+      afterEarnings.FULL_MONTH_ESI_WAGES = esiWagesOf(
+        fullMonthLines.reduce((sum, l) => sum + l.amount, 0),
+        fullMonthLines
+          .filter((l) => l.component && isEsiExcludedEarning(l.component))
+          .reduce((sum, l) => sum + l.amount, 0),
+        settings.esiUseWagesRule,
+      );
       afterEarnings.FULL_MONTH_BASIC_DA = fullMonthLines
         .filter((l) => l.code === 'BASIC' || l.code === 'DA')
         .reduce((sum, l) => sum + l.amount, 0);

@@ -115,6 +115,27 @@ export function resolvePtSlabs(
 // PF_WAGES / GRATUITY_WAGES are Basic + DA, lifted to 50% of gross where the org has switched the Labour Codes
 // "50% wages" rule on for that module. ESI_WAGES (set by the caller) is gross minus non-monthly pay (bonus/variable), which ESIC excludes. ESI_APPLICABLE keeps an employee covered for the rest of an ESI
 // contribution period (Apr-Sep / Oct-Mar) once they were covered, even if wages cross the ceiling mid-period.
+/**
+ * An earning the ESI wages leave out: one switched on as "Excluded from ESI wages" (Conveyance by default), and any bonus
+ * (the statutory Bonus component or anything marked as the bonus), which is a periodic payment, not regular monthly wages.
+ */
+export function isEsiExcludedEarning(c: {
+  code: string;
+  statutoryKey?: unknown;
+  excludedFromEsiWages?: boolean | null;
+}): boolean {
+  return c.excludedFromEsiWages === true || c.code === 'BONUS' || c.statutoryKey === 'BONUS';
+}
+
+/**
+ * The wages ESI is charged on: the monthly pay less the earnings left out of it. With the Labour Codes 50% rule on, the
+ * left-out part counts only up to 50% of the pay, so the wages never fall below half of it.
+ */
+export function esiWagesOf(base: number, excluded: number, useRule: boolean | undefined): number {
+  const wages = Math.max(0, base - excluded);
+  return Math.round(useRule ? Math.max(wages, base * 0.5) : wages);
+}
+
 /** ESI wage ceiling for a person with a disability (the general ceiling is a setting). */
 export const ESI_DISABLED_WAGE_CEILING = 25000;
 
@@ -134,7 +155,7 @@ export function deriveStatutoryContext(
   disabledPerson = false,
 ): Record<string, number> {
   const esiCeiling = disabledPerson
-    ? Math.max(settings.esiWageCeiling, ESI_DISABLED_WAGE_CEILING)
+    ? Math.max(settings.esiWageCeiling, settings.esiDisabledWageCeiling ?? ESI_DISABLED_WAGE_CEILING)
     : settings.esiWageCeiling;
   const basicDa = (context.BASIC ?? 0) + (context.DA ?? 0);
   const extraPf = extraPfWageCodes
