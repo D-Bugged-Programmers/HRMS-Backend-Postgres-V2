@@ -90,7 +90,7 @@ export const EMAIL_PREHEADERS: Record<string, string> = {
   LOGIN_CREDENTIALS_RESENT: 'Your login details are inside.',
   FOUNDER_ACCOUNT_WELCOME: 'Your organization is set up and ready to go.',
   PASSWORD_RESET:
-    'Use the secure link inside to reset your password. It expires in 30 minutes.',
+    'Use the secure link inside to reset your password. It expires in 15 minutes.',
   ACCOUNT_ACTIVATED: 'Your account is now active.',
   SETUP_COMPLETE:
     'Setup for {{companyName}} is complete — the HRMS is ready to use.',
@@ -620,7 +620,7 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
       blocks: [
         hello,
         paragraph(
-          'Click the button below to reset your password. This link expires in 30 minutes.',
+          'Click the button below to reset your password. This link expires in 15 minutes.',
         ),
         button('{{resetUrl}}', 'Reset password'),
         `<p style="margin:0 0 6px;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:12px;line-height:18px;color:#586074;">If the button doesn't work, copy and paste this link into your browser:</p>` +

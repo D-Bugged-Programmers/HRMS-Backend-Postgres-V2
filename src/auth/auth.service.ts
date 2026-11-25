@@ -77,8 +77,8 @@ import { resolveLocationMode } from '../common/location-requirement';
 import { resolveAttendanceMethod } from '../common/attendance-method';
 
 const SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS ?? 10);
-// 30 minutes — matches the original release's window exactly.
-const RESET_TOKEN_TTL_MS = 30 * 60 * 1000;
+// 15 minutes. Keep the "expires in 15 minutes" wording in the password reset email (email-template-defaults.ts) in step.
+const RESET_TOKEN_TTL_MS = 15 * 60 * 1000;
 const EMAIL_VERIFICATION_TTL_MS = 48 * 60 * 60 * 1000;
 // On unless REQUIRE_EMAIL_VERIFICATION=false (the e2e environment, which registers and signs in within one run).
 const emailVerificationRequired = () =>
@@ -910,7 +910,7 @@ export class AuthService {
         select: { companyName: true },
       });
       const companyName = org?.companyName || 'the company';
-      const fallbackHtml = `<p>Hello ${escapeHtml(user.name)},</p><p>Click the link below to reset your password. This link expires in 30 minutes.</p><p><a href="${resetUrl}">${resetUrl}</a></p>`;
+      const fallbackHtml = `<p>Hello ${escapeHtml(user.name)},</p><p>Click the link below to reset your password. This link expires in 15 minutes.</p><p><a href="${resetUrl}">${resetUrl}</a></p>`;
       const rendered = await this.emailTemplatesService.renderOccasion(
         user.organizationId,
         'PASSWORD_RESET',
