@@ -1701,6 +1701,8 @@ model SalaryComponent {
   showOnPayslip          Boolean       @default(true)
   // An earning counted in the PF wages besides Basic and DA (which always count), e.g. an Other Allowance paid to everyone.
   countsTowardsPfWages   Boolean       @default(false)
+  // An earning left out of the ESI wages (e.g. Conveyance, a travelling allowance the ESI Act excludes).
+  excludedFromEsiWages   Boolean       @default(false)
   isStatutory            Boolean       @default(false)
   statutoryKey           StatutoryKey?
   payFrequency           PayFrequency  @default(MONTHLY)

@@ -188,8 +188,12 @@ function evaluateStructure(
     afterEarnings[line.code] = Math.round(line.amount);
   }
   afterEarnings.GROSS_EARNINGS = gross;
-  afterEarnings.ESI_WAGES = gross;
-  afterEarnings.FULL_MONTH_ESI_WAGES = gross;
+  const esiExcluded = new Set(
+    components.filter((c) => (c as { excludedFromEsiWages?: boolean }).excludedFromEsiWages).map((c) => c.code),
+  );
+  const esiWages = gross - earned.results.filter((l) => esiExcluded.has(l.code)).reduce((s, l) => s + Math.round(l.amount), 0);
+  afterEarnings.ESI_WAGES = esiWages;
+  afterEarnings.FULL_MONTH_ESI_WAGES = esiWages;
   afterEarnings.FULL_MONTH_BASIC_DA =
     (afterEarnings.BASIC ?? 0) + (afterEarnings.DA ?? 0);
   Object.assign(

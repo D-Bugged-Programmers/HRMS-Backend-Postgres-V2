@@ -100,6 +100,11 @@ export class CreateSalaryComponentDto {
   @ApiPropertyOptional({ default: false })
   @IsOptional()
   @IsBoolean()
+  excludedFromEsiWages?: boolean;
+
+  @ApiPropertyOptional({ default: false })
+  @IsOptional()
+  @IsBoolean()
   isStatutory?: boolean;
 
   @ApiPropertyOptional({ enum: StatutoryKey })

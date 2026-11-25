@@ -1094,7 +1094,9 @@ export class PayrollService {
               l.component &&
               // The bonus is a periodic payment whichever pay frequency it was seeded/configured with.
               (l.component.payFrequency !== PayFrequency.MONTHLY ||
-                l.code === 'BONUS'),
+                l.code === 'BONUS' ||
+                // Allowances the ESI Act leaves out of ESI wages (e.g. Conveyance).
+                (l.component as { excludedFromEsiWages?: boolean }).excludedFromEsiWages === true),
           )
           .reduce((s, l) => s + l.amount, 0),
     );
@@ -1107,10 +1109,9 @@ export class PayrollService {
       roundAmount,
     );
     if (fullMonthLines) {
-      afterEarnings.FULL_MONTH_ESI_WAGES = fullMonthLines.reduce(
-        (sum, l) => sum + l.amount,
-        0,
-      );
+      afterEarnings.FULL_MONTH_ESI_WAGES = fullMonthLines
+        .filter((l) => !(l.component as { excludedFromEsiWages?: boolean } | undefined)?.excludedFromEsiWages)
+        .reduce((sum, l) => sum + l.amount, 0);
       afterEarnings.FULL_MONTH_BASIC_DA = fullMonthLines
         .filter((l) => l.code === 'BASIC' || l.code === 'DA')
         .reduce((sum, l) => sum + l.amount, 0);

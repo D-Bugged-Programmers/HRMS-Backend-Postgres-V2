@@ -572,6 +572,19 @@ describe('the employee and employer share of PF and ESI for a saved structure', 
     expect(lines.find((l) => l.code === 'PF')?.amount).toBe(Math.round(Math.min(10000, settings().pfWageCeiling) * 0.12));
     expect(lines.find((l) => l.code === 'ESI')?.amount).toBe(529);
   });
+  it('an allowance marked as excluded from ESI wages is left out of the ESI wages and the ceiling check', () => {
+    const rows = [
+      { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 14000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'HRA', valueType: 'FIXED', fixedAmount: 6000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'SPECIAL_ALLOWANCE', valueType: 'FIXED', fixedAmount: 1500, amountBasis: 'MONTHLY', isEnabled: true },
+    ];
+    const esiOf = (excluded: boolean) => {
+      const comps = (components() as unknown as { code: string }[]).map((c) => (c.code === 'SPECIAL_ALLOWANCE' ? { ...c, excludedFromEsiWages: excluded } : c));
+      return employeeContributionLinesForStructure({ components: comps as never, settings: settings(), rows }).find((l) => l.code === 'ESI')?.amount ?? 0;
+    };
+    expect(esiOf(false)).toBe(0); // gross 21,500 is above the ceiling
+    expect(esiOf(true)).toBe(Math.ceil((20000 * 0.75) / 100)); // 20,000 counts: 150
+  });
   it('has nothing for a structure with nothing switched on', () => {
     expect(employeeContributionLinesForStructure({ components: components(), settings: settings(), rows: [] })).toEqual([]);
   });

@@ -137,6 +137,7 @@ export class SalaryComponentsService {
         isEmployerContribution: dto.isEmployerContribution ?? false,
         showOnPayslip: dto.showOnPayslip ?? true,
         countsTowardsPfWages: dto.countsTowardsPfWages ?? false,
+        excludedFromEsiWages: dto.excludedFromEsiWages ?? false,
         isStatutory: dto.isStatutory ?? false,
         statutoryKey: dto.statutoryKey,
         payFrequency: dto.payFrequency ?? 'MONTHLY',
@@ -362,6 +363,9 @@ export class SalaryComponentsService {
         }),
         ...(dto.countsTowardsPfWages !== undefined && {
           countsTowardsPfWages: dto.countsTowardsPfWages,
+        }),
+        ...(dto.excludedFromEsiWages !== undefined && {
+          excludedFromEsiWages: dto.excludedFromEsiWages,
         }),
         ...(dto.isStatutory !== undefined && { isStatutory: dto.isStatutory }),
         ...(dto.statutoryKey !== undefined && {

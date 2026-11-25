@@ -27,6 +27,7 @@ export interface SalaryComponentDefault {
   includeInGross?: boolean;
   includeInNet?: boolean;
   showOnPayslip?: boolean;
+  excludedFromEsiWages?: boolean;
 }
 
 export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
@@ -67,6 +68,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
     code: 'CONVEYANCE',
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FIXED,
+    // A travelling allowance: the ESI Act leaves it out of ESI wages.
+    excludedFromEsiWages: true,
     displayOrder: 5,
   },
   {
@@ -243,7 +246,7 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FORMULA,
     formula:
-      'IF(ESI_APPLICABLE == 1, ROUND(ESI_WAGES * ESI_EMPLOYER_RATE / 100, 0), 0)',
+      'IF(ESI_APPLICABLE == 1, CEIL(ESI_WAGES * ESI_EMPLOYER_RATE / 100), 0)',
     isStatutory: true,
     statutoryKey: StatutoryKey.ESI,
     isEmployerContribution: true,
