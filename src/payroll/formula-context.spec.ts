@@ -358,6 +358,13 @@ describe('deriveStatutoryContext', () => {
     expect(hasDisability(null)).toBe(false);
   });
 
+  it('the low-wage ESI exemption follows the configured daily wage (default Rs 176)', () => {
+    const ctx = { GROSS_EARNINGS: 6000, ESI_WAGES: 6000, TOTAL_DAYS_IN_MONTH: 30 }; // Rs 200 a day
+    expect(deriveStatutoryContext(ctx, settings({}), false).ESI_EMPLOYEE_RATE).toBeUndefined();
+    expect(deriveStatutoryContext(ctx, settings({ esiDailyWageExemption: 200 }), false).ESI_EMPLOYEE_RATE).toBe(0);
+    expect(deriveStatutoryContext({ ...ctx, GROSS_EARNINGS: 5280, ESI_WAGES: 5280 }, settings({}), false).ESI_EMPLOYEE_RATE).toBe(0);
+  });
+
   it('overtime does not count when checking the ESI ceiling, when no full-month figure is given', () => {
     const s = settings({ esiWageCeiling: 21000 });
     expect(deriveStatutoryContext({ GROSS_EARNINGS: 23000, ESI_WAGES: 23000, OVERTIME_PAY: 3000 }, s, false).ESI_APPLICABLE).toBe(1);

@@ -172,7 +172,7 @@ export function deriveStatutoryContext(
     (context.ESI_WAGES ?? context.GROSS_EARNINGS ?? 0) > 0 &&
     (context.ESI_WAGES ?? context.GROSS_EARNINGS ?? 0) /
       (context.TOTAL_DAYS_IN_MONTH as number) <=
-      ESI_DAILY_WAGE_EXEMPTION
+      (settings.esiDailyWageExemption ?? ESI_DAILY_WAGE_EXEMPTION)
       ? { ESI_EMPLOYEE_RATE: 0 }
       : {}),
   };

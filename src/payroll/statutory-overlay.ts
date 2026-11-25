@@ -64,6 +64,8 @@ export interface OverlaidSettings {
   esiEmployeeRate: number;
   esiEmployerRate: number;
   esiWageCeiling: number;
+  /** ESI: an average daily wage up to this pays no employee share (the employer still pays). Unset = Rs 176. */
+  esiDailyWageExemption?: number;
   ptSlabs: PtSlab[];
   // Women's ladder for the org-wide default (undefined = women follow ptSlabs).
   ptWomenSlabs?: PtSlab[];
@@ -192,7 +194,10 @@ export function applyStatutoryOverrides(
       employeeRate: number;
       employerRate: number;
       wageCeiling: number;
+      dailyWageExemption?: number;
     };
+    resolved.esiDailyWageExemption =
+      typeof c.dailyWageExemption === 'number' ? c.dailyWageExemption : undefined;
     resolved.esiEmployeeRate = c.employeeRate;
     resolved.esiEmployerRate = c.employerRate;
     resolved.esiWageCeiling = c.wageCeiling;

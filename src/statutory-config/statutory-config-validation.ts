@@ -31,6 +31,7 @@ function validatePfOrEsi(config: unknown): void {
     adminChargeRate?: unknown;
     epsRate?: unknown;
     edliMaxAmount?: unknown;
+    dailyWageExemption?: unknown;
   };
   if (!isPercent(c.employeeRate))
     throw new Error('employeeRate must be a number between 0 and 100.');
@@ -38,6 +39,8 @@ function validatePfOrEsi(config: unknown): void {
     throw new Error('employerRate must be a number between 0 and 100.');
   if (!isNonNegative(c.wageCeiling))
     throw new Error('wageCeiling must be a non-negative number.');
+  if (c.dailyWageExemption !== undefined && !isNonNegative(c.dailyWageExemption))
+    throw new Error('dailyWageExemption must be a non-negative number.');
   validateOptionalBoolean(c.applyFiftyPercentRule, 'applyFiftyPercentRule');
   validateOptionalBoolean(c.includeArrearsInWages, 'includeArrearsInWages');
   validateOptionalBoolean(c.contributeOnActualWages, 'contributeOnActualWages');
@@ -359,7 +362,7 @@ export const SEED_DEFAULTS: Record<
     isEnabled: false,
   },
   [StatutoryModule.ESI]: {
-    config: { employeeRate: 0.75, employerRate: 3.25, wageCeiling: 21000 },
+    config: { employeeRate: 0.75, employerRate: 3.25, wageCeiling: 21000, dailyWageExemption: 176 },
     isEnabled: false,
   },
   [StatutoryModule.PT]: {
