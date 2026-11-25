@@ -77,6 +77,13 @@ describe('evaluateFormula — functions', () => {
     expect(evaluateFormula('ROUND(2.6)', {})).toBe(3);
   });
 
+  it('CEIL rounds up to the next whole number and ignores float noise', () => {
+    expect(evaluateFormula('CEIL(162.4)', {})).toBe(163);
+    expect(evaluateFormula('CEIL(162)', {})).toBe(162);
+    expect(evaluateFormula('CEIL(21700 * 0.75 / 100)', {})).toBe(163);
+    expect(evaluateFormula('CEIL(20000 * 0.75 / 100)', {})).toBe(150);
+  });
+
   it('ROUND respects an explicit decimals arg', () => {
     expect(evaluateFormula('ROUND(2.567, 2)', {})).toBe(2.57);
   });

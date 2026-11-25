@@ -3,6 +3,7 @@ import type { OverlaidSettings } from './statutory-overlay';
 import {
   buildBaseContext,
   deriveStatutoryContext,
+  hasDisability,
   resolvePtSlabs,
   splitEmployerPf,
 } from './formula-context';
@@ -345,6 +346,22 @@ describe('deriveStatutoryContext', () => {
         false,
       ).BASIC_DA,
     ).toBe(20000);
+  });
+
+  it('a person with a disability is covered by ESI up to Rs 25,000', () => {
+    const s = settings({ esiWageCeiling: 21000 });
+    expect(deriveStatutoryContext({ GROSS_EARNINGS: 24000 }, s, false, [], false).ESI_APPLICABLE).toBe(0);
+    expect(deriveStatutoryContext({ GROSS_EARNINGS: 24000 }, s, false, [], true).ESI_APPLICABLE).toBe(1);
+    expect(deriveStatutoryContext({ GROSS_EARNINGS: 26000 }, s, false, [], true).ESI_APPLICABLE).toBe(0);
+    expect(hasDisability({ hasDisability: 'Yes' })).toBe(true);
+    expect(hasDisability({ hasDisability: 'No' })).toBe(false);
+    expect(hasDisability(null)).toBe(false);
+  });
+
+  it('overtime does not count when checking the ESI ceiling, when no full-month figure is given', () => {
+    const s = settings({ esiWageCeiling: 21000 });
+    expect(deriveStatutoryContext({ GROSS_EARNINGS: 23000, ESI_WAGES: 23000, OVERTIME_PAY: 3000 }, s, false).ESI_APPLICABLE).toBe(1);
+    expect(deriveStatutoryContext({ GROSS_EARNINGS: 23000, ESI_WAGES: 23000, OVERTIME_PAY: 0 }, s, false).ESI_APPLICABLE).toBe(0);
   });
 
   it('ESI stays applicable within the ceiling, or after coverage earlier in the same period', () => {

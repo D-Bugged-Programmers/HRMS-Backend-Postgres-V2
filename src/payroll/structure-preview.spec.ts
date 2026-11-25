@@ -561,6 +561,17 @@ describe('the employee and employer share of PF and ESI for a saved structure', 
     expect(pfOf(false)).toBe(Math.round(Math.min(14100, ceiling) * 0.12));
     expect(pfOf(true)).toBe(Math.round(Math.min(21150, ceiling) * 0.12));
   });
+  it('ignores a stale fixed PF amount and keeps a fixed ESI amount', () => {
+    const rows = [
+      { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 10000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'HRA', valueType: 'FIXED', fixedAmount: 5000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'PF', valueType: 'FIXED', fixedAmount: 1800, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'ESI', valueType: 'FIXED', fixedAmount: 529, amountBasis: 'MONTHLY', isEnabled: true },
+    ];
+    const lines = employeeContributionLinesForStructure({ components: components(), settings: settings(), rows });
+    expect(lines.find((l) => l.code === 'PF')?.amount).toBe(Math.round(Math.min(10000, settings().pfWageCeiling) * 0.12));
+    expect(lines.find((l) => l.code === 'ESI')?.amount).toBe(529);
+  });
   it('has nothing for a structure with nothing switched on', () => {
     expect(employeeContributionLinesForStructure({ components: components(), settings: settings(), rows: [] })).toEqual([]);
   });

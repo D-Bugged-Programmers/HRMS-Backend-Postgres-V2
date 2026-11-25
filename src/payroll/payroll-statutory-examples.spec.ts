@@ -158,10 +158,10 @@ describe('ESI: worked examples (ceiling 21,000, 0.75% + 3.25%)', () => {
     });
   });
 
-  it('gross 20,300: 152.25 -> 152 and 659.75 -> 660 (nearest rupee)', async () => {
+  it('gross 20,300: 152.25 -> 153 (rounded up) and 659.75 -> 660', async () => {
     expect(await esiFor(14500)).toEqual({
       gross: 20300,
-      employee: 152,
+      employee: 153,
       employer: 660,
     });
   });

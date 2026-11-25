@@ -115,13 +115,27 @@ export function resolvePtSlabs(
 // PF_WAGES / GRATUITY_WAGES are Basic + DA, lifted to 50% of gross where the org has switched the Labour Codes
 // "50% wages" rule on for that module. ESI_WAGES (set by the caller) is gross minus non-monthly pay (bonus/variable), which ESIC excludes. ESI_APPLICABLE keeps an employee covered for the rest of an ESI
 // contribution period (Apr-Sep / Oct-Mar) once they were covered, even if wages cross the ceiling mid-period.
+/** ESI wage ceiling for a person with a disability (the general ceiling is a setting). */
+export const ESI_DISABLED_WAGE_CEILING = 25000;
+
+/** True when the employee's profile says they are a person with a disability (personalData.hasDisability = 'Yes'). */
+export function hasDisability(personalData: unknown): boolean {
+  const v = (personalData as Record<string, unknown> | null | undefined)?.hasDisability;
+  return typeof v === 'string' && v.trim().toLowerCase() === 'yes';
+}
+
 export function deriveStatutoryContext(
   context: Record<string, number>,
   settings: OverlaidSettings,
   hadEsiThisPeriod: boolean,
   /** Earnings counted in the PF wages besides Basic and DA (the component's "Counts towards PF wages" switch). */
   extraPfWageCodes: string[] = [],
+  /** A person with a disability is covered by ESI up to ESI_DISABLED_WAGE_CEILING. */
+  disabledPerson = false,
 ): Record<string, number> {
+  const esiCeiling = disabledPerson
+    ? Math.max(settings.esiWageCeiling, ESI_DISABLED_WAGE_CEILING)
+    : settings.esiWageCeiling;
   const basicDa = (context.BASIC ?? 0) + (context.DA ?? 0);
   const extraPf = extraPfWageCodes
     .filter((c) => c !== 'BASIC' && c !== 'DA')
@@ -144,11 +158,11 @@ export function deriveStatutoryContext(
     // Coverage and bonus eligibility are decided on the monthly wage RATE (what the structure pays for a full
     // month), not on what a part month happened to earn: a joiner or a month of LOP must not drop an employee out
     // of (or into) ESI / the bonus. The caller supplies the full-month figures; absent, the actual wages are used.
+    // Overtime is left out of the eligibility check (it is still deducted on when paid, as part of ESI_WAGES).
     ESI_APPLICABLE:
       (context.FULL_MONTH_ESI_WAGES ??
-        context.ESI_WAGES ??
-        context.GROSS_EARNINGS ??
-        0) <= settings.esiWageCeiling || hadEsiThisPeriod
+        Math.max(0, (context.ESI_WAGES ?? context.GROSS_EARNINGS ?? 0) - (context.OVERTIME_PAY ?? 0))) <=
+        esiCeiling || hadEsiThisPeriod
         ? 1
         : 0,
     BASIC_DA_RATE: context.FULL_MONTH_BASIC_DA ?? basicDa,

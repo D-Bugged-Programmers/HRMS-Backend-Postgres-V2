@@ -177,6 +177,7 @@ const FUNCTION_ARITY: Record<string, { min: number; max?: number }> = {
   OR: { min: 1 },
   NOT: { min: 1, max: 1 },
   ROUND: { min: 1, max: 2 },
+  CEIL: { min: 1, max: 1 },
   MIN: { min: 1 },
   MAX: { min: 1 },
   ABS: { min: 1, max: 1 },
@@ -372,6 +373,8 @@ const FUNCTIONS: Record<string, (args: number[], context: Context) => number> =
       const factor = 10 ** decimals;
       return Math.round(args[0] * factor) / factor;
     },
+    // Next whole rupee up (ESI employee share). The 1e-6 trim stops float noise such as 162.00000000000003 rounding up a rupee.
+    CEIL: (args) => Math.ceil(Math.round(args[0] * 1e6) / 1e6),
     MIN: (args) => Math.min(...args),
     MAX: (args) => Math.max(...args),
     ABS: (args) => Math.abs(args[0]),

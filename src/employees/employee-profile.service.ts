@@ -465,6 +465,8 @@ export class EmployeeProfileService {
       delete patch.personalEmail;
       // The company, not the employee, decides what an employee's CTC is.
       delete patch.currentCTC;
+      // Changes the ESI wage ceiling, so HR sets it, not the employee.
+      delete patch.hasDisability;
     }
     assertPersonalDataShape(patch, before);
     assertValidIdentifiers(patch);

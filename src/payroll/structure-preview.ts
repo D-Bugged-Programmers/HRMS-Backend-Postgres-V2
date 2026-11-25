@@ -160,6 +160,7 @@ function evaluateStructure(
   settings: OverlaidSettings,
   overrides: Map<string, EmployeeSalaryComponent>,
   base: Record<string, number>,
+  disabledPerson = false,
 ) {
   const earningComponents = components.filter(
     (c) =>
@@ -193,7 +194,7 @@ function evaluateStructure(
     (afterEarnings.BASIC ?? 0) + (afterEarnings.DA ?? 0);
   Object.assign(
     afterEarnings,
-    deriveStatutoryContext(afterEarnings, settings, false, pfWageCodesOf(components)),
+    deriveStatutoryContext(afterEarnings, settings, false, pfWageCodesOf(components), disabledPerson),
   );
   if (settings.pfOnActualWages && settings.pfEnabled) {
     afterEarnings.PF_WAGE_CEILING = Math.max(
@@ -256,6 +257,22 @@ function evaluateStructure(
   };
 }
 
+/**
+ * The employee's own PF always follows the PF settings (rate, ceiling, PF wages). A typed or uploaded fixed amount on
+ * that line goes stale the moment the settings change (and leaves it out of step with the employer's PF), so it is ignored.
+ * ESI and the other lines are left as saved.
+ */
+export function dropFixedEmployeePfOverrides<T extends { valueType?: unknown; isEnabled?: boolean | null }>(
+  components: { code: string; type: unknown; statutoryKey?: unknown; isEmployerContribution?: boolean }[],
+  overrides: Map<string, T>,
+): void {
+  for (const c of components) {
+    if (c.type !== SalaryComponentType.DEDUCTION || c.statutoryKey !== StatutoryKey.PF || c.isEmployerContribution) continue;
+    const o = overrides.get(c.code);
+    if (o && o.valueType === 'FIXED' && o.isEnabled !== false) overrides.delete(c.code);
+  }
+}
+
 export interface SavedStructureRow {
   componentCode: string;
   valueType: string;
@@ -285,6 +302,7 @@ export function employerLinesForStructure(args: {
   components: SalaryComponent[];
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
+  profile?: { state?: string | null; gender?: string | null; disabled?: boolean };
 }): { code: string; name: string; amount: number }[] {
   return evaluateSavedStructure(args)?.employerLines ?? [];
 }
@@ -295,7 +313,7 @@ export function employeeContributionLinesForStructure(args: {
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
   /** Where the employee works and their gender: Professional Tax follows the state's ladder. */
-  profile?: { state?: string | null; gender?: string | null };
+  profile?: { state?: string | null; gender?: string | null; disabled?: boolean };
 }): { code: string; name: string; amount: number }[] {
   return evaluateSavedStructure(args)?.employeeLines ?? [];
 }
@@ -304,7 +322,7 @@ function evaluateSavedStructure(args: {
   components: SalaryComponent[];
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
-  profile?: { state?: string | null; gender?: string | null };
+  profile?: { state?: string | null; gender?: string | null; disabled?: boolean };
 }) {
   const components = args.components.filter((c) => c.isActive);
   if (!args.rows.some((r) => r.isEnabled !== false)) return null;
@@ -322,11 +340,13 @@ function evaluateSavedStructure(args: {
       }),
     );
   }
+  dropFixedEmployeePfOverrides(components, overrides);
   return evaluateStructure(
     components,
     args.settings,
     overrides,
     fullMonthBase(args.settings, args.profile),
+    args.profile?.disabled === true,
   );
 }
 

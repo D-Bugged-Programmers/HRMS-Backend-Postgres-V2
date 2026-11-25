@@ -76,6 +76,7 @@ import { HoldPayrollDto } from './dto/hold-payroll.dto';
 import {
   computeStructurePreview,
   employerLinesForStructure,
+  dropFixedEmployeePfOverrides,
   employeeContributionLinesForStructure,
   monthlyFiguresForStructure,
   type SavedStructureRow,
@@ -143,6 +144,7 @@ import {
 import {
   buildBaseContext,
   deriveStatutoryContext,
+  hasDisability,
   splitEmployerPf,
   ageOnDate,
   EPS_PENSION_AGE,
@@ -1130,6 +1132,7 @@ export class PayrollService {
         allComponents
           .filter((c) => c.countsTowardsPfWages)
           .map((c) => c.code),
+        hasDisability(employee.personalData),
       ),
     );
     // Charge the month's PF wages at each period's own ceiling (see pf-ceiling-split.ts). The blended figure stands in
@@ -1785,6 +1788,7 @@ export class PayrollService {
       select: {
         id: true,
         gender: true,
+        personalData: true,
         workLocation: { select: { cityClass: true, state: true } },
         department: {
           select: { workLocation: { select: { cityClass: true, state: true } } },
@@ -1809,12 +1813,13 @@ export class PayrollService {
         components: withCityHra(components, cityClass),
         settings,
         rows: current,
+        profile: { disabled: hasDisability(u.personalData) },
       });
       const employeeLines = employeeContributionLinesForStructure({
         components: withCityHra(components, cityClass),
         settings,
         rows: current,
-        profile: { state: effectiveWorkLocation(u)?.state ?? null, gender: u.gender },
+        profile: { state: effectiveWorkLocation(u)?.state ?? null, gender: u.gender, disabled: hasDisability(u.personalData) },
       });
       return {
         employeeId: u.id,
@@ -1829,7 +1834,7 @@ export class PayrollService {
   // upload preview can show them before saving. The work location decides HRA, the same as everywhere else.
   async contributionLinesForRows(
     rows: SavedStructureRow[],
-    employee: { workLocationId?: string | null; departmentId?: string | null; gender?: string | null },
+    employee: { workLocationId?: string | null; departmentId?: string | null; gender?: string | null; personalData?: unknown },
     organizationId: string,
     context: Awaited<ReturnType<PayrollService['packageContext']>>,
   ): Promise<{
@@ -1855,9 +1860,10 @@ export class PayrollService {
       components: withCityHra(context.components, cityClass),
       settings: context.settings,
       rows,
+      profile: { state, gender: employee.gender ?? null, disabled: hasDisability(employee.personalData) },
     };
     return {
-      employeeLines: employeeContributionLinesForStructure({ ...args, profile: { state, gender: employee.gender ?? null } }),
+      employeeLines: employeeContributionLinesForStructure(args),
       employerLines: employerLinesForStructure(args),
     };
   }
@@ -5442,6 +5448,7 @@ export class PayrollService {
           r,
         ]),
       );
+      dropFixedEmployeePfOverrides(args.allComponents, overrides);
       const applicable = args.allComponents.filter((c) =>
         this.isApplicable(
           c,

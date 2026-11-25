@@ -142,6 +142,8 @@ export const KNOWN_PERSONAL_DATA_KEYS = new Set([
   'fatherOccupation',
   'fullNameAsPerGovtId',
   'gender',
+  // 'Yes' / 'No': a person with a disability is covered by ESI up to a higher wage ceiling (HR sets it).
+  'hasDisability',
   'maritalStatus',
   'motherContact',
   'motherName',
