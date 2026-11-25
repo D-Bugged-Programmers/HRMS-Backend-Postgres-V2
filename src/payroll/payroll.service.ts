@@ -76,7 +76,7 @@ import { HoldPayrollDto } from './dto/hold-payroll.dto';
 import {
   computeStructurePreview,
   employerLinesForStructure,
-  dropFixedEmployeePfOverrides,
+  dropFixedEmployeeStatutoryOverrides,
   employeeContributionLinesForStructure,
   monthlyFiguresForStructure,
   type SavedStructureRow,
@@ -5449,7 +5449,7 @@ export class PayrollService {
           r,
         ]),
       );
-      dropFixedEmployeePfOverrides(args.allComponents, overrides);
+      dropFixedEmployeeStatutoryOverrides(args.allComponents, overrides);
       const applicable = args.allComponents.filter((c) =>
         this.isApplicable(
           c,

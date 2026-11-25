@@ -262,16 +262,16 @@ function evaluateStructure(
 }
 
 /**
- * The employee's own PF always follows the PF settings (rate, ceiling, PF wages). A typed or uploaded fixed amount on
- * that line goes stale the moment the settings change (and leaves it out of step with the employer's PF), so it is ignored.
- * ESI and the other lines are left as saved.
+ * The employee's own PF and ESI always follow the statutory settings (rates, ceilings, wages). A typed or uploaded fixed
+ * amount on those lines goes stale the moment the settings change and leaves the employee out of step with the employer's
+ * share, so it is ignored. Professional Tax and the other lines are left as saved.
  */
-export function dropFixedEmployeePfOverrides<T extends { valueType?: unknown; isEnabled?: boolean | null }>(
+export function dropFixedEmployeeStatutoryOverrides<T extends { valueType?: unknown; isEnabled?: boolean | null }>(
   components: { code: string; type: unknown; statutoryKey?: unknown; isEmployerContribution?: boolean }[],
   overrides: Map<string, T>,
 ): void {
   for (const c of components) {
-    if (c.type !== SalaryComponentType.DEDUCTION || c.statutoryKey !== StatutoryKey.PF || c.isEmployerContribution) continue;
+    if (c.type !== SalaryComponentType.DEDUCTION || (c.statutoryKey !== StatutoryKey.PF && c.statutoryKey !== StatutoryKey.ESI) || c.isEmployerContribution) continue;
     const o = overrides.get(c.code);
     if (o && o.valueType === 'FIXED' && o.isEnabled !== false) overrides.delete(c.code);
   }
@@ -344,7 +344,7 @@ function evaluateSavedStructure(args: {
       }),
     );
   }
-  dropFixedEmployeePfOverrides(components, overrides);
+  dropFixedEmployeeStatutoryOverrides(components, overrides);
   return evaluateStructure(
     components,
     args.settings,

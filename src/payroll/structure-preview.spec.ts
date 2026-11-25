@@ -561,7 +561,7 @@ describe('the employee and employer share of PF and ESI for a saved structure', 
     expect(pfOf(false)).toBe(Math.round(Math.min(14100, ceiling) * 0.12));
     expect(pfOf(true)).toBe(Math.round(Math.min(21150, ceiling) * 0.12));
   });
-  it('ignores a stale fixed PF amount and keeps a fixed ESI amount', () => {
+  it('ignores stale fixed PF and ESI amounts so both follow the settings', () => {
     const rows = [
       { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 10000, amountBasis: 'MONTHLY', isEnabled: true },
       { componentCode: 'HRA', valueType: 'FIXED', fixedAmount: 5000, amountBasis: 'MONTHLY', isEnabled: true },
@@ -570,7 +570,8 @@ describe('the employee and employer share of PF and ESI for a saved structure', 
     ];
     const lines = employeeContributionLinesForStructure({ components: components(), settings: settings(), rows });
     expect(lines.find((l) => l.code === 'PF')?.amount).toBe(Math.round(Math.min(10000, settings().pfWageCeiling) * 0.12));
-    expect(lines.find((l) => l.code === 'ESI')?.amount).toBe(529);
+    // Gross 15,000 is within the ESI ceiling: 0.75% rounded up, not the saved 529.
+    expect(lines.find((l) => l.code === 'ESI')?.amount).toBe(Math.ceil((15000 * 0.75) / 100));
   });
   it('an allowance marked as excluded from ESI wages is left out of the ESI wages and the ceiling check', () => {
     const rows = [
