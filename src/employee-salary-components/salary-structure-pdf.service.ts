@@ -26,6 +26,13 @@ import {
   type StructureBreakdown,
 } from './salary-structure-math';
 import { employeeCityClass, withCityHra } from './city-hra';
+import { PayrollSettingsService } from '../payroll-settings/payroll-settings.service';
+import { StatutoryConfigService } from '../statutory-config/statutory-config.service';
+import { applyStatutoryOverrides, type EffectiveConfigsByModule } from '../payroll/statutory-overlay';
+import { employeeContributionLinesForStructure, employerLinesForStructure } from '../payroll/structure-preview';
+import { hasDisability, npsProfileOf } from '../payroll/formula-context';
+import { effectiveWorkLocation } from '../common/effective-work-location';
+import { StatutoryModule } from '@prisma/client';
 
 const PAGE_W = 595.28; // A4 portrait, points
 const MARGIN = 40;
@@ -60,6 +67,10 @@ export interface SalaryStructureDocInput {
   joiningDate: string;
   effectiveFrom: string;
   breakdown: StructureBreakdown;
+  // The employee's own PF / ESI / PT (deducted from pay) and what the company pays on top, as the Salary Details screen lists them.
+  // `notApplicable` lines are PF / ESI the company has on that are nil for this person.
+  employeeLines?: { code: string; name: string; amount: number; notApplicable?: boolean }[];
+  employerLines?: { code: string; name: string; amount: number; notApplicable?: boolean }[];
 }
 
 const inr = (n: number) =>
@@ -155,107 +166,145 @@ export function renderSalaryStructurePdf(
     }
     y = rowBottom + 18;
 
-    // The table.
+    // The structure: three summary figures, then one block per part (earnings, your contributions, employer contributions,
+    // variable pay) with its own total, and the Total CTC bar. Green is pay, red is taken from pay.
+    const GREEN = '#17803d';
+    const RED = '#b42318';
+    const BAND = '#eef0f5';
+    const TINT = '#e8eefb';
+    const TINT_BORDER = '#b8c7ea';
     const colA = CONTENT_W * 0.5;
     const colB = CONTENT_W * 0.25;
     const colC = CONTENT_W * 0.25;
-    const PAD = 10;
-    const rowH = 24;
+    const PAD = 12;
+    const rowH = 25;
+    const pageBottom = () => doc.page.height - MARGIN - 20;
     const ensureRoom = (needed: number) => {
-      if (y + needed > doc.page.height - MARGIN) {
+      if (y + needed > pageBottom()) {
         doc.addPage();
         y = MARGIN;
       }
     };
-    const box = (yy: number, h: number, fill?: string) => {
-      if (fill) doc.rect(MARGIN, yy, CONTENT_W, h).fill(fill);
-      doc.rect(MARGIN, yy, CONTENT_W, h).strokeColor(BORDER).stroke();
-      doc
-        .moveTo(MARGIN + colA, yy)
-        .lineTo(MARGIN + colA, yy + h)
-        .stroke();
-      doc
-        .moveTo(MARGIN + colA + colB, yy)
-        .lineTo(MARGIN + colA + colB, yy + h)
-        .stroke();
-    };
-    const line = (
-      label: string,
-      monthly: string,
-      annual: string,
-      opts: {
-        bold?: boolean;
-        fill?: string;
-        sub?: string | null;
-        h?: number;
-      } = {},
-    ) => {
-      const h = opts.h ?? (opts.sub ? rowH + 12 : rowH);
-      ensureRoom(h);
-      box(y, h, opts.fill);
-      doc
-        .font(opts.bold ? 'SS-Bold' : 'SS-Regular')
-        .fontSize(10.5)
-        .fillColor(INK_900);
-      doc.text(label, MARGIN + PAD, y + 7, { width: colA - PAD * 2 });
-      if (opts.sub) {
-        doc.font('SS-Regular').fontSize(8.5).fillColor(INK_600);
-        doc.text(opts.sub, MARGIN + PAD, doc.y + 1, { width: colA - PAD * 2 });
-      }
-      doc
-        .font(opts.bold ? 'SS-Bold' : 'SS-Regular')
-        .fontSize(10.5)
-        .fillColor(INK_900);
-      doc.text(monthly, MARGIN + colA, y + 7, {
-        width: colB - PAD,
-        align: 'right',
-      });
-      doc.text(annual, MARGIN + colA + colB, y + 7, {
-        width: colC - PAD,
-        align: 'right',
-      });
-      y += h;
-    };
-    const heading = (text: string) =>
-      line(text, '', '', { bold: true, h: rowH + 4 });
-
-    // header row
-    ensureRoom(rowH + 4);
-    box(y, rowH + 4);
-    doc.font('SS-Bold').fontSize(10).fillColor(INK_900);
-    doc.text('SALARY COMPONENTS', MARGIN + PAD, y + 9, {
-      width: colA - PAD * 2,
-    });
-    doc.text('MONTHLY AMOUNT', MARGIN + colA, y + 9, {
-      width: colB - PAD,
-      align: 'right',
-    });
-    doc.text('ANNUAL AMOUNT', MARGIN + colA + colB, y + 9, {
-      width: colC - PAD,
-      align: 'right',
-    });
-    y += rowH + 4;
+    const hairline = (yy: number) =>
+      doc.moveTo(MARGIN, yy).lineTo(MARGIN + CONTENT_W, yy).lineWidth(0.5).strokeColor(BORDER).stroke();
 
     const b = input.breakdown;
-    heading('Earnings');
-    for (const e of b.earnings) {
-      line(e.name, inr(e.monthly), inr(e.annual), { sub: e.basis });
+    const employeeLines = input.employeeLines ?? [];
+    const employerLines = input.employerLines ?? [];
+    const sum = (ls: { amount: number }[]) => ls.reduce((t, l) => t + l.amount, 0);
+    const employerMonthly = sum(employerLines);
+    const deductionsMonthly = sum(employeeLines);
+    const takeHome = b.fixedMonthly - deductionsMonthly;
+
+    // Summary figures.
+    const tiles: { label: string; value: string; note: string; color: string; fill: string }[] = [
+      { label: 'TOTAL CTC', value: inr(b.annualCTC + employerMonthly * 12), note: 'per year', color: INK_900, fill: '#ffffff' },
+      { label: 'FIXED PAY', value: inr(b.fixedMonthly), note: 'per month', color: INK_900, fill: '#ffffff' },
+    ];
+    if (employeeLines.length > 0) {
+      tiles.push({ label: 'TAKE-HOME PAY', value: inr(takeHome), note: 'per month, a full month', color: GREEN, fill: TINT });
     }
+    const gap = 10;
+    const tileW = (CONTENT_W - gap * (tiles.length - 1)) / tiles.length;
+    const tileH = 58;
+    ensureRoom(tileH + 16);
+    tiles.forEach((t, i) => {
+      const tx = MARGIN + i * (tileW + gap);
+      doc.roundedRect(tx, y, tileW, tileH, 6).fillAndStroke(t.fill, t.fill === '#ffffff' ? BORDER : TINT_BORDER);
+      doc.font('SS-Regular').fontSize(8).fillColor(INK_600).text(t.label, tx + 12, y + 10, { width: tileW - 24, characterSpacing: 0.6 });
+      doc.font('SS-Bold').fontSize(15).fillColor(t.color).text(t.value, tx + 12, y + 23, { width: tileW - 24 });
+      doc.font('SS-Regular').fontSize(8).fillColor(INK_600).text(t.note, tx + 12, y + 43, { width: tileW - 24 });
+    });
+    y += tileH + 16;
+
+    // One block of the structure.
+    const section = (
+      title: string,
+      note: string,
+      total: { monthly: string; annual?: string; color: string } | null,
+    ) => {
+      const h = 40;
+      ensureRoom(h + rowH * 2);
+      doc.rect(MARGIN, y, CONTENT_W, h).fill(BAND);
+      doc.font('SS-Bold').fontSize(10).fillColor(INK_900).text(title.toUpperCase(), MARGIN + PAD, y + 8, { width: colA - PAD, characterSpacing: 0.4 });
+      doc.font('SS-Regular').fontSize(8).fillColor(INK_600).text(note, MARGIN + PAD, y + 22, { width: colA + colB - PAD * 2 });
+      if (total) {
+        doc.font('SS-Bold').fontSize(11).fillColor(total.color).text(total.monthly, MARGIN + colA, y + 9, { width: colB - PAD, align: 'right' });
+        if (total.annual) doc.font('SS-Regular').fontSize(8.5).fillColor(INK_600).text(total.annual, MARGIN + colA + colB, y + 11, { width: colC - PAD, align: 'right' });
+      }
+      y += h;
+      // column labels
+      doc.font('SS-Regular').fontSize(7.5).fillColor(INK_600);
+      doc.text('COMPONENT', MARGIN + PAD, y + 7, { width: colA - PAD * 2, characterSpacing: 0.4 });
+      doc.text('MONTHLY', MARGIN + colA, y + 7, { width: colB - PAD, align: 'right', characterSpacing: 0.4 });
+      doc.text('ANNUAL', MARGIN + colA + colB, y + 7, { width: colC - PAD, align: 'right', characterSpacing: 0.4 });
+      y += 20;
+      hairline(y);
+    };
+    const row = (label: string, monthly: string, annual: string, opts: { color?: string; sub?: string | null; muted?: boolean } = {}) => {
+      const h = opts.sub ? rowH + 10 : rowH;
+      ensureRoom(h);
+      doc.font('SS-Regular').fontSize(10.5).fillColor(opts.muted ? INK_600 : INK_900).text(label, MARGIN + PAD, y + 7, { width: colA - PAD * 2 });
+      if (opts.sub) doc.font('SS-Regular').fontSize(8.5).fillColor(INK_600).text(opts.sub, MARGIN + PAD, doc.y + 1, { width: colA - PAD * 2 });
+      doc.font('SS-Bold').fontSize(10.5).fillColor(opts.muted ? INK_600 : opts.color ?? INK_900).text(monthly, MARGIN + colA, y + 7, { width: colB - PAD, align: 'right' });
+      doc.font('SS-Regular').fontSize(10.5).fillColor(opts.muted ? INK_600 : opts.color ?? INK_900).text(annual, MARGIN + colA + colB, y + 7, { width: colC - PAD, align: 'right' });
+      y += h;
+      hairline(y);
+    };
+
+    // Earnings
+    section('Earnings', 'Your fixed pay, paid every month', { monthly: inr(b.fixedMonthly), annual: `${inr(b.fixedAnnual)} / year`, color: GREEN });
+    for (const e of b.earnings.filter((x) => x.monthly !== 0 || x.annual !== 0)) {
+      row(e.name, inr(e.monthly), inr(e.annual), { color: GREEN, sub: e.basis });
+    }
+    y += 14;
+
+    if (employeeLines.length > 0) {
+      section('Your contributions', 'Deducted from your pay each month (not part of the CTC)', {
+        monthly: inr(deductionsMonthly),
+        annual: `${inr(deductionsMonthly * 12)} / year`,
+        color: RED,
+      });
+      for (const l of employeeLines) {
+        if (l.notApplicable) row(l.name, 'Not applicable', '-', { muted: true });
+        else row(l.name, inr(l.amount), inr(l.amount * 12), { color: RED });
+      }
+      y += 14;
+    }
+
+    if (employerLines.length > 0) {
+      section('Employer contributions', 'Paid by the company on top of your pay (part of the CTC)', {
+        monthly: inr(employerMonthly),
+        annual: `${inr(employerMonthly * 12)} / year`,
+        color: INK_900,
+      });
+      for (const l of employerLines) {
+        if (l.notApplicable) row(l.name, 'Not applicable', '-', { muted: true });
+        else row(l.name, inr(l.amount), inr(l.amount * 12));
+      }
+      y += 14;
+    }
+
     const extras = [...b.variable, ...b.oneTime];
     if (extras.length > 0) {
-      heading('One Time Earnings');
+      section('Variable & one-time pay', 'Not paid every month', { monthly: '', annual: `${inr(b.variableAnnual + b.oneTimeAnnual)} / year`, color: INK_900 });
       for (const v of extras) {
-        const label = /variable/i.test(v.name)
-          ? v.name
-          : `${v.name} (Variable)`;
-        line(label, '', inr(v.annual));
+        row(/variable/i.test(v.name) ? v.name : `${v.name} (Variable)`, '', inr(v.annual));
       }
+      y += 14;
     }
-    line('COST TO COMPANY', inr(b.fixedMonthly), inr(b.annualCTC), {
-      bold: true,
-      fill: SHADE,
-      h: rowH + 4,
-    });
+
+    // Total CTC bar
+    const barH = 44;
+    ensureRoom(barH);
+    doc.roundedRect(MARGIN, y, CONTENT_W, barH, 6).fillAndStroke(TINT, TINT_BORDER);
+    doc.font('SS-Bold').fontSize(12).fillColor(INK_900).text('TOTAL CTC', MARGIN + PAD, y + 15, { width: colA - PAD, characterSpacing: 0.4 });
+    doc.font('SS-Regular').fontSize(7.5).fillColor(INK_600).text('MONTHLY', MARGIN + colA, y + 8, { width: colB - PAD, align: 'right', characterSpacing: 0.4 });
+    doc.font('SS-Bold').fontSize(12).fillColor(INK_900).text(inr(b.fixedMonthly + employerMonthly), MARGIN + colA, y + 21, { width: colB - PAD, align: 'right' });
+    doc.font('SS-Regular').fontSize(7.5).fillColor(INK_600).text('ANNUAL', MARGIN + colA + colB, y + 8, { width: colC - PAD, align: 'right', characterSpacing: 0.4 });
+    doc.font('SS-Bold').fontSize(12).fillColor(INK_900).text(inr(b.annualCTC + employerMonthly * 12), MARGIN + colA + colB, y + 21, { width: colC - PAD, align: 'right' });
+    y += barH;
+
     doc.end();
   });
 }
@@ -265,6 +314,8 @@ export class SalaryStructurePdfService {
   constructor(
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly brandingLookup: BrandingLookupService,
+    private readonly payrollSettingsService: PayrollSettingsService,
+    private readonly statutoryConfigService: StatutoryConfigService,
   ) {}
 
   async build(
@@ -291,6 +342,10 @@ export class SalaryStructurePdfService {
           designation: true,
           joiningDate: true,
           brandId: true,
+          gender: true,
+          personalData: true,
+          workLocation: { select: { state: true } },
+          department: { select: { workLocation: { select: { state: true } } } },
         },
       }),
     ]);
@@ -340,6 +395,51 @@ export class SalaryStructurePdfService {
         'This employee has no salary structure on file yet.',
       );
     }
+    // The employee's own PF / ESI / PT and what the company pays on top, from the settings in force on the date.
+    const settingsRow = await this.payrollSettingsService.getOrCreate(organizationId);
+    const effectiveConfigs: EffectiveConfigsByModule = {};
+    for (const statutoryModule of Object.values(StatutoryModule)) {
+      const { version } = await this.statutoryConfigService.getEffective(statutoryModule, asOf, organizationId);
+      if (version) effectiveConfigs[statutoryModule] = { config: version.config, isEnabled: version.isEnabled };
+    }
+    const settings = applyStatutoryOverrides(settingsRow, effectiveConfigs);
+    const structureComponents = withCityHra(components, cityClass);
+    const saved = current.map((r) => ({
+      componentCode: r.componentCode,
+      valueType: r.valueType,
+      fixedAmount: r.fixedAmount,
+      percentageValue: r.percentageValue,
+      percentageOf: r.percentageOf,
+      amountBasis: r.amountBasis,
+      isEnabled: r.isEnabled,
+    }));
+    const profile = {
+      state: effectiveWorkLocation(employee)?.state ?? null,
+      gender: employee.gender ?? null,
+      disabled: hasDisability(employee.personalData),
+      nps: npsProfileOf(employee.personalData),
+    };
+    const shownLines = (
+      lines: { code: string; name: string; amount: number }[],
+      codes: string[],
+      employer: boolean,
+    ) => [
+      ...lines,
+      ...codes
+        .map((code) => components.find((c) => c.code === code && !!c.isEmployerContribution === employer))
+        .filter((c): c is (typeof components)[number] => !!c && !lines.some((l) => l.code === c.code))
+        .map((c) => ({ code: c.code, name: c.name, amount: 0, notApplicable: true })),
+    ];
+    const employeeLines = shownLines(
+      employeeContributionLinesForStructure({ components: structureComponents, settings, rows: saved, profile }),
+      ['PF', 'ESI'],
+      false,
+    );
+    const employerLines = shownLines(
+      employerLinesForStructure({ components: structureComponents, settings, rows: saved, profile }),
+      ['PF_EMPLOYER', 'ESI_EMPLOYER'],
+      true,
+    );
     // A sister company's salary structure carries its brand's name, address and logo; no brand keeps the organization's own.
     const branding = employee.brandId ? await this.brandingLookup.forBrand(organizationId, employee.brandId) : null;
     const logoKey = branding?.brandId ? branding.logoUrl : org?.companyLogoUrl;
@@ -359,6 +459,8 @@ export class SalaryStructurePdfService {
         : '',
       effectiveFrom: breakdown.effectiveFrom ?? asOf,
       breakdown,
+      employeeLines,
+      employerLines,
     });
     const filename = `${`${employee.employeeId}-Salary Structure`
       .replace(/[\\/:*?"<>|\r\n]+/g, ' ')

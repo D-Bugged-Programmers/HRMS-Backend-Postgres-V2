@@ -28,6 +28,7 @@ export interface SalaryComponentDefault {
   includeInNet?: boolean;
   showOnPayslip?: boolean;
   excludedFromEsiWages?: boolean;
+  includeInCTC?: boolean;
 }
 
 export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
@@ -106,6 +107,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
   {
     name: 'Overtime Pay',
     code: 'OVERTIME_PAY',
+    // Off for ESI wages like every earning except Basic, DA and the Miscellaneous Allowance; switch it on per company.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FORMULA,
     // OT_WEIGHTED_HOURS = Σ approved hours × the record's rateMultiplier (1.5x regular, 2x holiday/weekend,
@@ -119,6 +122,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
   {
     name: 'Arrears',
     code: 'ARREARS',
+    // Off for ESI wages like every earning except Basic, DA and the Miscellaneous Allowance; switch it on per company.
+    excludedFromEsiWages: true,
     type: SalaryComponentType.EARNING,
     calcType: CalcType.MANUAL,
     displayOrder: 10,
@@ -278,11 +283,23 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
     displayOrder: 42,
   },
   {
+    // The employee's own (voluntary) NPS contribution, deducted from pay. Nil unless the company or the employee sets a rate.
+    name: 'NPS (Employee)',
+    code: 'NPS_EMPLOYEE',
+    type: SalaryComponentType.DEDUCTION,
+    calcType: CalcType.FORMULA,
+    formula: 'IF(NPS_ENROLLED == 1, ROUND(NPS_WAGES * NPS_EMPLOYEE_RATE / 100, 0), 0)',
+    isStatutory: true,
+    statutoryKey: StatutoryKey.NPS,
+    displayOrder: 32,
+  },
+  {
     name: 'Employer NPS Contribution',
     code: 'NPS_EMPLOYER',
     type: SalaryComponentType.EARNING,
     calcType: CalcType.FORMULA,
-    formula: 'PERCENT(NPS_WAGES, NPS_EMPLOYER_RATE)',
+    // Only for employees enrolled in NPS (the profile can leave a person out).
+    formula: 'IF(NPS_ENROLLED == 1, PERCENT(NPS_WAGES, NPS_EMPLOYER_RATE), 0)',
     isStatutory: true,
     statutoryKey: StatutoryKey.NPS,
     isEmployerContribution: true,
@@ -317,6 +334,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
     isStatutory: true,
     statutoryKey: StatutoryKey.PF,
     isEmployerContribution: true,
+    // Not shown on the structure or payslip and not part of the CTC (the company still pays it; it is in the PF returns).
+    includeInCTC: false,
     includeInGross: false,
     includeInNet: false,
     displayOrder: 45,
@@ -330,6 +349,8 @@ export const SALARY_COMPONENT_DEFAULTS: SalaryComponentDefault[] = [
     isStatutory: true,
     statutoryKey: StatutoryKey.PF,
     isEmployerContribution: true,
+    // Not shown on the structure or payslip and not part of the CTC (the company still pays it; it is in the PF returns).
+    includeInCTC: false,
     includeInGross: false,
     includeInNet: false,
     displayOrder: 46,

@@ -20,7 +20,7 @@ describe('EmailService: inactive recipients', () => {
   it('skips mail addressed to an inactive employee', async () => {
     const { svc, reached } = build(['gone@acme.test']);
     const r = await svc.send({ organizationId: 'o1', to: 'Gone@Acme.test', subject: 's', html: 'h' });
-    expect(r).toEqual({ dryRun: true });
+    expect(r).toMatchObject({ dryRun: true });
     expect(reached).toEqual([]);
   });
 

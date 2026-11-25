@@ -75,5 +75,26 @@ describe('salary structure document', () => {
     });
     expect(buffer.subarray(0, 5).toString()).toBe('%PDF-');
     expect(buffer.length).toBeGreaterThan(1500);
+
+    // With the employee's own PF / ESI / PT and the employer's share, the document is longer than the earnings alone and still a PDF.
+    const full = await renderSalaryStructurePdf({
+      companyName: "D'Bugged Programmers",
+      companyAddress: '',
+      companyLogoBuffer: null,
+      watermarkEnabled: false,
+      employeeName: 'Jigar Vekariya',
+      employeeCode: 'DP00007',
+      designation: '',
+      joiningDate: '2024-10-23',
+      effectiveFrom: '2026-04-01',
+      breakdown,
+      employeeLines: [
+        { code: 'PF', name: 'Provident Fund', amount: 1530 },
+        { code: 'ESI', name: 'ESI', amount: 0, notApplicable: true },
+      ],
+      employerLines: [{ code: 'PF_EMPLOYER', name: 'Employer PF Contribution', amount: 1530 }],
+    });
+    expect(full.subarray(0, 5).toString()).toBe('%PDF-');
+    expect(full.length).toBeGreaterThan(buffer.length);
   });
 });

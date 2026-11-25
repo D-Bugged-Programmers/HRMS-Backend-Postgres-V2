@@ -91,6 +91,54 @@ describe('buildReadiness', () => {
   });
 });
 
+describe('buildReadiness - loan perquisite', () => {
+  const run = (loansUntaxed?: { employeeId: string; outstanding: number; interestRate: number }[]) =>
+    buildReadiness({
+      month: 9,
+      year: 2026,
+      employees: [emp()],
+      withStructure: new Set(['e1']),
+      exits: new Map(),
+      loansUntaxed,
+    });
+
+  it('warns who has a loan that is not taxed as a perquisite while the SBI rate is off', () => {
+    const [c] = run([{ employeeId: 'e1', outstanding: 150000, interestRate: 0 }]);
+    expect(c.key).toBe('perquisite');
+    expect(c.level).toBe('warning');
+    expect(c.people[0].detail).toBe('loan ₹1,50,000 at 0%');
+  });
+
+  it('says nothing when no such loan is passed (the rate is set, or nobody has a loan)', () => {
+    expect(run()).toEqual([]);
+    expect(run([])).toEqual([]);
+  });
+});
+
+describe('buildReadiness - PRAN', () => {
+  const run = (npsOn: boolean, personalData: Record<string, unknown>) =>
+    buildReadiness({
+      month: 9,
+      year: 2026,
+      employees: [emp({ personalData: { bankAccountNo: '500100207919', bankIFSC: 'HDFC0001234', panNumber: 'ABCDE1234F', ...personalData } })],
+      withStructure: new Set(['e1']),
+      exits: new Map(),
+      npsOn,
+    });
+
+  it('NPS on: an enrolled employee without a PRAN is a blocker', () => {
+    const [c] = run(true, {});
+    expect(c.key).toBe('pran');
+    expect(c.level).toBe('blocker');
+  });
+
+  it('is not asked for when NPS is off, when the employee is not enrolled, or once the PRAN is on file', () => {
+    expect(run(false, {})).toEqual([]);
+    expect(run(true, { npsEnrolled: 'No' })).toEqual([]);
+    expect(run(true, { pranNumber: '110012345678' })).toEqual([]);
+  });
+});
+
 describe('buildReadiness - statutory', () => {
   const run = (statutoryOff: boolean, employees = [emp()]) =>
     buildReadiness({

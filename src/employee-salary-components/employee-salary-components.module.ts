@@ -10,6 +10,8 @@ import { SalaryStructurePdfService } from './salary-structure-pdf.service';
 import { PrivacyModule } from '../privacy/privacy.module';
 
 import { CompanyBrandsModule } from '../company-brands/company-brands.module';
+import { PayrollSettingsModule } from '../payroll-settings/payroll-settings.module';
+import { StatutoryConfigModule } from '../statutory-config/statutory-config.module';
 
 @Module({
   imports: [
@@ -20,6 +22,9 @@ import { CompanyBrandsModule } from '../company-brands/company-brands.module';
     EmailTemplatesModule,
     PrivacyModule,
     CompanyBrandsModule,
+    // The PF / ESI / PT figures on the printed structure are worked out from the settings in force today.
+    PayrollSettingsModule,
+    StatutoryConfigModule,
   ],
   controllers: [EmployeeSalaryComponentsController],
   providers: [EmployeeSalaryComponentsService, SalaryStructurePdfService],

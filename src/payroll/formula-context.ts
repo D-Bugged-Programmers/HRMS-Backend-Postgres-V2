@@ -124,6 +124,8 @@ export function isEsiExcludedEarning(c: {
   statutoryKey?: unknown;
   excludedFromEsiWages?: boolean | null;
 }): boolean {
+  // Basic and DA always count towards the ESI wages.
+  if (c.code === 'BASIC' || c.code === 'DA') return false;
   return c.excludedFromEsiWages === true || c.code === 'BONUS' || c.statutoryKey === 'BONUS';
 }
 
@@ -139,6 +141,15 @@ export function esiWagesOf(base: number, excluded: number, useRule: boolean | un
 /** ESI wage ceiling for a person with a disability (the general ceiling is a setting). */
 export const ESI_DISABLED_WAGE_CEILING = 25000;
 
+/** NPS enrolment from the profile (personalData.npsEnrolled = 'No' leaves the employee out; anything else follows the company). */
+export function npsProfileOf(personalData: unknown): { enrolled: boolean; employeeRate: number | null } {
+  const pd = (personalData as Record<string, unknown> | null | undefined) ?? {};
+  const enrolled = !(typeof pd.npsEnrolled === 'string' && pd.npsEnrolled.trim().toLowerCase() === 'no');
+  const raw = pd.npsEmployeeRate;
+  const rate = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
+  return { enrolled, employeeRate: Number.isFinite(rate) && rate >= 0 && rate <= 100 ? rate : null };
+}
+
 /** True when the employee's profile says they are a person with a disability (personalData.hasDisability = 'Yes'). */
 export function hasDisability(personalData: unknown): boolean {
   const v = (personalData as Record<string, unknown> | null | undefined)?.hasDisability;
@@ -153,6 +164,8 @@ export function deriveStatutoryContext(
   extraPfWageCodes: string[] = [],
   /** A person with a disability is covered by ESI up to ESI_DISABLED_WAGE_CEILING. */
   disabledPerson = false,
+  /** NPS: whether the employee is enrolled, their own rate if different from the company's, and the earnings counted in the NPS wages. */
+  nps: { enrolled?: boolean; employeeRate?: number | null; extraWageCodes?: string[] } = {},
 ): Record<string, number> {
   const esiCeiling = disabledPerson
     ? Math.max(settings.esiWageCeiling, settings.esiDisabledWageCeiling ?? ESI_DISABLED_WAGE_CEILING)
@@ -175,7 +188,13 @@ export function deriveStatutoryContext(
     BASIC_DA: basicDa,
     PF_WAGES: wages(settings.pfUseWagesRule, pfBase),
     GRATUITY_WAGES: wages(settings.gratuityUseWagesRule, basicDa),
-    NPS_WAGES: basicDa,
+    NPS_WAGES:
+      basicDa +
+      (nps.extraWageCodes ?? [])
+        .filter((c) => c !== 'BASIC' && c !== 'DA')
+        .reduce((s, c) => s + (context[c] ?? 0), 0),
+    NPS_ENROLLED: nps.enrolled === false ? 0 : 1,
+    NPS_EMPLOYEE_RATE: nps.employeeRate ?? settings.npsEmployeeRate ?? 0,
     // Coverage and bonus eligibility are decided on the monthly wage RATE (what the structure pays for a full
     // month), not on what a part month happened to earn: a joiner or a month of LOP must not drop an employee out
     // of (or into) ESI / the bonus. The caller supplies the full-month figures; absent, the actual wages are used.

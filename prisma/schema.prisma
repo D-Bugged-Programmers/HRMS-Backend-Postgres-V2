@@ -1703,6 +1703,8 @@ model SalaryComponent {
   countsTowardsPfWages   Boolean       @default(false)
   // An earning left out of the ESI wages (e.g. Conveyance, a travelling allowance the ESI Act excludes).
   excludedFromEsiWages   Boolean       @default(false)
+  // An earning counted in the NPS wages besides Basic and DA (which always count).
+  countsTowardsNpsWages  Boolean       @default(false)
   isStatutory            Boolean       @default(false)
   statutoryKey           StatutoryKey?
   payFrequency           PayFrequency  @default(MONTHLY)
@@ -4535,6 +4537,11 @@ model StatutoryFiling {
   dueDate  String
   filedAt  DateTime @default(now())
   filedById String
+  // What HR confirmed: the date it was paid / filed (YYYY-MM-DD), the challan / TRRN / acknowledgement number, and the amount if any.
+  // Empty on records made before these were asked for. TDS deposits and returns are not recorded here: they follow the TDS records.
+  filedOn   String?
+  reference String   @default("")
+  amount    Float?
 
   @@unique([organizationId, key, dueDate])
   @@index([organizationId])

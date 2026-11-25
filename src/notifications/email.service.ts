@@ -66,6 +66,12 @@ function emailDriver(): 'resend' | 'smtp' {
   return process.env.EMAIL_DRIVER === 'resend' ? 'resend' : 'smtp';
 }
 
+/** dryRun true = nothing was sent; `reason` says why (callers that must tell the user, such as a letter, check it). */
+export interface EmailSendResult {
+  dryRun: boolean;
+  reason?: 'no-address' | 'inactive' | 'test-address' | 'not-configured' | 'paused' | 'failed';
+}
+
 @Injectable()
 export class EmailService {
   private readonly logger = new Logger(EmailService.name);
@@ -167,7 +173,7 @@ export class EmailService {
     }
   }
 
-  async send(input: SendEmailInput): Promise<{ dryRun: boolean }> {
+  async send(input: SendEmailInput): Promise<EmailSendResult> {
     const { attachments, organizationId } = input;
     // The product name in the mail follows the name saved in the Control Center.
     const subject = this.platformBrand ? await this.platformBrand.applyToEmail(input.subject, false) : input.subject;
@@ -176,7 +182,7 @@ export class EmailService {
     // A person with no email has a placeholder login address that can never receive mail: nothing is sent to it.
     if (isPlaceholderEmail(to)) {
       this.logger.log(`[Email - SKIPPED, recipient has no email] Subject: ${subject}`);
-      return { dryRun: true };
+      return { dryRun: true, reason: 'no-address' };
     }
     cc = cc?.filter((a) => !isPlaceholderEmail(a));
     bcc = bcc?.filter((a) => !isPlaceholderEmail(a));
@@ -185,7 +191,7 @@ export class EmailService {
       if (inactive.size > 0) {
         if (inactive.has(to.trim().toLowerCase())) {
           this.logger.log(`[Email - SKIPPED, recipient is an inactive employee] To: ${to} | Subject: ${subject}`);
-          return { dryRun: true };
+          return { dryRun: true, reason: 'inactive' };
         }
         cc = cc?.filter((a) => !inactive.has(a.trim().toLowerCase()));
         bcc = bcc?.filter((a) => !inactive.has(a.trim().toLowerCase()));
@@ -207,7 +213,7 @@ export class EmailService {
       this.logger.log(
         `[Email - SKIPPED, reserved test address] To: ${to} | Subject: ${subject}${attachmentNote}`,
       );
-      return { dryRun: true };
+      return { dryRun: true, reason: 'test-address' };
     }
 
     if (emailDriver() === 'resend') {
@@ -215,7 +221,7 @@ export class EmailService {
         this.logger.log(
           `[Email - DRY RUN, EMAIL_DRIVER=resend but RESEND_API_KEY not set] To: ${to}${ccNote} | Subject: ${subject}${attachmentNote} | Body not logged (may contain credentials)`,
         );
-        return { dryRun: true };
+        return { dryRun: true, reason: 'not-configured' };
       }
       try {
         const { error } = await this.getResend().emails.send({
@@ -238,7 +244,7 @@ export class EmailService {
         this.logger.error(
           `[Email] Resend failed to send to ${to} (Subject: ${subject}). Body not logged (may contain credentials). Resend error: ${message}`,
         );
-        return { dryRun: true };
+        return { dryRun: true, reason: 'failed' };
       }
     }
 
@@ -246,14 +252,14 @@ export class EmailService {
       this.logger.log(
         `[Email - DRY RUN, SMTP not configured] To: ${to}${ccNote} | Subject: ${subject}${attachmentNote} | Body not logged (may contain credentials)`,
       );
-      return { dryRun: true };
+      return { dryRun: true, reason: 'not-configured' };
     }
 
     if (Date.now() < this.smtpPausedUntil) {
       this.logger.warn(
         `[Email - PAUSED, the mail provider refused the login a moment ago] To: ${to} | Subject: ${subject}${attachmentNote}`,
       );
-      return { dryRun: true };
+      return { dryRun: true, reason: 'paused' };
     }
 
     try {
@@ -288,7 +294,7 @@ export class EmailService {
           `[Email] SMTP sends paused for ${SMTP_PAUSE_MS / 60000} minutes after a login refusal.`,
         );
       }
-      return { dryRun: true };
+      return { dryRun: true, reason: 'failed' };
     }
   }
 }

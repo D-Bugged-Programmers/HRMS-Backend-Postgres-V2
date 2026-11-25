@@ -65,6 +65,7 @@ import {
   mergePersonalData,
   uanRequiredFor,
   aadhaarRequiredFor,
+  pranRequiredFor,
 } from './personal-data';
 import { assertNotSelfApproval, inReviewerScope } from '../common/dept-scope';
 
@@ -214,7 +215,7 @@ export class EmployeeProfileService {
           contactNumber: true, profileImage: true, designation: true, departmentId: true, employeeCategory: true, workLocationId: true,
         },
       }),
-      this.scopedPrisma.payrollSettings.findFirst({ where: { organizationId }, select: { pfEnabled: true } }),
+      this.scopedPrisma.payrollSettings.findFirst({ where: { organizationId }, select: { pfEnabled: true, npsEnabled: true } }),
     ]);
     const visible = employees.filter(
       (e) => actor.id === e.id || actor.role === Role.ADMIN || !(e.role === Role.ADMIN || e.role === Role.HR),
@@ -236,7 +237,7 @@ export class EmployeeProfileService {
         withAccountFields(withRootGender(e.personalData as Record<string, unknown>, e.gender), e),
         requirements,
         byEmployee.get(e.id) ?? [],
-        { uanRequired: uanRequiredFor({ pfEnabled: payrollSettings?.pfEnabled ?? false, employeeType: e.employeeType }) },
+        { uanRequired: uanRequiredFor({ pfEnabled: payrollSettings?.pfEnabled ?? false, employeeType: e.employeeType }), pranRequired: pranRequiredFor({ npsEnabled: payrollSettings?.npsEnabled ?? false, personalData: e.personalData }) },
       );
       return {
         employeeId: e.id,
@@ -371,14 +372,15 @@ export class EmployeeProfileService {
 
   // What the profile must contain for this person because of the company's statutory switches: a UAN where PF applies, the Aadhaar number where PF or ESI applies.
   private async profileNeeds(
-    employee: { employeeType: string | null },
+    employee: { employeeType: string | null; personalData?: unknown },
     organizationId: string,
-  ): Promise<{ uanRequired: boolean; aadhaarRequired: boolean }> {
+  ): Promise<{ uanRequired: boolean; aadhaarRequired: boolean; pranRequired: boolean }> {
     const settings = await this.scopedPrisma.payrollSettings.findFirst({
       where: { organizationId },
-      select: { pfEnabled: true, esiEnabled: true },
+      select: { pfEnabled: true, esiEnabled: true, npsEnabled: true },
     });
     return {
+      pranRequired: pranRequiredFor({ npsEnabled: settings?.npsEnabled ?? false, personalData: employee.personalData }),
       uanRequired: uanRequiredFor({ pfEnabled: settings?.pfEnabled ?? false, employeeType: employee.employeeType }),
       aadhaarRequired: aadhaarRequiredFor({ pfEnabled: settings?.pfEnabled ?? false, esiEnabled: settings?.esiEnabled ?? false, employeeType: employee.employeeType }),
     };
@@ -467,6 +469,9 @@ export class EmployeeProfileService {
       delete patch.currentCTC;
       // Changes the ESI wage ceiling, so HR sets it, not the employee.
       delete patch.hasDisability;
+      // NPS enrolment and the contribution rate change what is deducted from pay, so HR sets them.
+      delete patch.npsEnrolled;
+      delete patch.npsEmployeeRate;
     }
     assertPersonalDataShape(patch, before);
     assertValidIdentifiers(patch);

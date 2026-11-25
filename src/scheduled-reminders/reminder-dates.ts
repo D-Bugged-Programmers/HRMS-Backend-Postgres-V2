@@ -2,12 +2,18 @@
 // Important: all dates are plain 'YYYY-MM-DD' strings, matching the rest of the codebase, and are handled in UTC so
 // no server-timezone or DST shift can change a calendar date.
 
+import { challanDueDate } from '../tds-compliance/tds-math';
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const parse = (d: string) => {
   const [y, m, day] = d.split('-').map(Number);
   return Date.UTC(y, m - 1, day);
 };
+
+// "TDS return (Form 138)" for a quarter starting on/after 1-Apr-2026, "TDS return (Form 24Q)" before.
+const tdsReturnLabel = (quarterStart: string): string =>
+  `TDS return (${quarterStart >= '2026-04-01' ? 'Form 138' : 'Form 24Q'})`;
 
 /** Whole days from `from` to `to` (negative when `to` is earlier). */
 export function daysBetween(from: string, to: string): number {
@@ -83,6 +89,8 @@ export interface StatutoryDue {
   label: string;
   dueDate: string;
   period: string;
+  /** The calendar months ('YYYY-MM') the obligation is for, so a caller can check whether payroll or TDS happened in them. */
+  months: string[];
   daysLeft: number;
 }
 
@@ -90,28 +98,35 @@ export interface StatutoryDue {
 // date for their registration category. Payment obligations are only reminded for modules the org has switched on.
 //   PF / ESI      15th of the following month
 //   TDS (salary)  7th of the following month
-//   Form 24Q      31 Jul / 31 Oct / 31 Jan / 31 May (quarters ending Jun / Sep / Dec / Mar)
+//   TDS return    31 Jul / 31 Oct / 31 Jan / 31 May (Form 138 from 1-Apr-2026, Form 24Q before) (quarters ending Jun / Sep / Dec / Mar)
 //   PT            last day of the following month
 //   LWF (Mah.)    15 Jul (Jan-Jun) and 15 Jan (Jul-Dec)
 export function upcomingStatutoryDues(
   today: string,
   enabledModules: ReadonlySet<string>,
   leadDays: readonly number[] = STATUTORY_REMINDER_DAYS,
+  /** How many months before this one the monthly dues are generated (the filing tracker looks further back than the reminders). */
+  lookbackMonths = 1,
 ): StatutoryDue[] {
   const [year, month] = today.split('-').map(Number);
   const candidates: Omit<StatutoryDue, 'daysLeft'>[] = [];
+  const ym = (date: string) => date.slice(0, 7);
+  const monthsOf = (startYear: number, startMonth: number, count: number) =>
+    Array.from({ length: count }, (_, i) => ym(dateOf(startYear, startMonth + i, 1)));
 
   // Monthly obligations: look at the due dates falling in the previous, current and next calendar month.
-  for (let offset = -1; offset <= 2; offset++) {
+  for (let offset = -lookbackMonths; offset <= 2; offset++) {
     const dueMonth = month + offset;
     const periodMonth = dateOf(year, dueMonth - 1, 1); // the month the contribution is for
     const period = monthLabel(periodMonth);
+    const periodMonths = [ym(periodMonth)];
     if (enabledModules.has('PF')) {
       candidates.push({
         key: 'PF',
         label: 'PF contribution and ECR',
         dueDate: dateOf(year, dueMonth, 15),
         period,
+        months: periodMonths,
       });
     }
     if (enabledModules.has('ESI')) {
@@ -120,6 +135,7 @@ export function upcomingStatutoryDues(
         label: 'ESI contribution',
         dueDate: dateOf(year, dueMonth, 15),
         period,
+        months: periodMonths,
       });
     }
     if (enabledModules.has('PT')) {
@@ -128,42 +144,50 @@ export function upcomingStatutoryDues(
         label: 'Professional Tax payment',
         dueDate: dateOf(year, dueMonth + 1, 31), // clamped to the last day of the following month
         period: monthLabel(dateOf(year, dueMonth, 1)),
+        months: [ym(dateOf(year, dueMonth, 1))],
       });
     }
+    // Tax deducted in a month is deposited by the 7th of the next month; March's by 30 April (the same rule as the TDS Compliance page).
     candidates.push({
       key: 'TDS',
       label: 'TDS deposit (salary)',
-      dueDate: dateOf(year, dueMonth, 7),
+      dueDate: challanDueDate(Number(periodMonth.slice(5, 7)), Number(periodMonth.slice(0, 4))),
       period,
+      months: periodMonths,
     });
   }
 
-  // Quarterly TDS return (Form 24Q) and half-yearly LWF, for this and the adjoining years.
-  for (const y of [year - 1, year, year + 1]) {
+  // Quarterly salary TDS return and half-yearly LWF, for this and the adjoining years. The return is Form 138 for quarters starting on/after
+  // 1-Apr-2026 (Income-tax Act, 2025) and Form 24Q before; the key stays '24Q' so filings already marked keep matching.
+  for (const y of [year - 2, year - 1, year, year + 1]) {
     candidates.push(
       {
         key: '24Q',
-        label: 'TDS return (Form 24Q)',
+        label: tdsReturnLabel(`${y}-04-01`),
         dueDate: `${y}-07-31`,
         period: `April to June ${y}`,
+        months: monthsOf(y, 4, 3),
       },
       {
         key: '24Q',
-        label: 'TDS return (Form 24Q)',
+        label: tdsReturnLabel(`${y}-07-01`),
         dueDate: `${y}-10-31`,
         period: `July to September ${y}`,
+        months: monthsOf(y, 7, 3),
       },
       {
         key: '24Q',
-        label: 'TDS return (Form 24Q)',
+        label: tdsReturnLabel(`${y - 1}-10-01`),
         dueDate: `${y}-01-31`,
         period: `October to December ${y - 1}`,
+        months: monthsOf(y - 1, 10, 3),
       },
       {
         key: '24Q',
-        label: 'TDS return (Form 24Q)',
+        label: tdsReturnLabel(`${y}-01-01`),
         dueDate: `${y}-05-31`,
         period: `January to March ${y}`,
+        months: monthsOf(y, 1, 3),
       },
     );
     if (enabledModules.has('LWF')) {
@@ -173,12 +197,14 @@ export function upcomingStatutoryDues(
           label: 'Labour Welfare Fund contribution',
           dueDate: `${y}-07-15`,
           period: `January to June ${y}`,
+          months: monthsOf(y, 1, 6),
         },
         {
           key: 'LWF',
           label: 'Labour Welfare Fund contribution',
           dueDate: `${y}-01-15`,
           period: `July to December ${y - 1}`,
+          months: monthsOf(y - 1, 7, 6),
         },
       );
     }

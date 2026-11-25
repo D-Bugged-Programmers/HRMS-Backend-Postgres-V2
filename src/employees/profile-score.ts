@@ -103,7 +103,7 @@ export function profileScore(
   requirements: { name: string; isMandatory: boolean; isActive: boolean }[],
   documents: { docType: string; status: string }[],
   // A UAN is asked for where PF applies, unless the person said they have none yet (their first PF job).
-  opts: { uanRequired?: boolean } = {},
+  opts: { uanRequired?: boolean; pranRequired?: boolean } = {},
 ): ProfileScore {
   const pd = personalData ?? {};
   const missing: MissingItem[] = [];
@@ -117,6 +117,11 @@ export function profileScore(
   if (opts.uanRequired && pd.noUanYet !== true) {
     extra = 1;
     if (!filled(pd.uanNumber)) missing.push({ key: 'uanNumber', label: 'UAN number', group: 'Bank & tax' });
+  }
+  // A PRAN is asked for where NPS applies to this person.
+  if (opts.pranRequired) {
+    extra += 1;
+    if (!filled(pd.pranNumber)) missing.push({ key: 'pranNumber', label: 'PRAN (NPS)', group: 'Bank & tax' });
   }
   const mandatory = requirements.filter((r) => r.isMandatory && r.isActive);
   for (const r of mandatory) {

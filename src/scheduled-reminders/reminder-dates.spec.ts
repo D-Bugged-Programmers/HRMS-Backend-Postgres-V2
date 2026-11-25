@@ -83,6 +83,24 @@ describe('upcomingStatutoryDues', () => {
     expect(keys('2026-07-26', none)).toContain('24Q@2026-07-31/5');
     expect(keys('2027-01-30', none)).toContain('24Q@2027-01-31/1');
   });
+  it('names the quarterly TDS return Form 138 from 1-Apr-2026 and Form 24Q before', () => {
+    const label = (today: string, due: string) =>
+      upcomingStatutoryDues(today, none, [5, 1]).find((d) => d.key === '24Q' && d.dueDate === due)?.label;
+    expect(label('2026-07-26', '2026-07-31')).toBe('TDS return (Form 138)'); // April-June 2026
+    expect(label('2026-10-26', '2026-10-31')).toBe('TDS return (Form 138)');
+    expect(label('2027-01-26', '2027-01-31')).toBe('TDS return (Form 138)'); // October-December 2026
+    expect(label('2026-05-26', '2026-05-31')).toBe('TDS return (Form 24Q)'); // January-March 2026, still FY 2025-26
+    expect(label('2026-01-26', '2026-01-31')).toBe('TDS return (Form 24Q)'); // October-December 2025
+  });
+  it("March's TDS deposit is due on 30 April, not 7 April; other months on the 7th", () => {
+    const tds = (today: string) => upcomingStatutoryDues(today, none, [-30, -20, -10, 0, 5, 1, 10, 20]).filter((d) => d.key === 'TDS');
+    expect(tds('2026-04-10').map((d) => d.dueDate)).not.toContain('2026-04-07'); // not the 7th for March
+    expect(tds('2026-04-10').map((d) => d.dueDate)).toContain('2026-04-30');
+    const march = upcomingStatutoryDues('2026-04-25', none, [5]).find((d) => d.key === 'TDS' && d.dueDate === '2026-04-30');
+    expect(march?.period).toBe('March 2026');
+    expect(march?.months).toEqual(['2026-03']);
+    expect(upcomingStatutoryDues('2026-05-02', none, [5]).find((d) => d.key === 'TDS')?.dueDate).toBe('2026-05-07'); // April's tax
+  });
   it('reminds Maharashtra LWF for the half-years (15 Jul and 15 Jan), only when enabled', () => {
     expect(keys('2026-07-10', all)).toContain('LWF@2026-07-15/5');
     expect(keys('2027-01-10', all)).toContain('LWF@2027-01-15/5');

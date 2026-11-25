@@ -544,6 +544,14 @@ function wfhAlreadyRequestedMessage(
   return `${what} Only one request is allowed per day.`;
 }
 
+/** A day someone recorded or punched as worked (present, half day, punch with no punch-out; not the system's own stamps). Imported leave leaves it alone. */
+export function isWorkedByPerson(r: { status: AttendanceStatus; source: AttendanceSource }): boolean {
+  return (
+    r.source !== AttendanceSource.SYSTEM &&
+    (r.status === AttendanceStatus.PRESENT || r.status === AttendanceStatus.HALF_DAY || r.status === AttendanceStatus.INCOMPLETE)
+  );
+}
+
 @Injectable()
 export class AttendanceService {
   private readonly logger = new Logger(AttendanceService.name);
@@ -3754,23 +3762,32 @@ export class AttendanceService {
     // The days the leave is charged for, when that is fewer than every date in its range (a holiday or weekly off inside it that
     // the leave type's sandwich rule leaves out keeps its own status). Omitted = every date in the range.
     onlyDates?: string[],
+    // Imported leave leaves a day that already has recorded or punched attendance as it is; other leave replaces it.
+    keepWorkedDays = false,
   ) {
     const status = leave.isHalfDay
       ? AttendanceStatus.HALF_DAY
       : AttendanceStatus.ON_LEAVE;
 
-    const dates = onlyDates ?? enumerateDateStrings(leave.startDate, leave.endDate);
+    let dates = onlyDates ?? enumerateDateStrings(leave.startDate, leave.endDate);
     if (dates.length === 0) return;
     // One findMany + one updateMany + one createMany instead of a
     // findFirst+update/create pair per date — a leave range is usually
     // short, but this is free to batch regardless.
-    const existingRows = await tx.attendance.findMany({
+    let existingRows = await tx.attendance.findMany({
       where: {
         organizationId,
         employeeId: leave.employeeId,
         date: { in: dates },
       },
     });
+    if (keepWorkedDays) {
+      const kept = new Set(existingRows.filter((r) => isWorkedByPerson(r)).map((r) => r.date));
+      if (kept.size > 0) {
+        existingRows = existingRows.filter((r) => !kept.has(r.date));
+        dates = dates.filter((d) => !kept.has(d));
+      }
+    }
     const existingDates = new Set(existingRows.map((r) => r.date));
 
     for (const r of existingRows) {

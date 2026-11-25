@@ -145,6 +145,7 @@ import {
   buildBaseContext,
   deriveStatutoryContext,
   hasDisability,
+  npsProfileOf,
   isEsiExcludedEarning,
   esiWagesOf,
   splitEmployerPf,
@@ -1136,6 +1137,10 @@ export class PayrollService {
           .filter((c) => c.countsTowardsPfWages)
           .map((c) => c.code),
         hasDisability(employee.personalData),
+        {
+          ...npsProfileOf(employee.personalData),
+          extraWageCodes: allComponents.filter((c) => c.countsTowardsNpsWages).map((c) => c.code),
+        },
       ),
     );
     // Charge the month's PF wages at each period's own ceiling (see pf-ceiling-split.ts). The blended figure stands in
@@ -1778,6 +1783,8 @@ export class PayrollService {
       lines: { code: string; name: string; amount: number }[];
       /** The employee's own PF and ESI (deducted from their pay). */
       employeeLines: { code: string; name: string; amount: number }[];
+      /** PF and ESI lines the company has on that are worked out as nil for this person (above the wage limit, or exempt), so a screen can say "not applicable". */
+      notApplicableLines: { code: string; name: string; amount: number; employer: boolean }[];
     }[]
   > {
     const { settings, components, today } =
@@ -1816,19 +1823,24 @@ export class PayrollService {
         components: withCityHra(components, cityClass),
         settings,
         rows: current,
-        profile: { disabled: hasDisability(u.personalData) },
+        profile: { disabled: hasDisability(u.personalData), nps: npsProfileOf(u.personalData) },
       });
       const employeeLines = employeeContributionLinesForStructure({
         components: withCityHra(components, cityClass),
         settings,
         rows: current,
-        profile: { state: effectiveWorkLocation(u)?.state ?? null, gender: u.gender, disabled: hasDisability(u.personalData) },
+        profile: { state: effectiveWorkLocation(u)?.state ?? null, gender: u.gender, disabled: hasDisability(u.personalData), nps: npsProfileOf(u.personalData) },
       });
+      const notApplicableLines = components
+        .filter((c) => ['PF', 'ESI', 'PF_EMPLOYER', 'ESI_EMPLOYER'].includes(c.code) && c.isActive)
+        .filter((c) => !(c.isEmployerContribution ? lines : employeeLines).some((l) => l.code === c.code))
+        .map((c) => ({ code: c.code, name: c.name, amount: 0, employer: !!c.isEmployerContribution }));
       return {
         employeeId: u.id,
         employerMonthly: lines.reduce((s, l) => s + l.amount, 0),
         lines,
         employeeLines,
+        notApplicableLines,
       };
     });
   }
@@ -1863,7 +1875,7 @@ export class PayrollService {
       components: withCityHra(context.components, cityClass),
       settings: context.settings,
       rows,
-      profile: { state, gender: employee.gender ?? null, disabled: hasDisability(employee.personalData) },
+      profile: { state, gender: employee.gender ?? null, disabled: hasDisability(employee.personalData), nps: npsProfileOf(employee.personalData) },
     };
     return {
       employeeLines: employeeContributionLinesForStructure(args),
@@ -4387,6 +4399,25 @@ export class PayrollService {
       ),
     );
 
+    // While the SBI benchmark rate is 0 (off), a loan at a low or nil interest rate is not taxed as a perquisite: name who it affects.
+    let loansUntaxed: { employeeId: string; outstanding: number; interestRate: number }[] = [];
+    if (!(payrollSettings.perquisiteLoanBenchmarkRate > 0)) {
+      const loans = await this.scopedPrisma.loan.findMany({
+        where: { organizationId, employeeId: { in: ids }, status: LoanStatus.ACTIVE, loanType: LoanType.LOAN },
+        select: { employeeId: true, outstandingBalance: true, interestRate: true },
+      });
+      const byEmployee = new Map<string, { outstanding: number; interestRate: number }>();
+      for (const l of loans) {
+        const cur = byEmployee.get(l.employeeId) ?? { outstanding: 0, interestRate: l.interestRate };
+        cur.outstanding += l.outstandingBalance;
+        cur.interestRate = Math.min(cur.interestRate, l.interestRate);
+        byEmployee.set(l.employeeId, cur);
+      }
+      // Same limit the calculation uses: nothing is taxed while the total outstanding stays within 20,000.
+      loansUntaxed = [...byEmployee.entries()]
+        .filter(([, v]) => v.outstanding > 20000)
+        .map(([employeeId, v]) => ({ employeeId, ...v }));
+    }
     const checks = buildReadiness({
       month,
       year,
@@ -4405,6 +4436,8 @@ export class PayrollService {
       ]),
       exits: new Map(exitCases.map((c) => [c.employeeId, c.lastWorkingDay])),
       statutoryOff,
+      npsOn: payrollSettings.npsEnabled,
+      loansUntaxed,
     });
     if (gaps.length > 0) {
       // Between "no salary structure" and "bank details": unmarked days are paid as unpaid leave.

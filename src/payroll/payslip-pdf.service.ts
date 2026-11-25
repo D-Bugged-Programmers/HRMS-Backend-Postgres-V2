@@ -618,7 +618,18 @@ export class PayslipPdfService {
     };
     const earnings = nonZero(run.earnings as PayrollLine[]);
     const deductions = nonZero(run.deductions as PayrollLine[]);
-    const employerContributions = run.employerContributions as PayrollLine[];
+    // Employer lines switched off for the CTC (EDLI and the PF admin charge by default) are not printed on the payslip.
+    const notInCtc = new Set(
+      run.organizationId
+        ? (
+            await this.scopedPrisma.salaryComponent.findMany({
+              where: { organizationId: run.organizationId, isEmployerContribution: true, includeInCTC: false },
+              select: { code: true },
+            })
+          ).map((c) => c.code)
+        : [],
+    );
+    const employerContributions = (run.employerContributions as PayrollLine[]).filter((c) => !notInCtc.has(c.code));
 
     const rowCount = Math.max(earnings.length, deductions.length, 1);
     const tableRowH = rowCount > 10 ? 11 : rowCount > 6 ? 13 : 15;

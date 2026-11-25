@@ -16,6 +16,7 @@ import {
   Put,
   Query,
   Res,
+  ServiceUnavailableException,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
@@ -253,7 +254,7 @@ export class TdsComplianceController {
     res.end(pdf);
   }
 
-  // Tells every employee with finalized pay in the year that their Form 16 can be downloaded (template FORM16_AVAILABLE). No
+  // Tells every employee with finalized pay in the year that their Form 130 (Form 16 before 1-Apr-2026) can be downloaded (template FORM16_AVAILABLE). No
   // attachment: the certificate itself is still downloaded from Tax Declaration or issued per person below.
   @Post('form130/notify')
   @Roles(Role.ADMIN, Role.HR)
@@ -272,7 +273,7 @@ export class TdsComplianceController {
         to: u.email,
         occasionKey: 'FORM16_AVAILABLE',
         notificationPreferences: u.notificationPreferences,
-        variables: { employeeName: u.name, financialYear: q.financialYear, downloadUrl: `${frontendUrl()}/tax-declaration` },
+        variables: { employeeName: u.name, financialYear: q.financialYear, formName: Number(q.financialYear.slice(0, 4)) >= 2026 ? 'Form 130' : 'Form 16', downloadUrl: `${frontendUrl()}/tax-declaration` },
       });
       if (ok) sent++;
     }
@@ -333,13 +334,17 @@ export class TdsComplianceController {
         html: `<p>Hi ${escapeHtml(employee.name)},</p><p>Your ${escapeHtml(data.formName)} (tax certificate) for ${escapeHtml(q.financialYear)} is attached. Please keep it for your income-tax filing.</p>`,
       },
     );
-    await this.emailService.send({
+    const sendResult = await this.emailService.send({
       organizationId: c.organizationId,
       to,
       subject: rendered.subject,
       html: rendered.html,
       attachments: [{ filename, content: pdf }],
     });
+    // Nothing was sent (mail not set up, paused or refused): say so instead of reporting it as sent.
+    if (sendResult?.dryRun) {
+      throw new ServiceUnavailableException(`The certificate could not be emailed to ${to}. Check that email is set up and working, then try again.`);
+    }
     return {
       sentTo: to,
       toPersonalEmail: !!personal,

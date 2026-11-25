@@ -146,7 +146,7 @@ const SUPPLIED: Record<string, string[]> = {
   ASSET_RETURN_REMINDER: ['assetList', 'assetCount', 'lastWorkingDay'],
   LOAN_EMI_DUE: ['loanType', 'month', 'emiAmount', 'outstanding'],
   LOAN_CLOSED: ['loanType', 'amount', 'closedOn'],
-  FORM16_AVAILABLE: ['financialYear', 'downloadUrl'],
+  FORM16_AVAILABLE: ['financialYear', 'formName', 'downloadUrl'],
   ONBOARDING_REMINDER: ['pendingItems', 'profileUrl'],
   RESIGNATION_SUBMITTED: ['subjectName', 'requestedLwd', 'reason', 'reviewUrl'],
   RESIGNATION_PENDING_REMINDER: ['subjectName', 'requestedLwd', 'daysWaiting', 'reviewUrl'],

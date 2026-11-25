@@ -50,6 +50,12 @@ const IDENTIFIER_PATTERNS: Record<
     label: 'PF number',
     example: 'MH/BAN/1234567/000/0001234',
   },
+  // NPS Permanent Retirement Account Number: 12 digits.
+  pranNumber: {
+    pattern: /^[0-9]{12}$/,
+    label: 'PRAN',
+    example: '110012345678',
+  },
   esicNumber: {
     pattern: /^[0-9]{10}$/,
     label: 'ESIC number',
@@ -144,6 +150,10 @@ export const KNOWN_PERSONAL_DATA_KEYS = new Set([
   'gender',
   // 'Yes' / 'No': a person with a disability is covered by ESI up to a higher wage ceiling (HR sets it).
   'hasDisability',
+  // NPS: the PRAN, whether the person is enrolled ('Yes' / 'No'; blank follows the company) and their own contribution rate (%).
+  'pranNumber',
+  'npsEnrolled',
+  'npsEmployeeRate',
   'maritalStatus',
   'motherContact',
   'motherName',
@@ -423,7 +433,7 @@ export function isProfileComplete(
   personalData: Record<string, unknown>,
   // hasContactNumber / hasProfilePhoto: facts about the employee record (not the personal data). When given and false, the
   // profile is not complete - the same two things the completeness percentage counts.
-  opts: { uanRequired?: boolean; aadhaarRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
+  opts: { uanRequired?: boolean; aadhaarRequired?: boolean; pranRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
 ): boolean {
   if (opts.hasContactNumber === false || opts.hasProfilePhoto === false) return false;
   const filled = (field: string) => {
@@ -433,6 +443,8 @@ export function isProfileComplete(
   if (!REQUIRED_FOR_COMPLETION.every(filled)) return false;
   // Aadhaar only where PF or ESI applies to this person.
   if (opts.aadhaarRequired && !filled('aadharNumber')) return false;
+  // A PRAN only where NPS applies to this person (see pranRequiredFor).
+  if (opts.pranRequired && !filled('pranNumber')) return false;
   // UAN only where PF applies, and not from someone who said they have none yet (first PF job).
   return (
     !opts.uanRequired || personalData.noUanYet === true || filled('uanNumber')
@@ -457,6 +469,14 @@ export function uanRequiredFor(input: {
   employeeType?: string | null;
 }): boolean {
   return input.pfEnabled && statutoryDefaultsForType(input.employeeType).pf;
+}
+
+// NPS applies to this person: the company has NPS on and the profile does not leave them out (npsEnrolled = 'No'). Then a PRAN is
+// asked for; where NPS is off, or the person is not enrolled, it stays optional.
+export function pranRequiredFor(input: { npsEnabled: boolean; personalData?: unknown }): boolean {
+  if (!input.npsEnabled) return false;
+  const v = (input.personalData as Record<string, unknown> | null | undefined)?.npsEnrolled;
+  return !(typeof v === 'string' && v.trim().toLowerCase() === 'no');
 }
 
 // A mandatory DocumentRequirement is satisfied by any uploaded
@@ -533,7 +553,7 @@ export function mergePersonalData(
   current: Record<string, unknown>,
   patch: Record<string, unknown>,
   mandatoryDocumentsUploaded: boolean,
-  opts: { uanRequired?: boolean; aadhaarRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
+  opts: { uanRequired?: boolean; aadhaarRequired?: boolean; pranRequired?: boolean; hasContactNumber?: boolean; hasProfilePhoto?: boolean } = {},
 ): Record<string, unknown> {
   const merged = { ...current, ...dropReSignedFileUrls(current, patch) };
   const completed =

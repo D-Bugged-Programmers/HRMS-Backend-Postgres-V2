@@ -85,6 +85,7 @@ function build(
       findFirst: async () => r,
       findMany: async () => opts.priorRuns ?? [],
     },
+    salaryComponent: { findMany: async () => [] },
     payrollTemplate: {
       findFirst: async () =>
         opts.template === undefined ? TEMPLATE : opts.template,

@@ -31,7 +31,11 @@ describe('findSettingsClashes', () => {
 
   it('flags salary paid before payroll is processed', () => {
     expect(keys({ processingDate: '2026-11-26', paymentDate: '2026-11-05' })).toEqual(['pay-before-processing']);
-    expect(keys({ processingDate: '2026-11-26', paymentDate: '2026-11-26' })).toEqual([]);
+  });
+
+  it('flags salary paid on the same day payroll is processed, but not a payment day after it', () => {
+    expect(keys({ processingDate: '2026-11-26', paymentDate: '2026-11-26' })).toEqual(['pay-same-as-processing']);
+    expect(keys({ processingDate: '2026-11-26', paymentDate: '2026-11-27' })).toEqual([]);
   });
 
   it('flags a fixed processing or payment day that lands on a weekly off, but not "last working day"', () => {

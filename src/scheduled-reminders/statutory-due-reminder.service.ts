@@ -3,7 +3,8 @@
 // Responsibilities: 5 days and 1 day before each due date (see upcomingStatutoryDues), notifies every active HR and
 // Admin — in-app and by the STATUTORY_DUE_REMINDER email template.
 // Important: payment reminders (PF/ESI/PT/LWF) are sent only for statutory modules the org has switched on; TDS
-// always applies once payroll runs. The dates are the standard ones — the message asks HR to verify them.
+// is reminded only for months and quarters in which TDS was actually deducted (March's deposit is due 30 April). The dates are the
+// standard ones — the message asks HR to verify them.
 import { keepModuleEnabled } from '../module-access/module-gate';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
@@ -15,6 +16,7 @@ import { frontendUrl } from '../common/frontend-url';
 import { formatDateDisplay } from '../payroll/format-date';
 import { ReminderNotifier } from './reminder-notifier.service';
 import { upcomingStatutoryDues } from './reminder-dates';
+import { loadDueContext, relevantDues, tdsRecordFor } from '../reports/statutory-due-activity';
 
 @Injectable()
 export class StatutoryDueReminderService {
@@ -59,11 +61,12 @@ export class StatutoryDueReminderService {
     const filedKeys = new Set(
       (await this.scopedPrisma.statutoryFiling.findMany({ where: { organizationId }, select: { key: true, dueDate: true } })).map((f) => `${f.key}|${f.dueDate}`),
     );
-    const dues = upcomingStatutoryDues(
-      today,
-      new Set(versions.map((v) => v.module)),
-      [5, 1, -1, -7],
-    ).filter((d) => !filedKeys.has(`${d.key}|${d.dueDate}`));
+    // Only dues with something behind them: no reminder for TDS in a month where none was deducted, or for a period with no payroll.
+    const ctx = await loadDueContext(this.scopedPrisma, organizationId, Number(today.slice(0, 4)) - 1);
+    const dues = relevantDues(
+      upcomingStatutoryDues(today, new Set(versions.map((v) => v.module)), [5, 1, -1, -7]),
+      ctx,
+    ).filter((d) => !filedKeys.has(`${d.key}|${d.dueDate}`) && !tdsRecordFor(d, ctx)); // a TDS deposit / return already on the TDS records is done
     if (dues.length === 0) return 0;
 
     const recipients = (await this.notifier.activeUsers(organizationId)).filter(

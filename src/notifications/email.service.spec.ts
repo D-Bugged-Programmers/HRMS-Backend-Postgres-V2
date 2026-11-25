@@ -29,7 +29,7 @@ describe('EmailService', () => {
     delete process.env.SMTP_USER;
     delete process.env.SMTP_PASS;
     const result = await new EmailService({} as any).send(input);
-    expect(result).toEqual({ dryRun: true });
+    expect(result).toMatchObject({ dryRun: true });
     expect(sendMailMock).not.toHaveBeenCalled();
     expect(sendMock).not.toHaveBeenCalled();
   });
@@ -49,7 +49,7 @@ describe('EmailService', () => {
     process.env.EMAIL_DRIVER = 'resend';
     delete process.env.RESEND_API_KEY;
     const result = await new EmailService({} as any).send(input);
-    expect(result).toEqual({ dryRun: true });
+    expect(result).toMatchObject({ dryRun: true });
     expect(sendMock).not.toHaveBeenCalled();
     expect(sendMailMock).not.toHaveBeenCalled();
   });
@@ -72,7 +72,7 @@ describe('EmailService', () => {
       error: { message: 'invalid_from_address' },
     });
     const result = await new EmailService({} as any).send(input);
-    expect(result).toEqual({ dryRun: true });
+    expect(result).toMatchObject({ dryRun: true });
   });
 
   describe('addresses that can never be delivered', () => {
@@ -100,7 +100,7 @@ describe('EmailService', () => {
         ...input,
         to: 'cold1@loadtest.qa.test',
       });
-      expect(result).toEqual({ dryRun: true });
+      expect(result).toMatchObject({ dryRun: true });
       expect(sendMailMock).not.toHaveBeenCalled();
     });
   });
@@ -119,14 +119,16 @@ describe('EmailService', () => {
       ),
     );
     const service = new EmailService({} as any);
-    expect(await service.send(input)).toEqual({ dryRun: true });
+    expect(await service.send(input)).toMatchObject({ dryRun: true });
     expect(sendMailMock).toHaveBeenCalledTimes(1);
     // the next sends are skipped without touching the provider
     expect(await service.send({ ...input, to: 'c@d.com' })).toEqual({
       dryRun: true,
+      reason: 'paused',
     });
     expect(await service.send({ ...input, to: 'e@f.com' })).toEqual({
       dryRun: true,
+      reason: 'paused',
     });
     expect(sendMailMock).toHaveBeenCalledTimes(1);
   });

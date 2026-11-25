@@ -39,6 +39,7 @@ import { maskRevealable } from '../employees/personal-data-mask';
 import {
   signPersonalDataFileUrls,
   uanRequiredFor,
+  pranRequiredFor,
   aadhaarRequiredFor,
 } from '../employees/personal-data';
 import { UsersService } from '../users/users.service';
@@ -788,8 +789,9 @@ export class AuthService {
     // The profile form marks UAN required when PF applies to this person (company PF on, employee category covered).
     const payrollSettings = await this.scopedPrisma.payrollSettings.findFirst({
       where: { organizationId },
-      select: { pfEnabled: true, esiEnabled: true },
+      select: { pfEnabled: true, esiEnabled: true, npsEnabled: true },
     });
+    const pranRequired = pranRequiredFor({ npsEnabled: payrollSettings?.npsEnabled ?? false, personalData: user.personalData });
     const uanRequired = uanRequiredFor({
       pfEnabled: payrollSettings?.pfEnabled ?? false,
       employeeType: user.employeeType,
@@ -807,6 +809,7 @@ export class AuthService {
       punchMethod,
       additionalReportingManagers,
       uanRequired,
+      pranRequired,
       aadhaarRequired,
     };
   }

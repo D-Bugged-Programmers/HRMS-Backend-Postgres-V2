@@ -155,6 +155,22 @@ export class PayrollReportsController {
     });
   }
 
+  @Get('nps')
+  async nps(
+    @Query() query: PayrollReportQueryDto,
+    @CurrentUser() caller: Caller,
+    @Res() res: Response,
+  ) {
+    const report = await this.payrollReportsService.npsReport(
+      query,
+      caller.organizationId,
+    );
+    await sendReportBranded(res, this.scopedPrisma, caller.organizationId, {
+      ...named(report, query),
+      format: query.format ?? 'xlsx',
+    });
+  }
+
   @Get('pt')
   async pt(
     @Query() query: PayrollReportQueryDto,

@@ -11,6 +11,7 @@ import { dateStrInOrgTz } from '../common/org-date';
 import { personalEmailOf } from '../common/personal-email';
 import { letterRecipientOf } from './letter-recipient';
 import {
+  ServiceUnavailableException,
   BadRequestException,
   ForbiddenException,
   Inject,
@@ -1759,7 +1760,7 @@ export class LettersService {
       { brandId: employee.brandId },
     );
 
-    await this.emailService.send({
+    const sendResult = await this.emailService.send({
       organizationId,
       allowInactive: true, // addressed to a leaver on purpose
       to: recipient,
@@ -1767,6 +1768,19 @@ export class LettersService {
       html: rendered.html,
       attachments: [{ filename, content: buffer }],
     });
+    // The mail service reports, rather than throws, when nothing was sent: never tell HR a letter went out when it did not,
+    // and leave no "emailed" record in the audit log or the timeline.
+    if (sendResult?.dryRun) {
+      const why: Record<string, string> = {
+        'not-configured': 'Email is not set up for this system yet (the mail server login is missing).',
+        paused: 'Email sending is paused for a few minutes after the mail server refused the login.',
+        failed: 'The mail server did not accept it.',
+        'no-address': 'The employee has no deliverable email address.',
+        'test-address': 'The address is a reserved test address.',
+        inactive: 'The recipient is an inactive employee.',
+      };
+      throw new ServiceUnavailableException(`The letter could not be emailed to ${recipient}. ${why[sendResult.reason ?? 'failed']} Try again, or download it and hand it over.`);
+    }
 
     if (makeVisible) await this.writeAccess(employeeId, key, true, actor, organizationId, template.name, true, !!template.requiresApproval);
     const edited = !!(overrides?.title?.trim() || overrides?.body?.trim());

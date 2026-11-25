@@ -9,6 +9,7 @@ import {
   assertValidIdentifiers,
   isProfileComplete,
   uanRequiredFor,
+  pranRequiredFor,
   signPersonalDataFileUrls,
   mergePersonalData,
 } from './personal-data';
@@ -432,6 +433,26 @@ describe('assertContactNumbersDistinct', () => {
       ),
     ).not.toThrow();
     expect(() => assertContactNumbersDistinct({}, '')).not.toThrow();
+  });
+});
+
+describe('PRAN on the profile', () => {
+  it('is optional unless NPS is on and the person is enrolled', () => {
+    expect(pranRequiredFor({ npsEnabled: false })).toBe(false);
+    expect(pranRequiredFor({ npsEnabled: true, personalData: {} })).toBe(true);
+    expect(pranRequiredFor({ npsEnabled: true, personalData: { npsEnrolled: 'Yes' } })).toBe(true);
+    expect(pranRequiredFor({ npsEnabled: true, personalData: { npsEnrolled: 'No' } })).toBe(false);
+  });
+
+  it('holds up "profile complete" only where it is required', () => {
+    expect(isProfileComplete({ ...COMPLETE_FIELDS }, { pranRequired: true })).toBe(false);
+    expect(isProfileComplete({ ...COMPLETE_FIELDS, pranNumber: '110012345678' }, { pranRequired: true })).toBe(true);
+    expect(isProfileComplete({ ...COMPLETE_FIELDS }, { pranRequired: false })).toBe(true);
+  });
+
+  it('is a 12-digit number', () => {
+    expect(() => assertValidIdentifiers({ pranNumber: '12345' })).toThrow();
+    expect(() => assertValidIdentifiers({ pranNumber: '110012345678' })).not.toThrow();
   });
 });
 

@@ -132,7 +132,7 @@ export const EMAIL_PREHEADERS: Record<string, string> = {
   ASSET_RETURN_REMINDER: 'Please return {{assetCount}} item(s) before {{lastWorkingDay}}.',
   LOAN_EMI_DUE: 'Your EMI of {{emiAmount}} is deducted from your {{month}} salary.',
   LOAN_CLOSED: 'Your {{loanType}} loan is fully repaid.',
-  FORM16_AVAILABLE: 'Your Form 16 for FY {{financialYear}} is ready to download.',
+  FORM16_AVAILABLE: 'Your {{formName}} for FY {{financialYear}} is ready to download.',
   ONBOARDING_REMINDER: 'A few steps are left to finish your onboarding.',
   RESIGNATION_PENDING_REMINDER:
     "{{subjectName}}'s resignation has been waiting {{daysWaiting}} days for a decision.",
@@ -1276,14 +1276,15 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
   },
   {
     occasionKey: 'FORM16_AVAILABLE',
-    name: 'Form 16 Available',
-    subject: 'Your Form 16 for FY {{financialYear}} is ready',
+    // The key stays FORM16_AVAILABLE; {{formName}} is Form 130 from 1-Apr-2026 (tax year 2026-27) and Form 16 before.
+    name: 'Tax Certificate Available',
+    subject: 'Your {{formName}} for FY {{financialYear}} is ready',
     bodyHtml: emailBody({
       category: 'Payroll & Finance',
-      title: 'Your Form 16 is ready',
+      title: 'Your {{formName}} is ready',
       blocks: [
         greet,
-        paragraph('Your Form 16 (tax certificate) for FY {{financialYear}} is ready to download from the HRMS.'),
+        paragraph('Your {{formName}} (tax certificate) for FY {{financialYear}} is ready to download from the HRMS.'),
         button('{{downloadUrl}}', 'Open Tax Declaration'),
         regards,
       ],

@@ -149,6 +149,9 @@ function fullMonthBase(settings: OverlaidSettings, profile?: { state?: string | 
   });
 }
 
+const npsWageCodesOf = (components: SalaryComponent[]) =>
+  components.filter((c) => (c as { countsTowardsNpsWages?: boolean }).countsTowardsNpsWages).map((c) => c.code);
+
 const pfWageCodesOf = (components: SalaryComponent[]) =>
   components.filter((c) => (c as { countsTowardsPfWages?: boolean }).countsTowardsPfWages).map((c) => c.code);
 
@@ -161,6 +164,7 @@ function evaluateStructure(
   overrides: Map<string, EmployeeSalaryComponent>,
   base: Record<string, number>,
   disabledPerson = false,
+  nps?: { enrolled: boolean; employeeRate: number | null },
 ) {
   const earningComponents = components.filter(
     (c) =>
@@ -202,7 +206,7 @@ function evaluateStructure(
     (afterEarnings.BASIC ?? 0) + (afterEarnings.DA ?? 0);
   Object.assign(
     afterEarnings,
-    deriveStatutoryContext(afterEarnings, settings, false, pfWageCodesOf(components), disabledPerson),
+    deriveStatutoryContext(afterEarnings, settings, false, pfWageCodesOf(components), disabledPerson, { ...nps, extraWageCodes: npsWageCodesOf(components) }),
   );
   if (settings.pfOnActualWages && settings.pfEnabled) {
     afterEarnings.PF_WAGE_CEILING = Math.max(
@@ -213,6 +217,8 @@ function evaluateStructure(
   const employerComponents = components.filter(
     (c) =>
       c.isEmployerContribution &&
+      // A contribution switched off for the CTC (EDLI and the PF admin charge by default) is not listed or counted here.
+      c.includeInCTC !== false &&
       c.type === SalaryComponentType.EARNING &&
       isComponentApplicable(
         c,
@@ -232,7 +238,7 @@ function evaluateStructure(
   const employeeComponents = components.filter(
     (c) =>
       c.type === SalaryComponentType.DEDUCTION &&
-      (c.statutoryKey === StatutoryKey.PF || c.statutoryKey === StatutoryKey.ESI || c.statutoryKey === StatutoryKey.PT) &&
+      (c.statutoryKey === StatutoryKey.PF || c.statutoryKey === StatutoryKey.ESI || c.statutoryKey === StatutoryKey.PT || c.statutoryKey === StatutoryKey.NPS) &&
       isComponentApplicable(c, overrides.get(c.code) ?? null, PREVIEW_MONTH, settings),
   );
   const employee = resolveGroup(
@@ -310,7 +316,7 @@ export function employerLinesForStructure(args: {
   components: SalaryComponent[];
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
-  profile?: { state?: string | null; gender?: string | null; disabled?: boolean };
+  profile?: { state?: string | null; gender?: string | null; disabled?: boolean; nps?: { enrolled: boolean; employeeRate: number | null } };
 }): { code: string; name: string; amount: number }[] {
   return evaluateSavedStructure(args)?.employerLines ?? [];
 }
@@ -321,7 +327,7 @@ export function employeeContributionLinesForStructure(args: {
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
   /** Where the employee works and their gender: Professional Tax follows the state's ladder. */
-  profile?: { state?: string | null; gender?: string | null; disabled?: boolean };
+  profile?: { state?: string | null; gender?: string | null; disabled?: boolean; nps?: { enrolled: boolean; employeeRate: number | null } };
 }): { code: string; name: string; amount: number }[] {
   return evaluateSavedStructure(args)?.employeeLines ?? [];
 }
@@ -330,7 +336,7 @@ function evaluateSavedStructure(args: {
   components: SalaryComponent[];
   settings: OverlaidSettings;
   rows: SavedStructureRow[];
-  profile?: { state?: string | null; gender?: string | null; disabled?: boolean };
+  profile?: { state?: string | null; gender?: string | null; disabled?: boolean; nps?: { enrolled: boolean; employeeRate: number | null } };
 }) {
   const components = args.components.filter((c) => c.isActive);
   if (!args.rows.some((r) => r.isEnabled !== false)) return null;
@@ -355,6 +361,7 @@ function evaluateSavedStructure(args: {
     overrides,
     fullMonthBase(args.settings, args.profile),
     args.profile?.disabled === true,
+    args.profile?.nps,
   );
 }
 

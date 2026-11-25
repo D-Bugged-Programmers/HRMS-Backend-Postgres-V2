@@ -739,6 +739,50 @@ export class PayrollReportsService {
     };
   }
 
+  // NPS contribution report: PRAN, the employee's own contribution (deducted from pay) and the employer's, per employee.
+  async npsReport(query: PayrollReportQueryDto, organizationId: string) {
+    const runs = (await this.fetchRuns(query, organizationId)).filter(
+      (r) =>
+        lineAmount(r.deductions, SALARY_COMPONENT_CODES.NPS_EMPLOYEE) > 0 ||
+        lineAmount(r.employerContributions, SALARY_COMPONENT_CODES.NPS_EMPLOYER) > 0,
+    );
+    const ident = await this.identifiersFor(
+      runs.map((r) => r.employeeId),
+      organizationId,
+    );
+    const rows = runs.map((r) => {
+      const employee = lineAmount(r.deductions, SALARY_COMPONENT_CODES.NPS_EMPLOYEE);
+      const employer = lineAmount(r.employerContributions, SALARY_COMPONENT_CODES.NPS_EMPLOYER);
+      return {
+        pran: ident(r.employeeId, 'pranNumber'),
+        employeeId: r.employee.employeeId,
+        name: r.employee.name,
+        month: r.month,
+        year: r.year,
+        employeeContribution: employee,
+        employerContribution: employer,
+        total: employee + employer,
+      };
+    });
+    const columns: ReportColumn[] = [
+      { header: 'PRAN', key: 'pran', width: 16 },
+      { header: 'Employee ID', key: 'employeeId', width: 14 },
+      { header: 'Name', key: 'name', width: 22 },
+      { header: 'Month', key: 'month', width: 8 },
+      { header: 'Year', key: 'year', width: 8 },
+      { header: 'Employee Contribution', key: 'employeeContribution', width: 20 },
+      { header: 'Employer Contribution', key: 'employerContribution', width: 20 },
+      { header: 'Total', key: 'total', width: 12 },
+    ];
+    return {
+      title: 'NPS Report',
+      subtitle: 'National Pension System contributions',
+      columns,
+      rows,
+      filename: 'nps_report',
+    };
+  }
+
   async ptReport(query: PayrollReportQueryDto, organizationId: string) {
     return this.statutoryContributionReport(
       query,

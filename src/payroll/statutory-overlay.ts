@@ -85,6 +85,8 @@ export interface OverlaidSettings {
   lwfStateRates: LwfStateRate[];
 
   npsEmployerRate: number;
+  /** NPS: the employee's own contribution, % of the NPS wages. Unset / 0 = none unless the employee has their own rate. */
+  npsEmployeeRate?: number;
   gratuityRate: number;
 
   // Labour Codes "50% wages" rule (in force 21-Nov-2025): where enabled on the module's version, the PF /
@@ -273,8 +275,9 @@ export function applyStatutoryOverrides(
 
   const nps = effectiveConfigs.NPS;
   if (nps) {
-    const c = nps.config as { employerRate: number };
+    const c = nps.config as { employerRate: number; employeeRate?: number };
     resolved.npsEmployerRate = c.employerRate;
+    resolved.npsEmployeeRate = typeof c.employeeRate === 'number' ? c.employeeRate : undefined;
     resolved.npsEnabled = nps.isEnabled;
   }
 

@@ -45,6 +45,7 @@ import { AttendanceService } from '../attendance/attendance.service';
 import { PreviewLeaveDaysQueryDto } from './dto/preview-leave-days-query.dto';
 import { ApplyLeaveDto } from './dto/apply-leave.dto';
 import { ManualLeaveDto } from './dto/manual-leave.dto';
+import { isWorkedByPerson } from '../attendance/attendance.service';
 import { ImportLeavesDto } from './dto/import-leaves.dto';
 import { isValidCalendarDateString } from '../common/is-valid-calendar-date.validator';
 import { UpdateLeaveDto } from './dto/update-leave.dto';
@@ -1107,6 +1108,8 @@ export class LeavesService {
     organizationId: string,
     // The leave import records the decision without telling anyone.
     quiet = false,
+    // The leave import also leaves a day that already has recorded or punched attendance as it is.
+    keepWorkedDays = false,
   ) {
     // Approving a leave rewrites attendance and balances for its dates: refuse when one of those months is already
     // locked/paid, and send a signed-off run back for recalculation (see payroll-period-guard.ts).
@@ -1153,6 +1156,7 @@ export class LeavesService {
           leave,
           organizationId,
           stampDates,
+          keepWorkedDays,
         );
         await markPayrollInputsChanged(
           tx,
@@ -2337,6 +2341,18 @@ export class LeavesService {
   // turns into On Leave / Half Day, payroll inputs are flagged, a locked payroll month is refused and overlapping leave is
   // caught - minus the application-time rules (notice, backdating limits, documents), which an HR override does not apply.
   // The reply lists each person's result; a refused one never stops the others. Only an Admin may do it for an HR/Admin.
+  // Days in a leave's range that already have recorded or punched attendance: the leave import leaves them as they are and says so.
+  private async keptWorkedDaysNote(organizationId: string, employeeId: string, startDate: string, endDate: string, tense: 'will be' | 'were'): Promise<string> {
+    const rows = await this.scopedPrisma.attendance.findMany({
+      where: { organizationId, employeeId, date: { gte: startDate, lte: endDate } },
+      select: { date: true, status: true, source: true },
+      orderBy: { date: 'asc' },
+    });
+    const kept = rows.filter((r) => isWorkedByPerson(r)).map((r) => r.date);
+    if (kept.length === 0) return '';
+    return ` ${kept.length} day(s) already have attendance recorded (${kept.map(dmyText).join(', ')}) and ${tense} left as they are.`;
+  }
+
   async manualLeave(
     dto: ManualLeaveDto,
     actor: Actor,
@@ -2493,7 +2509,7 @@ export class LeavesService {
           )) as unknown as { totalDays: number };
           out.totalDays = checked.totalDays;
           out.status = 'OK';
-          out.message = `Would record ${checked.totalDays} day(s) of ${leaveType.name}.`;
+          out.message = `Would record ${checked.totalDays} day(s) of ${leaveType.name}.${await this.keptWorkedDaysNote(organizationId, employee.id, out.startDate, out.endDate, 'will be')}`;
           extraRanges.push({
             start: out.startDate,
             end: out.endDate,
@@ -2520,6 +2536,7 @@ export class LeavesService {
               importer.id,
               organizationId,
               true,
+              true,
             );
           } catch (err) {
             // Approval failed after the request was saved: take the request (and its balance hold) back out so a
@@ -2535,7 +2552,7 @@ export class LeavesService {
           }
           out.totalDays = created.totalDays;
           out.status = 'IMPORTED';
-          out.message = `Recorded ${created.totalDays} day(s) of ${leaveType.name}.`;
+          out.message = `Recorded ${created.totalDays} day(s) of ${leaveType.name}.${await this.keptWorkedDaysNote(organizationId, employee.id, out.startDate, out.endDate, 'were')}`;
           if (manual) {
             await this.notificationsService
               .create({

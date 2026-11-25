@@ -33,6 +33,13 @@ export class PerformanceRatingsController {
     private readonly performanceRatingsService: PerformanceRatingsService,
   ) {}
 
+  @Get('variable-pay-status')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
+  variablePayStatus(@CurrentUser() caller: Caller) {
+    return this.performanceRatingsService.variablePayStatus(caller.organizationId);
+  }
+
   // EMPLOYEE included here (unlike every other route below) — findAll()
   // force-scopes an EMPLOYEE caller to their own APPROVED ratings only.
   @Get()

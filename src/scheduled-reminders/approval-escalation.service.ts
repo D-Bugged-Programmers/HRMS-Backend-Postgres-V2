@@ -202,7 +202,8 @@ export class ApprovalEscalationService {
   ): Promise<PendingRequest[]> {
     const p = this.scopedPrisma;
     const who = { select: { id: true, name: true } };
-    const base = { organizationId };
+    // Requests from someone who has left are not waiting for anyone, so no escalation is sent for them.
+    const base = { organizationId, employee: { isActive: true } };
     const days = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
     const [
       leaves,

@@ -274,9 +274,11 @@ function validateBonus(config: unknown): void {
 }
 
 function validateNps(config: unknown): void {
-  const c = config as { employerRate?: unknown };
+  const c = config as { employerRate?: unknown; employeeRate?: unknown };
   if (!isPercent(c.employerRate))
     throw new Error('employerRate must be a number between 0 and 100.');
+  if (c.employeeRate !== undefined && !isPercent(c.employeeRate))
+    throw new Error('employeeRate must be a number between 0 and 100.');
 }
 
 function validatePayrollCalendar(config: unknown): void {
@@ -402,7 +404,7 @@ export const SEED_DEFAULTS: Record<
     isEnabled: false,
   },
   [StatutoryModule.NPS]: {
-    config: { employerRate: 10 },
+    config: { employerRate: 14, employeeRate: 0 },
     isEnabled: false,
   },
   [StatutoryModule.PAYROLL_CALENDAR]: {

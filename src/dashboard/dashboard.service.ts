@@ -769,11 +769,14 @@ export class DashboardService {
     },
     viewer?: { id: string; role: Role },
   ) {
+    // Requests from someone who has left are not waiting for anyone to decide (they were never closed when the exit completed), so they
+    // stay out of every list and badge count for every viewer.
     const withoutOwn = () => {
-      if (!viewer || viewer.role === Role.ADMIN) return scope;
+      if (!viewer || viewer.role === Role.ADMIN) return { ...scope, employee: { isActive: true } };
       return {
         ...scope,
         employeeId: { ...(scope.employeeId ?? {}), not: viewer.id },
+        employee: { isActive: true },
       };
     };
     return {

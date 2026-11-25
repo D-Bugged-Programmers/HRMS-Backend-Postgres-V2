@@ -14,7 +14,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { CalcType, Prisma, SalaryComponent } from '@prisma/client';
+import { CalcType, Prisma, SalaryComponent, SalaryComponentType } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { CreateSalaryComponentDto } from './dto/create-salary-component.dto';
@@ -36,6 +36,9 @@ import {
   statutoryEnabledToday,
 } from './statutory-activation';
 import { AuditLogService } from '../audit-log/audit-log.service';
+
+// Earnings that count towards the PF and ESI wages from the start (the others are switched on per component).
+const CORE_WAGE_CODES = new Set(['BASIC', 'DA', 'MISCELLANEOUS_ALLOWANCE']);
 
 function slugify(name: string): string {
   return name
@@ -136,8 +139,12 @@ export class SalaryComponentsService {
         includeInCTC: dto.includeInCTC ?? true,
         isEmployerContribution: dto.isEmployerContribution ?? false,
         showOnPayslip: dto.showOnPayslip ?? true,
-        countsTowardsPfWages: dto.countsTowardsPfWages ?? false,
-        excludedFromEsiWages: dto.excludedFromEsiWages ?? false,
+        // Off for every earning unless switched on; Basic, DA and the Miscellaneous Allowance start on.
+        countsTowardsPfWages: dto.countsTowardsPfWages ?? CORE_WAGE_CODES.has(code),
+        countsTowardsNpsWages: dto.countsTowardsNpsWages ?? false,
+        excludedFromEsiWages:
+          dto.excludedFromEsiWages ??
+          (dto.type === SalaryComponentType.EARNING && !(dto.isEmployerContribution ?? false) && !CORE_WAGE_CODES.has(code)),
         isStatutory: dto.isStatutory ?? false,
         statutoryKey: dto.statutoryKey,
         payFrequency: dto.payFrequency ?? 'MONTHLY',
@@ -363,6 +370,9 @@ export class SalaryComponentsService {
         }),
         ...(dto.countsTowardsPfWages !== undefined && {
           countsTowardsPfWages: dto.countsTowardsPfWages,
+        }),
+        ...(dto.countsTowardsNpsWages !== undefined && {
+          countsTowardsNpsWages: dto.countsTowardsNpsWages,
         }),
         ...(dto.excludedFromEsiWages !== undefined && {
           excludedFromEsiWages: dto.excludedFromEsiWages,

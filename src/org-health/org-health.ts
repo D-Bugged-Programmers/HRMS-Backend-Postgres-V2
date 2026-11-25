@@ -88,6 +88,14 @@ export function findSettingsClashes(f: SettingsFacts): SettingsClash[] {
       link: '/payroll-settings',
     });
   }
+  if (f.paymentDate === f.processingDate) {
+    out.push({
+      key: 'pay-same-as-processing',
+      title: 'Salary is paid on the same day payroll is processed',
+      detail: `Payroll is processed and salary is paid on ${dmyText(f.paymentDate)}, so there is no time between approving payroll and paying (for example sending the bank file). Move the payment day later.`,
+      link: '/statutory-compliance',
+    });
+  }
   if (f.processingFixed && isWeeklyOff(f.processingDate, f.weeklyOffs)) {
     out.push({
       key: 'processing-on-weekly-off',

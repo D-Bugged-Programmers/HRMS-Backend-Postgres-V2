@@ -616,6 +616,39 @@ describe('the employee and employer share of PF and ESI for a saved structure', 
     expect(esiOf(false)).toBe(Math.ceil((10000 * 0.75) / 100)); // 75: only Basic counts
     expect(esiOf(true)).toBe(Math.ceil((11500 * 0.75) / 100)); // 87: wages lifted to 50% of the 23,000 pay
   });
+  it('an employer contribution switched off for the CTC is not listed or counted', () => {
+    const rows = [{ componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 20000, amountBasis: 'MONTHLY', isEnabled: true }];
+    const linesWith = (off: string[]) => {
+      const comps = (components() as unknown as { code: string }[]).map((c) => (off.includes(c.code) ? { ...c, includeInCTC: false } : c));
+      return employerLinesForStructure({ components: comps as never, settings: settings(), rows });
+    };
+    const all = linesWith([]);
+    const some = linesWith(['EDLI_EMPLOYER', 'EPF_ADMIN_EMPLOYER']);
+    expect(all.map((l) => l.code)).toEqual(expect.arrayContaining(['PF_EMPLOYER', 'EDLI_EMPLOYER', 'EPF_ADMIN_EMPLOYER']));
+    expect(some.map((l) => l.code)).toContain('PF_EMPLOYER');
+    expect(some.map((l) => l.code)).not.toContain('EDLI_EMPLOYER');
+    expect(some.map((l) => l.code)).not.toContain('EPF_ADMIN_EMPLOYER');
+    expect(all.reduce((t, l) => t + l.amount, 0)).toBeGreaterThan(some.reduce((t, l) => t + l.amount, 0));
+  });
+  it('NPS: the employee share follows the rate, the enrolment and the earnings counted in the NPS wages', () => {
+    const rows = [
+      { componentCode: 'BASIC', valueType: 'FIXED', fixedAmount: 25000, amountBasis: 'MONTHLY', isEnabled: true },
+      { componentCode: 'SPECIAL_ALLOWANCE', valueType: 'FIXED', fixedAmount: 5000, amountBasis: 'MONTHLY', isEnabled: true },
+    ];
+    const on = { ...settings(), npsEnabled: true, npsEmployerRate: 14, npsEmployeeRate: 10 };
+    const nps = (over: { countsNps?: boolean; profile?: { nps: { enrolled: boolean; employeeRate: number | null } } } = {}) => {
+      const comps = (components() as unknown as { code: string }[]).map((c) => (c.code === 'SPECIAL_ALLOWANCE' ? { ...c, countsTowardsNpsWages: !!over.countsNps } : c));
+      const args = { components: comps as never, settings: on, rows, profile: over.profile };
+      return {
+        employee: employeeContributionLinesForStructure(args).find((l) => l.code === 'NPS_EMPLOYEE')?.amount ?? 0,
+        employer: employerLinesForStructure(args).find((l) => l.code === 'NPS_EMPLOYER')?.amount ?? 0,
+      };
+    };
+    expect(nps()).toEqual({ employee: 2500, employer: 3500 }); // 10% and 14% of the Basic 25,000
+    expect(nps({ countsNps: true })).toEqual({ employee: 3000, employer: 4200 }); // the allowance counts: 30,000
+    expect(nps({ profile: { nps: { enrolled: true, employeeRate: 5 } } }).employee).toBe(1250); // own rate
+    expect(nps({ profile: { nps: { enrolled: false, employeeRate: null } } })).toEqual({ employee: 0, employer: 0 }); // not enrolled
+  });
   it('has nothing for a structure with nothing switched on', () => {
     expect(employeeContributionLinesForStructure({ components: components(), settings: settings(), rows: [] })).toEqual([]);
   });

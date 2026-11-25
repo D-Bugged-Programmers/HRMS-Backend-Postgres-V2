@@ -28,6 +28,8 @@ export interface ReadinessCheck {
     | 'opening'
     | 'bank'
     | 'pan'
+    | 'pran'
+    | 'perquisite'
     | 'approvals'
     | 'attendance'
     | 'joiners'
@@ -79,6 +81,13 @@ export function buildReadiness(input: {
   fyStartMonth?: number;
   /** Employees who already have year-to-date earnings/tax on record. */
   hasYtd?: Set<string>;
+  /** NPS is on for the company: an enrolled employee then needs a PRAN. */
+  npsOn?: boolean;
+  /**
+   * Employees with an active employer loan whose total outstanding is above 20,000, passed only while the SBI benchmark rate is 0
+   * (off): the interest-free / low-interest loan perquisite is then not taxed.
+   */
+  loansUntaxed?: { employeeId: string; outstanding: number; interestRate: number }[];
 }): ReadinessCheck[] {
   const monthStart = `${input.year}-${String(input.month).padStart(2, '0')}-01`;
   const monthEnd = new Date(Date.UTC(input.year, input.month, 0))
@@ -89,6 +98,15 @@ export function buildReadiness(input: {
   const onPayroll = input.employees.filter((e) => e.joiningDate <= monthEnd);
 
   const noStructure = onPayroll.filter((e) => !input.withStructure.has(e.id));
+  // With NPS on, everyone enrolled (all, unless the profile says 'No') needs a PRAN before the contribution can be remitted.
+  const noPran = input.npsOn
+    ? onPayroll.filter((e) => {
+        const pd = (e.personalData ?? {}) as Record<string, unknown>;
+        return text(pd.npsEnrolled).toLowerCase() !== 'no' && !text(pd.pranNumber);
+      })
+    : [];
+  const loanById = new Map((input.loansUntaxed ?? []).map((l) => [l.employeeId, l]));
+  const noBenchmark = onPayroll.filter((e) => loanById.has(e.id));
   const noBank = onPayroll.filter((e) => {
     const pd = (e.personalData ?? {}) as Record<string, unknown>;
     return !text(pd.bankAccountNo) || !text(pd.bankIFSC);
@@ -138,6 +156,21 @@ export function buildReadiness(input: {
       level: 'warning',
       title: 'Bank details missing',
       people: noBank.map((e) => person(e)),
+    },
+    {
+      key: 'perquisite',
+      level: 'warning',
+      title: 'Employer loans are not taxed as a perquisite: the SBI benchmark rate in Payroll Settings is 0 (off)',
+      people: noBenchmark.map((e) => {
+        const l = loanById.get(e.id)!;
+        return person(e, `loan ₹${Math.round(l.outstanding).toLocaleString('en-IN')} at ${l.interestRate}%`);
+      }),
+    },
+    {
+      key: 'pran',
+      level: 'blocker',
+      title: 'PRAN missing (NPS is on, so every enrolled employee needs one)',
+      people: noPran.map((e) => person(e)),
     },
     {
       key: 'pan',

@@ -11,7 +11,7 @@ import { EmployeeDocumentCategory, NotificationCategory, Role } from '@prisma/cl
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { profileScore, withAccountFields, withRootGender } from '../employees/profile-score';
-import { uanRequiredFor } from '../employees/personal-data';
+import { uanRequiredFor, pranRequiredFor } from '../employees/personal-data';
 import { ReminderNotifier } from './reminder-notifier.service';
 
 const SIX_DAYS = 24 * 6;
@@ -43,7 +43,7 @@ export class ProfileCompletionReminderService {
       this.notifier.activeUsers(organizationId),
       p.documentRequirement.findMany({ where: { organizationId, isMandatory: true, isActive: true }, select: { name: true, isMandatory: true, isActive: true } }),
       p.employeeDocument.findMany({ where: { organizationId, category: EmployeeDocumentCategory.DOCUMENT }, select: { employeeId: true, docType: true, status: true } }),
-      p.payrollSettings.findFirst({ where: { organizationId }, select: { pfEnabled: true } }),
+      p.payrollSettings.findFirst({ where: { organizationId }, select: { pfEnabled: true, npsEnabled: true } }),
       p.user.findMany({
         where: { organizationId, isActive: true, exitDate: null },
         select: { id: true, email: true, gender: true, personalData: true, employeeType: true, contactNumber: true, profileImage: true, designation: true, departmentId: true, employeeCategory: true, workLocationId: true },
@@ -59,7 +59,7 @@ export class ProfileCompletionReminderService {
           withAccountFields(withRootGender(e.personalData as Record<string, unknown>, e.gender), e),
           requirements,
           docsBy.get(e.id) ?? [],
-          { uanRequired: uanRequiredFor({ pfEnabled: settings?.pfEnabled ?? false, employeeType: e.employeeType }) },
+          { uanRequired: uanRequiredFor({ pfEnabled: settings?.pfEnabled ?? false, employeeType: e.employeeType }), pranRequired: pranRequiredFor({ npsEnabled: settings?.npsEnabled ?? false, personalData: e.personalData }) },
         ),
       );
     }

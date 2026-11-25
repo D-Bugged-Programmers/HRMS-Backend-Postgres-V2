@@ -55,6 +55,16 @@ export class PerformanceRatingsService {
     private readonly emailTemplatesService: EmailTemplatesService,
   ) {}
 
+  // Whether variable pay is scaled by performance for this company (Payroll Settings > Variable pay): when it is off, screens leave
+  // the variable-pay rating card out.
+  async variablePayStatus(organizationId: string): Promise<{ enabled: boolean }> {
+    const row = await this.scopedPrisma.payrollSettings.findFirst({
+      where: { organizationId },
+      select: { companyPerformanceEnabled: true },
+    });
+    return { enabled: row?.companyPerformanceEnabled ?? false };
+  }
+
   async findAll(
     query: QueryPerformanceRatingDto,
     actor: Actor,
