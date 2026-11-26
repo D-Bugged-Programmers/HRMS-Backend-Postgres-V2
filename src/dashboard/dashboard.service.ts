@@ -48,6 +48,7 @@ import {
   WorkArrangement,
 } from '@prisma/client';
 import { leaveDaysInRange } from '../leaves/leave-days-in-range';
+import { signFileToken } from '../files/file-token';
 import { EXPORTABLE_RUN_STATUSES } from '../payroll/exportable-runs';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
@@ -946,6 +947,176 @@ export class DashboardService {
     return this.pendingItems(organizationId, team, actor.role !== Role.MANAGER, viewer, options);
   }
 
+  // The requests THIS person has already decided (approved or rejected), most recently decided first, for the mobile
+  // Approvals "Completed" tab. Only the caller's own decisions are listed, so a manager never sees someone else's, and
+  // every read is also limited to the caller's organization. Same item shape as the waiting list plus what was decided.
+  // Leave, correction, Work From Home, overtime, comp-off and expense claims: the types the mobile app can review.
+  async completedItems(
+    actor: Actor,
+    organizationId: string,
+    query: { type?: string; decision?: string; offset?: number; limit?: number },
+  ) {
+    const page = pageRequest(query.offset, query.limit ?? 20);
+    const want = wanted(page);
+    const type = query.type && query.type !== 'ALL' ? query.type : null;
+    const only = query.decision === 'APPROVED' || query.decision === 'REJECTED' ? query.decision : null;
+    const off = await disabledModulesOf(organizationId);
+    const employeeSelect = { select: { name: true, employeeId: true, profileImage: true } } as const;
+    const days = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
+    const base = { organizationId };
+    const wants = (t: string, module: string) => (!type || type === t) && !off.has(module);
+    // Enum filters narrowed to the chosen decision (reimbursement: approved includes PAID).
+    const pick = <T extends string>(approved: T[], rejected: T[]): T[] =>
+      only === 'APPROVED' ? approved : only === 'REJECTED' ? rejected : [...approved, ...rejected];
+    const leaveWhere: Prisma.LeaveWhereInput = {
+      ...base,
+      reviewedById: actor.id,
+      status: { in: pick([LeaveStatus.APPROVED], [LeaveStatus.REJECTED]) },
+    };
+    const regStatus = only === 'APPROVED' ? ['approved'] : only === 'REJECTED' ? ['rejected'] : ['approved', 'rejected'];
+    const regWhere: Prisma.AttendanceWhereInput = {
+      ...base,
+      AND: [
+        { regularization: { path: ['reviewedBy'], equals: actor.id } },
+        { OR: regStatus.map((st) => ({ regularization: { path: ['status'], equals: st } })) },
+      ],
+    };
+    const wfhWhere: Prisma.AttendanceWhereInput = {
+      ...base,
+      workArrangementReviewedById: actor.id,
+      workArrangementStatus: { in: pick([WfhApprovalStatus.APPROVED], [WfhApprovalStatus.REJECTED]) },
+    };
+    const otWhere: Prisma.OvertimeRecordWhereInput = {
+      ...base,
+      approvedById: actor.id,
+      status: { in: pick([OvertimeStatus.APPROVED], [OvertimeStatus.REJECTED]) },
+    };
+    const coWhere: Prisma.CompOffWhereInput = {
+      ...base,
+      approvedById: actor.id,
+      status: {
+        in: only === 'REJECTED'
+          ? [CompOffStatus.REJECTED]
+          : only === 'APPROVED'
+            ? [CompOffStatus.APPROVED, CompOffStatus.AVAILED, CompOffStatus.PARTIALLY_AVAILED, CompOffStatus.EXPIRED]
+            : [CompOffStatus.APPROVED, CompOffStatus.REJECTED, CompOffStatus.AVAILED, CompOffStatus.PARTIALLY_AVAILED, CompOffStatus.EXPIRED],
+      },
+    };
+    const reWhere: Prisma.ReimbursementWhereInput = {
+      ...base,
+      approvedById: actor.id,
+      status: {
+        in: only === 'REJECTED'
+          ? [ReimbursementStatus.REJECTED]
+          : only === 'APPROVED'
+            ? [ReimbursementStatus.APPROVED, ReimbursementStatus.PAID]
+            : [ReimbursementStatus.APPROVED, ReimbursementStatus.PAID, ReimbursementStatus.REJECTED],
+      },
+    };
+
+    const [leaves, regs, wfhRows, overtime, compOffs, reimbs] = await Promise.all([
+      wants('LEAVE', 'module.leave')
+        ? this.scopedPrisma.leave.findMany({ where: leaveWhere, include: { employee: employeeSelect, leaveType: { select: { name: true } } }, orderBy: { reviewedAt: 'desc' }, take: want })
+        : [],
+      wants('REGULARIZATION', 'module.attendance')
+        ? this.scopedPrisma.attendance.findMany({ where: regWhere, include: { employee: employeeSelect }, orderBy: { updatedAt: 'desc' }, take: want })
+        : [],
+      wants('WFH', 'module.attendance')
+        ? this.scopedPrisma.attendance.findMany({ where: wfhWhere, include: { employee: employeeSelect }, orderBy: { workArrangementReviewedAt: 'desc' }, take: want * 4 })
+        : [],
+      wants('OVERTIME', 'module.attendance')
+        ? this.scopedPrisma.overtimeRecord.findMany({ where: otWhere, include: { employee: employeeSelect }, orderBy: { updatedAt: 'desc' }, take: want })
+        : [],
+      wants('COMP_OFF', 'module.leave')
+        ? this.scopedPrisma.compOff.findMany({ where: coWhere, include: { employee: employeeSelect }, orderBy: { updatedAt: 'desc' }, take: want })
+        : [],
+      wants('REIMBURSEMENT', 'module.loans_reimbursements')
+        ? this.scopedPrisma.reimbursement.findMany({ where: reWhere, include: { employee: employeeSelect }, orderBy: { updatedAt: 'desc' }, take: want })
+        : [],
+    ]);
+    const [nLeave, nReg, nOt, nCo, nRe, wfhGroups, wfhSingles] = await Promise.all([
+      wants('LEAVE', 'module.leave') ? this.scopedPrisma.leave.count({ where: leaveWhere }) : 0,
+      wants('REGULARIZATION', 'module.attendance') ? this.scopedPrisma.attendance.count({ where: regWhere }) : 0,
+      wants('OVERTIME', 'module.attendance') ? this.scopedPrisma.overtimeRecord.count({ where: otWhere }) : 0,
+      wants('COMP_OFF', 'module.leave') ? this.scopedPrisma.compOff.count({ where: coWhere }) : 0,
+      wants('REIMBURSEMENT', 'module.loans_reimbursements') ? this.scopedPrisma.reimbursement.count({ where: reWhere }) : 0,
+      wants('WFH', 'module.attendance')
+        ? this.scopedPrisma.attendance.groupBy({ by: ['wfhRequestId'], where: { ...wfhWhere, wfhRequestId: { not: null } } })
+        : [],
+      wants('WFH', 'module.attendance') ? this.scopedPrisma.attendance.count({ where: { ...wfhWhere, wfhRequestId: null } }) : 0,
+    ]);
+    const total = nLeave + nReg + nOt + nCo + nRe + wfhGroups.length + wfhSingles;
+
+    const decisionOf = (s: string): 'APPROVED' | 'REJECTED' => (/^(rejected)$/i.test(s) ? 'REJECTED' : 'APPROVED');
+    type Row = {
+      type: string; id: string; employee: string; employeeId: string; profileImage: string | null; summary: string;
+      date: string; endDate: string | null; requestedAt: Date; decision: 'APPROVED' | 'REJECTED'; status: string;
+      decidedAt: Date; decisionComments: string | null; reason?: string | null; groupId?: string | null;
+    };
+    const rows: Row[] = [];
+    for (const l of leaves) {
+      rows.push({
+        type: 'LEAVE', id: l.id, employee: l.employee.name, employeeId: l.employee.employeeId, profileImage: l.employee.profileImage ?? null,
+        summary: `${l.leaveType.name} (${days(l.totalDays)})`, date: l.startDate, endDate: l.endDate === l.startDate ? null : l.endDate,
+        requestedAt: l.createdAt, decision: decisionOf(l.status), status: l.status, decidedAt: l.reviewedAt ?? l.updatedAt,
+        decisionComments: l.reviewComments?.trim() || null, reason: l.remarks?.trim() || null,
+      });
+    }
+    for (const a of regs) {
+      const reg = a.regularization as unknown as { status?: string; reason?: string | null; reviewedAt?: string | null; reviewComments?: string | null } | null;
+      rows.push({
+        type: 'REGULARIZATION', id: a.id, employee: a.employee.name, employeeId: a.employee.employeeId, profileImage: a.employee.profileImage ?? null,
+        summary: 'Attendance regularization', date: a.date, endDate: null, requestedAt: a.updatedAt,
+        decision: decisionOf(reg?.status ?? ''), status: String(reg?.status ?? '').toUpperCase(),
+        decidedAt: reg?.reviewedAt ? new Date(reg.reviewedAt) : a.updatedAt,
+        decisionComments: reg?.reviewComments?.trim() || null, reason: reg?.reason?.trim() || null,
+      });
+    }
+    // A multi-day Work From Home request is several rows decided together: one item for all of them.
+    const wfhSeen = new Map<string, typeof wfhRows>();
+    for (const r of wfhRows) {
+      const key = r.wfhRequestId ?? r.id;
+      wfhSeen.set(key, [...(wfhSeen.get(key) ?? []), r]);
+    }
+    for (const [key, group] of wfhSeen) {
+      const sorted = [...group].sort((x, y) => x.date.localeCompare(y.date));
+      const first = sorted[0];
+      rows.push({
+        type: 'WFH', id: first.id, groupId: first.wfhRequestId ?? null, employee: first.employee.name, employeeId: first.employee.employeeId,
+        profileImage: first.employee.profileImage ?? null, summary: sorted.length > 1 ? `Work From Home (${days(sorted.length)})` : 'Work From Home',
+        date: first.date, endDate: sorted.length > 1 ? sorted[sorted.length - 1].date : null, requestedAt: first.updatedAt,
+        decision: decisionOf(first.workArrangementStatus), status: first.workArrangementStatus,
+        decidedAt: first.workArrangementReviewedAt ?? first.updatedAt, decisionComments: first.workArrangementReviewComments?.trim() || null,
+        reason: first.workArrangementReason ?? null,
+      });
+      void key;
+    }
+    for (const o of overtime) {
+      rows.push({
+        type: 'OVERTIME', id: o.id, employee: o.employee.name, employeeId: o.employee.employeeId, profileImage: o.employee.profileImage ?? null,
+        summary: `Overtime (${o.hours}h)`, date: o.date, endDate: null, requestedAt: o.createdAt,
+        decision: decisionOf(o.status), status: o.status, decidedAt: o.updatedAt, decisionComments: o.decisionNote?.trim() || null,
+      });
+    }
+    for (const c of compOffs) {
+      rows.push({
+        type: 'COMP_OFF', id: c.id, employee: c.employee.name, employeeId: c.employee.employeeId, profileImage: c.employee.profileImage ?? null,
+        summary: `Comp-off (${days(c.daysEarned)})`, date: c.earnedForDate, endDate: null, requestedAt: c.createdAt,
+        decision: decisionOf(c.status), status: c.status, decidedAt: c.approvedAt ?? c.updatedAt, decisionComments: null, reason: c.reason?.trim() || null,
+      });
+    }
+    for (const r of reimbs) {
+      rows.push({
+        type: 'REIMBURSEMENT', id: r.id, employee: r.employee.name, employeeId: r.employee.employeeId, profileImage: r.employee.profileImage ?? null,
+        summary: 'Expense claim', date: r.claimDate, endDate: null, requestedAt: r.createdAt,
+        decision: decisionOf(r.status), status: r.status, decidedAt: r.updatedAt, decisionComments: r.reviewComments?.trim() || null,
+      });
+    }
+    // Most recently decided first; the id breaks ties so a page never repeats or skips a row.
+    rows.sort((a, b) => b.decidedAt.getTime() - a.decidedAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    return { ...slicePage(rows, page), total, ...page };
+  }
+
   // The Work From Home rows of the waiting requests, newest request first: single days one row each, and a multi-day
   // request all of its rows together (so it is never cut in the middle). Reads `want` requests of each kind.
   private async wfhRowsForPending(
@@ -1167,6 +1338,13 @@ export class DashboardService {
         levelOneApprovedAt: l.level1ApprovedAt,
         // The employee's remarks on the leave (a cancellation shows its own reason instead).
         reason: l.status === LeaveStatus.APPROVED ? null : l.remarks?.trim() || null,
+        // The supporting document the employee attached, as a signed short-lived link, so the approver can open it.
+        attachmentUrl: l.attachmentUrl
+          ? `/files/${signFileToken(organizationId, l.attachmentUrl)}`
+          : null,
+        attachmentFileName: l.attachmentUrl
+          ? (l.attachmentUrl.split('/').pop() ?? null)
+          : null,
       })),
       ...regularizations.map((a) => {
         // What was actually punched and what is being asked for, in the organization's own clock, so the reviewer sees
@@ -1175,6 +1353,7 @@ export class DashboardService {
           requestedInTime?: string | null;
           requestedOutTime?: string | null;
           reason?: string | null;
+          evidenceUrl?: string | null;
         } | null;
         const clock = (v: Date | string | null | undefined, none: string) =>
           v
@@ -1201,6 +1380,13 @@ export class DashboardService {
           requestedAt: a.updatedAt,
           // Why the employee asked for the correction: the approver needs it to decide.
           reason: reg?.reason?.trim() || null,
+          // The supporting document, as a signed short-lived link (the stored value is a bare key that serves nothing).
+          evidenceUrl: reg?.evidenceUrl
+            ? `/files/${signFileToken(organizationId, reg.evidenceUrl)}`
+            : null,
+          evidenceFileName: reg?.evidenceUrl
+            ? (reg.evidenceUrl.split('/').pop() ?? null)
+            : null,
         };
       }),
       ...this.groupWfhRows(wfh).map((g) => ({

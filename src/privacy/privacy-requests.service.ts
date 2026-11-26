@@ -28,6 +28,7 @@ import { assertValidAddress } from '../employees/personal-data';
 import { signFileToken } from '../files/file-token';
 import { deleteStoredFile } from '../files/delete-stored-file';
 import { PrivacyAuditService } from './privacy-audit.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { PrivacyService } from './privacy.service';
 import { storeGeneratedFile } from './privacy-storage';
 import type { RetentionRule } from './privacy-defaults';
@@ -159,6 +160,7 @@ export class PrivacyRequestsService {
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
     private readonly audit: PrivacyAuditService,
     private readonly privacy: PrivacyService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   // -- shared helpers --
@@ -214,6 +216,73 @@ export class PrivacyRequestsService {
     return r;
   }
 
+  // -- notifications --
+  // Messages carry the person's name, the kind of request and its number only: never what was asked to be changed or any data.
+  private static readonly TYPE_LABEL: Record<string, string> = {
+    ACCESS: 'access to personal data',
+    CORRECTION: 'correction of personal data',
+    UPDATE: 'update of personal data',
+    EXPORT: 'export of personal data',
+    ERASURE: 'erasure of personal data',
+  };
+
+  // Tell the company's Admins that a request has come in. Best-effort: a notification problem never fails the request.
+  private async notifyAdminsOfNewRequest(r: DataRequest, actor: Caller) {
+    try {
+      const admins = await this.scopedPrisma.user.findMany({
+        where: { organizationId: r.organizationId, role: Role.ADMIN, isActive: true, id: { not: actor.id } },
+        select: { id: true },
+      });
+      const label = PrivacyRequestsService.TYPE_LABEL[r.type] ?? 'personal data';
+      for (const a of admins) {
+        await this.notifications.create({
+          organizationId: r.organizationId,
+          userId: a.id,
+          title: 'New privacy request',
+          message: `${actor.name} submitted a request for ${label} (${r.requestNo}). Status: Submitted.`,
+          category: 'GENERAL',
+          pushKind: 'APPROVAL',
+          link: '/privacy/requests',
+        });
+      }
+    } catch {
+      /* the request is already saved */
+    }
+  }
+
+  private static readonly STATUS_TITLE: Partial<Record<DataRequestStatus, string>> = {
+    APPROVED: 'Privacy request approved',
+    REJECTED: 'Privacy request not approved',
+    COMPLETED: 'Privacy request completed',
+    ACTION_REQUIRED: 'Privacy request needs your attention',
+  };
+
+  private static readonly STATUS_NOTE: Partial<Record<DataRequestStatus, string>> = {
+    APPROVED: 'has been approved',
+    REJECTED: 'was not approved',
+    COMPLETED: 'has been completed',
+    ACTION_REQUIRED: 'needs your attention',
+  };
+
+  // Tell the person when their request is approved, rejected, completed or needs their attention. Called after the change is saved.
+  private async notifyRequester(updated: DataRequest, before: DataRequestStatus) {
+    const note = PrivacyRequestsService.STATUS_NOTE[updated.status];
+    if (!note || updated.status === before) return;
+    try {
+      const label = PrivacyRequestsService.TYPE_LABEL[updated.type] ?? 'personal data';
+      await this.notifications.create({
+        organizationId: updated.organizationId,
+        userId: updated.userId,
+        title: PrivacyRequestsService.STATUS_TITLE[updated.status] ?? 'Privacy request updated',
+        message: `Your request for ${label} (${updated.requestNo}) ${note}. Open Privacy to see the details.`,
+        category: 'GENERAL',
+        link: '/my/privacy',
+      });
+    } catch {
+      /* the decision is already saved */
+    }
+  }
+
   // Guarded write: only applies while the row is still in one of `fromStatuses`, so two reviewers cannot both act.
   private async transition(
     r: DataRequest,
@@ -235,7 +304,10 @@ export class PrivacyRequestsService {
         'This request was changed by someone else; reload and retry.',
       );
     }
-    return this.findOrThrow(r.id, r.organizationId);
+    const updated = await this.findOrThrow(r.id, r.organizationId);
+    // Only after the change is saved. A request cannot be moved to the same status twice (the write above is guarded), so this sends once.
+    await this.notifyRequester(updated, r.status);
+    return updated;
   }
 
   // Erasure verdict is exposed on the request so the employee sees "Deletion Restricted" and why.
@@ -345,6 +417,7 @@ export class PrivacyRequestsService {
         await this.log(actor, ctx, 'DATA_REQUEST_SUBMITTED', created, {
           fieldNames: Object.keys((payload.fields as object) ?? {}),
         });
+        await this.notifyAdminsOfNewRequest(created, actor);
         return this.present(created);
       } catch (err) {
         if (

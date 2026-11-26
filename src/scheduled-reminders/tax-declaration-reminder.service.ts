@@ -13,6 +13,7 @@ import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { todayInOrgTz } from '../common/org-date';
 import { frontendUrl } from '../common/frontend-url';
+import { taxYearLabel } from '../common/tax-year';
 import { formatDateDisplay } from '../payroll/format-date';
 import { PayrollSettingsService } from '../payroll-settings/payroll-settings.service';
 import { ReminderNotifier } from './reminder-notifier.service';
@@ -96,11 +97,12 @@ export class TaxDeclarationReminderService {
         variables: {
           employeeName: user.name,
           financialYear: window.financialYear,
+          taxYearLabel: taxYearLabel(window.financialYear),
           deadline,
           reviewUrl: `${frontendUrl()}/tax-declaration`,
         },
-        title: `Submit your tax declaration for FY ${window.financialYear} (${displayToday})`,
-        message: `Your investment declaration for FY ${window.financialYear} is not submitted yet. Submit it by ${deadline} so your TDS reflects it.`,
+        title: `Submit your tax declaration for ${taxYearLabel(window.financialYear)} (${displayToday})`,
+        message: `Your investment declaration for ${taxYearLabel(window.financialYear)} is not submitted yet. Submit it by ${deadline} so your TDS reflects it.`,
         category: NotificationCategory.PAYROLL,
       });
       if (delivered) sent++;

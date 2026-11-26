@@ -13,6 +13,7 @@ import { isOvertimePayEnabled } from '../overtime/overtime-pay';
 import { sandwichKindsOf, type LeaveRules } from '../leaves/leave-rules';
 import { leaveFreezeDayOf } from '../leaves/leave-freeze';
 import { employeeDob, missingPastMonths } from './fy-employment';
+import { ageOnFYEnd } from '../common/tax-year';
 import { holidayInEffect } from '../holidays/holiday-in-effect';
 import {
   EMPLOYEE_ORDER_BY,
@@ -6038,20 +6039,4 @@ export class PayrollService {
       .filter((row) => row.unmarkedDays > 0)
       .sort((a, b) => b.unmarkedDays - a.unmarkedDays);
   }
-}
-
-// Age (whole years) on 31 March ending the financial year ("2026-27" -> 31 Mar 2027); null when no valid DOB.
-function ageOnFYEnd(dob: unknown, financialYear: string): number | null {
-  if (typeof dob !== 'string') return null;
-  const born = new Date(dob);
-  const startYear = Number(financialYear.slice(0, 4));
-  if (Number.isNaN(born.getTime()) || !Number.isFinite(startYear)) return null;
-  const end = new Date(Date.UTC(startYear + 1, 2, 31));
-  let age = end.getUTCFullYear() - born.getUTCFullYear();
-  const beforeBirthday =
-    end.getUTCMonth() < born.getUTCMonth() ||
-    (end.getUTCMonth() === born.getUTCMonth() &&
-      end.getUTCDate() < born.getUTCDate());
-  if (beforeBirthday) age -= 1;
-  return age;
 }

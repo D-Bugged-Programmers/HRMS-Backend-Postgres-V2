@@ -4,6 +4,7 @@ import {
   effectiveLeaveRules,
   LeaveRules,
   rangesOverlap,
+  rejectedLeaveDates,
   sandwichKindsOf,
   splitDaysByYear,
   withSandwichFlags,
@@ -699,5 +700,25 @@ describe('sandwich rule: weekly offs and holidays chosen separately', () => {
       withSandwichFlags({ sandwichWeeklyOffs: false, sandwichHolidays: false }),
     ).toMatchObject({ sandwichLeaveApplies: false });
     expect(sandwichKindsOf({ sandwichLeaveApplies: true })).toEqual({ weeklyOffs: true, holidays: true });
+  });
+});
+
+describe('rejectedLeaveDates: no new request for a day that was rejected', () => {
+  const rejected = [{ start: '2026-11-10', end: '2026-11-11' }];
+  it('a single-day request on a rejected date is named', () => {
+    expect(rejectedLeaveDates(rejected, { start: '2026-11-10', end: '2026-11-10' })).toEqual(['2026-11-10']);
+  });
+  it('a multi-day request names every rejected date it includes, and only those', () => {
+    expect(rejectedLeaveDates(rejected, { start: '2026-11-09', end: '2026-11-12' })).toEqual(['2026-11-10', '2026-11-11']);
+  });
+  it('a request on other dates is clear', () => {
+    expect(rejectedLeaveDates(rejected, { start: '2026-11-12', end: '2026-11-14' })).toEqual([]);
+    expect(rejectedLeaveDates([], { start: '2026-11-10', end: '2026-11-10' })).toEqual([]);
+  });
+  it('the other half of a day whose one half was rejected is a different request', () => {
+    const am = [{ start: '2026-11-10', end: '2026-11-10', isHalfDay: true, halfDaySession: 'FIRST_HALF' }];
+    expect(rejectedLeaveDates(am, { start: '2026-11-10', end: '2026-11-10', isHalfDay: true, halfDaySession: 'SECOND_HALF' })).toEqual([]);
+    expect(rejectedLeaveDates(am, { start: '2026-11-10', end: '2026-11-10', isHalfDay: true, halfDaySession: 'FIRST_HALF' })).toEqual(['2026-11-10']);
+    expect(rejectedLeaveDates(am, { start: '2026-11-10', end: '2026-11-10' })).toEqual(['2026-11-10']);
   });
 });

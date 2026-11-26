@@ -7,6 +7,9 @@
 // even though they could set it freely when editing someone else's.
 import { markPayrollStaleForFinancialYear } from '../payroll/payroll-period-guard';
 import { isMetroCity } from '../common/hra-cities';
+import { ageOnFYEnd, taxYearLabel } from '../common/tax-year';
+import { employeeDob } from '../payroll/fy-employment';
+import { declarationLimitErrors } from './declaration-limits';
 import {
   BadRequestException,
   NotFoundException,
@@ -346,12 +349,12 @@ export class TaxDeclarationsService {
           existing.status === TaxDeclarationStatus.VERIFIED
         ) {
           throw new BadRequestException(
-            `Your declaration for FY ${dto.financialYear} has been verified, so its proofs can no longer be changed. Ask HR to reopen it.`,
+            `Your declaration for ${taxYearLabel(dto.financialYear)} has been verified, so its proofs can no longer be changed. Ask HR to reopen it.`,
           );
         }
         if (otherEdits.length > 0) {
           throw new BadRequestException(
-            `Your declaration for FY ${dto.financialYear} has already been submitted and can no longer be changed. Only your tax regime can still be changed, once a year.`,
+            `Your declaration for ${taxYearLabel(dto.financialYear)} has already been submitted and can no longer be changed. Only your tax regime can still be changed, once a year.`,
           );
         }
       }
@@ -371,10 +374,12 @@ export class TaxDeclarationsService {
       );
       if (dto.financialYear > currentFinancialYear) {
         throw new BadRequestException(
-          `FY ${dto.financialYear} hasn't started yet — it opens for declarations in ${MONTH_NAMES[settings.financialYearStartMonth]}.`,
+          `${taxYearLabel(dto.financialYear)} hasn't started yet — it opens for declarations in ${MONTH_NAMES[settings.financialYearStartMonth]}.`,
         );
       }
     }
+
+    await this.assertWithinLimits(dto, existing?.regimeChosen, employeeId, organizationId);
 
     // Switching regime follows its own rules (once a year after payroll has started, a company cut-off month, HR can
     // always do it); it is checked for every own edit, submitted or not.
@@ -539,7 +544,7 @@ export class TaxDeclarationsService {
       employeeId,
       eventKey: 'TAX_DECLARATION_UPDATED',
       performedById: actor.id,
-      description: `Tax declaration for FY ${dto.financialYear} ${existing ? 'updated' : 'created'}.`,
+      description: `Tax declaration for ${taxYearLabel(dto.financialYear)} ${existing ? 'updated' : 'created'}.`,
     });
 
     if (!isOwnDeclaration && status === TaxDeclarationStatus.VERIFIED) {
@@ -548,7 +553,7 @@ export class TaxDeclarationsService {
       });
       if (employee) {
         const title = 'Tax Declaration Verified';
-        const message = `Your tax declaration for FY ${dto.financialYear} has been verified.`;
+        const message = `Your tax declaration for ${taxYearLabel(dto.financialYear)} has been verified.`;
         await this.notificationsService.create({
           organizationId,
           userId: employee.id,
@@ -559,7 +564,7 @@ export class TaxDeclarationsService {
         const rendered = await this.emailTemplatesService.renderOccasion(
           organizationId,
           'TAX_DECLARATION_VERIFIED',
-          { employeeName: employee.name, financialYear: dto.financialYear },
+          { employeeName: employee.name, financialYear: dto.financialYear, taxYearLabel: taxYearLabel(dto.financialYear) },
           { subject: title, html: message },
         );
         // Fire-and-forget — the verification has already committed.
@@ -573,6 +578,25 @@ export class TaxDeclarationsService {
     }
 
     return withSignedProofs(declaration, organizationId);
+  }
+
+  // The age- and regime-dependent limits, on the amounts being saved. The date of birth is read only when an amount is high
+  // enough for it to matter.
+  private async assertWithinLimits(
+    dto: { financialYear: string; regimeChosen?: TaxRegime; section80D?: number; homeLoanInterest?: number; section80TTA?: number },
+    savedRegime: TaxRegime | undefined,
+    employeeId: string,
+    organizationId: string,
+  ) {
+    const isOld = (dto.regimeChosen ?? savedRegime ?? TaxRegime.NEW) === TaxRegime.OLD;
+    // Amounts within the strictest limits pass whatever the age.
+    if (declarationLimitErrors(dto, isOld, 0).length === 0) return;
+    const person = await this.scopedPrisma.user.findFirst({
+      where: { id: employeeId, organizationId },
+      select: { personalData: true },
+    });
+    const errors = declarationLimitErrors(dto, isOld, ageOnFYEnd(employeeDob(person?.personalData), dto.financialYear));
+    if (errors.length > 0) throw new BadRequestException(errors.join(' '));
   }
 
   // HR / Admin set the regime for one employee or many (a bulk change at the start of a year, or a correction). It never
@@ -650,7 +674,7 @@ export class TaxDeclarationsService {
         employeeId,
         eventKey: 'TAX_DECLARATION_UPDATED',
         performedById: actor.id,
-        description: `Tax regime for FY ${dto.financialYear} set to ${dto.regime === TaxRegime.OLD ? 'Old' : 'New'} by HR.`,
+        description: `Tax regime for ${taxYearLabel(dto.financialYear)} set to ${dto.regime === TaxRegime.OLD ? 'Old' : 'New'} by HR.`,
       });
       changed.push(known.get(employeeId)!);
     }

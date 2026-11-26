@@ -328,6 +328,27 @@ export function rangesOverlap(a: DateRange, b: DateRange): boolean {
   return true;
 }
 
+// The dates of a new request that fall on a day the employee already had REJECTED leave for. Every date in the range is checked on its own
+// (a multi-day request names each clashing day), and the same rule as other overlaps applies: the morning rejected and the afternoon
+// requested on one single date are different halves and do not clash. Pure; the caller supplies the employee's rejected ranges.
+export function rejectedLeaveDates(rejected: DateRange[], requested: DateRange): string[] {
+  const out: string[] = [];
+  const day = new Date(`${requested.start}T00:00:00Z`);
+  const last = new Date(`${requested.end}T00:00:00Z`);
+  for (let n = 0; day <= last && n < 400; n += 1) {
+    const d = day.toISOString().slice(0, 10);
+    const single: DateRange = {
+      start: d,
+      end: d,
+      isHalfDay: requested.start === requested.end ? requested.isHalfDay : false,
+      halfDaySession: requested.start === requested.end ? requested.halfDaySession : null,
+    };
+    if (rejected.some((x) => rangesOverlap(x, single))) out.push(d);
+    day.setUTCDate(day.getUTCDate() + 1);
+  }
+  return out;
+}
+
 // The days a leave is charged, split by calendar year, so a leave spanning New Year takes its December days from the
 // old year's balance and its January days from the new one's. `total` is what the whole request is charged (it can
 // include a sandwich adjustment); each part is counted with the same basis as the total and the last part takes the

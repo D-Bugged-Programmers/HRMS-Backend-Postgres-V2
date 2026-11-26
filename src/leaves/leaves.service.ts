@@ -60,6 +60,7 @@ import {
   countChargedDaysInclusive,
   effectiveLeaveRules,
   rangesOverlap,
+  rejectedLeaveDates,
   splitDaysByYear,
   LeaveRules,
 } from './leave-rules';
@@ -602,6 +603,25 @@ export class LeavesService {
       () => this.scopedPrisma.leave.count({ where }),
       query.page,
       query.limit,
+    );
+  }
+
+  // Refuses a request that includes a day the employee already had a REJECTED request for, naming the day(s).
+  private assertNoRejectedDates(
+    rejected: { startDate: string; endDate: string; isHalfDay: boolean; halfDaySession: string | null }[],
+    dto: { startDate: string; endDate: string; isHalfDay?: boolean; halfDaySession?: string | null },
+  ) {
+    const dates = rejectedLeaveDates(
+      rejected.map((x) => ({ start: x.startDate, end: x.endDate, isHalfDay: x.isHalfDay, halfDaySession: x.halfDaySession })),
+      { start: dto.startDate, end: dto.endDate, isHalfDay: dto.isHalfDay ?? false, halfDaySession: dto.halfDaySession ?? null },
+    );
+    if (dates.length === 0) return;
+    const shown = dates.slice(0, 5).map((d) => formatDateDisplay(d)).join(', ');
+    const more = dates.length > 5 ? ` and ${dates.length - 5} more` : '';
+    throw new BadRequestException(
+      dates.length === 1
+        ? `Your leave request for ${shown} was rejected, so a new request for that date can't be submitted. Choose a different date or speak to HR.`
+        : `Your leave requests for ${shown}${more} were rejected, so new requests for those dates can't be submitted. Remove ${dates.length === 1 ? 'that date' : 'those dates'} from the range or speak to HR.`,
     );
   }
 
@@ -2054,6 +2074,15 @@ export class LeavesService {
     if (!ruleResult.ok) {
       throw new BadRequestException(ruleResult.errors.join(' '));
     }
+    // A day whose leave request was REJECTED cannot be asked for again (a rejected record is kept as it is; only a new request is refused).
+    // Checked for every date of the range, so the message can name the date(s). Leave imported from an old system is not held to it.
+    if (!opts?.importing) {
+      const rejectedRows = await this.scopedPrisma.leave.findMany({
+        where: { organizationId, employeeId: actor.id, status: LeaveStatus.REJECTED },
+        select: { startDate: true, endDate: true, isHalfDay: true, halfDaySession: true },
+      });
+      this.assertNoRejectedDates(rejectedRows, dto);
+    }
     const totalDays = ruleResult.totalDays;
     const holidayDates = new Set(holidays.map((h) => h.date));
     const leaveYearCfg: LeaveYearConfig = {
@@ -2171,6 +2200,16 @@ export class LeavesService {
           halfDaySession: true,
         },
       });
+      if (!opts?.importing) {
+        // Same rule once the employee's row is locked, so a request sent at the same moment as another cannot slip past it.
+        this.assertNoRejectedDates(
+          await tx.leave.findMany({
+            where: { organizationId, employeeId: actor.id, status: LeaveStatus.REJECTED },
+            select: { startDate: true, endDate: true, isHalfDay: true, halfDaySession: true },
+          }),
+          dto,
+        );
+      }
       const stillOverlaps = freshOtherLeaves.some((range) =>
         rangesOverlap(
           {

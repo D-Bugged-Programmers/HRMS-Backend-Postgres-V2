@@ -3256,10 +3256,11 @@ export class AttendanceService {
             })
           ).map((e) => e.id)
         : scope;
-      where.employeeId =
-        query.employeeId && scoped.has(query.employeeId)
-          ? query.employeeId
-          : { in: inDept };
+      // Asking for one person outside the reviewer's own people is refused, not quietly widened to the whole team.
+      if (query.employeeId && !scoped.has(query.employeeId)) {
+        throw new ForbiddenException("Not authorized to view this employee's attendance.");
+      }
+      where.employeeId = query.employeeId ? query.employeeId : { in: inDept };
     } else if (query.employeeId) {
       // Not an employee of this organisation: "not found", like every other employee endpoint, rather than an empty list.
       const exists = await this.scopedPrisma.user.findFirst({
@@ -3473,6 +3474,10 @@ export class AttendanceService {
         // Whether that leave is paid (Leave Without Pay and other unpaid types are not), so a summary can count unpaid
         // days as absent days, the way payroll does.
         let leavePaid: boolean | undefined;
+        // When the leave on this day is a half day: which half it covers, so a half-day leave plus Work From Home on the same day
+        // reads "first half leave, second half WFH" instead of a bare Half Day.
+        let leaveHalfDay: boolean | undefined;
+        let leaveHalfDaySession: string | null | undefined;
         if (
           record.status === AttendanceStatus.ON_LEAVE ||
           record.status === AttendanceStatus.HALF_DAY
@@ -3481,6 +3486,10 @@ export class AttendanceService {
             (l) => l.startDate <= record.date && l.endDate >= record.date,
           );
           leaveTypeName = matching?.leaveType.name;
+          if (matching) {
+            leaveHalfDay = matching.isHalfDay;
+            leaveHalfDaySession = matching.isHalfDay ? matching.halfDaySession : null;
+          }
           if (matching) {
             leavePaid =
               matching.leaveType.isPaid && matching.leaveType.code !== 'LWP';
@@ -3519,6 +3528,7 @@ export class AttendanceService {
           ...(leaveTypeName !== undefined && { leaveTypeName }),
           ...(leaveKind !== undefined && { leaveKind }),
           ...(leavePaid !== undefined && { leavePaid }),
+          ...(leaveHalfDay !== undefined && { leaveHalfDay, leaveHalfDaySession }),
         };
       }),
     };

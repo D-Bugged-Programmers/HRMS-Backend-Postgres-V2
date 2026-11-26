@@ -35,6 +35,7 @@ import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { sendReportBranded } from '../reports/report-branding';
 import { TdsComplianceService } from './tds-compliance.service';
 import { renderForm130 } from './form130-pdf';
+import { taxYearLabel } from '../common/tax-year';
 import { sendOccasionEmail } from '../email-templates/send-occasion-email';
 import { frontendUrl } from '../common/frontend-url';
 import { EmailTemplatesService } from '../email-templates/email-templates.service';
@@ -273,7 +274,7 @@ export class TdsComplianceController {
         to: u.email,
         occasionKey: 'FORM16_AVAILABLE',
         notificationPreferences: u.notificationPreferences,
-        variables: { employeeName: u.name, financialYear: q.financialYear, formName: Number(q.financialYear.slice(0, 4)) >= 2026 ? 'Form 130' : 'Form 16', downloadUrl: `${frontendUrl()}/tax-declaration` },
+        variables: { employeeName: u.name, financialYear: q.financialYear, taxYearLabel: taxYearLabel(q.financialYear), formName: Number(q.financialYear.slice(0, 4)) >= 2026 ? 'Form 130' : 'Form 16', downloadUrl: `${frontendUrl()}/tax-declaration` },
       });
       if (ok) sent++;
     }
@@ -319,7 +320,7 @@ export class TdsComplianceController {
     );
     const pdf = await renderForm130(data, logo, watermarkEnabled);
     const filename = `${data.formName.replace(' ', '')}_${data.employee.code}_${q.financialYear}.pdf`;
-    const subject = `Your ${data.formName} for ${q.financialYear}`;
+    const subject = `Your ${data.formName} for ${taxYearLabel(q.financialYear)}`;
     // Through the shared email shell (organization header, footer, styled body) - it used to go out as bare paragraphs.
     const rendered = await this.emailTemplatesService.renderOccasion(
       c.organizationId,
@@ -328,10 +329,11 @@ export class TdsComplianceController {
         employeeName: employee.name,
         formName: data.formName,
         financialYear: q.financialYear,
+        taxYearLabel: taxYearLabel(q.financialYear),
       },
       {
         subject,
-        html: `<p>Hi ${escapeHtml(employee.name)},</p><p>Your ${escapeHtml(data.formName)} (tax certificate) for ${escapeHtml(q.financialYear)} is attached. Please keep it for your income-tax filing.</p>`,
+        html: `<p>Hi ${escapeHtml(employee.name)},</p><p>Your ${escapeHtml(data.formName)} (tax certificate) for ${escapeHtml(taxYearLabel(q.financialYear))} is attached. Please keep it for your income-tax filing.</p>`,
       },
     );
     const sendResult = await this.emailService.send({

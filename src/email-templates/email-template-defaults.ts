@@ -80,7 +80,7 @@ export const EMAIL_PREHEADERS: Record<string, string> = {
   PAYSLIP_ISSUED:
     'Your salary for {{month}}/{{year}} has been paid. Payslip attached.',
   TAX_DECLARATION_VERIFIED:
-    'Your tax declaration for FY {{financialYear}} has been verified.',
+    'Your tax declaration for {{taxYearLabel}} has been verified.',
   PERFORMANCE_RATING_PUBLISHED:
     'Your performance rating for FY {{financialYear}} is now available.',
   OFFBOARDING_INITIATED: 'Your last working day is {{lastWorkingDay}}.',
@@ -119,7 +119,7 @@ export const EMAIL_PREHEADERS: Record<string, string> = {
   HOLIDAY_CALENDAR_REMINDER:
     "{{nextYear}}'s holiday calendar has {{holidayCount}} holiday(s) so far.",
   TAX_DECLARATION_REMINDER:
-    'Submit your FY {{financialYear}} tax declaration by {{deadline}}.',
+    'Submit your tax declaration for {{taxYearLabel}} by {{deadline}}.',
   EXIT_HANDOVER_REMINDER:
     'Your last working day is {{lastWorkingDay}} ({{when}}).',
   EXIT_CLEARANCE_REMINDER:
@@ -132,7 +132,7 @@ export const EMAIL_PREHEADERS: Record<string, string> = {
   ASSET_RETURN_REMINDER: 'Please return {{assetCount}} item(s) before {{lastWorkingDay}}.',
   LOAN_EMI_DUE: 'Your EMI of {{emiAmount}} is deducted from your {{month}} salary.',
   LOAN_CLOSED: 'Your {{loanType}} loan is fully repaid.',
-  FORM16_AVAILABLE: 'Your {{formName}} for FY {{financialYear}} is ready to download.',
+  FORM16_AVAILABLE: 'Your {{formName}} for {{taxYearLabel}} is ready to download.',
   ONBOARDING_REMINDER: 'A few steps are left to finish your onboarding.',
   RESIGNATION_PENDING_REMINDER:
     "{{subjectName}}'s resignation has been waiting {{daysWaiting}} days for a decision.",
@@ -476,9 +476,9 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
       category: 'Payroll & Finance',
       title: 'Tax Declaration Verified',
       message:
-        'Your tax declaration for FY {{financialYear}} has been verified.',
+        'Your tax declaration for {{taxYearLabel}} has been verified.',
       rows: [
-        row('Financial year', 'FY {{financialYear}}'),
+        row('Year', '{{taxYearLabel}}'),
         row('Status', status('Verified')),
       ],
     }),
@@ -1069,14 +1069,14 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
     // deadline, to employees who have not submitted a declaration for the current financial year.
     occasionKey: 'TAX_DECLARATION_REMINDER',
     name: 'Tax Declaration Reminder',
-    subject: 'Submit your tax declaration for FY {{financialYear}}',
+    subject: 'Submit your tax declaration for {{taxYearLabel}}',
     bodyHtml: emailBody({
       category: 'Payroll & Finance',
       title: 'Tax declaration due',
       blocks: [
         greet,
         paragraph(
-          'Your investment declaration for FY {{financialYear}} is not submitted yet. Submit it by {{deadline}} so your monthly TDS reflects your deductions.',
+          'Your investment declaration for {{taxYearLabel}} is not submitted yet. Submit it by {{deadline}} so your monthly TDS reflects your deductions.',
         ),
         infoCard([
           row('Financial year', '{{financialYear}}'),
@@ -1278,13 +1278,13 @@ export const EMAIL_TEMPLATE_DEFAULTS: EmailTemplateDefault[] = [
     occasionKey: 'FORM16_AVAILABLE',
     // The key stays FORM16_AVAILABLE; {{formName}} is Form 130 from 1-Apr-2026 (tax year 2026-27) and Form 16 before.
     name: 'Tax Certificate Available',
-    subject: 'Your {{formName}} for FY {{financialYear}} is ready',
+    subject: 'Your {{formName}} for {{taxYearLabel}} is ready',
     bodyHtml: emailBody({
       category: 'Payroll & Finance',
       title: 'Your {{formName}} is ready',
       blocks: [
         greet,
-        paragraph('Your {{formName}} (tax certificate) for FY {{financialYear}} is ready to download from the HRMS.'),
+        paragraph('Your {{formName}} (tax certificate) for {{taxYearLabel}} is ready to download from the HRMS.'),
         button('{{downloadUrl}}', 'Open Tax Declaration'),
         regards,
       ],

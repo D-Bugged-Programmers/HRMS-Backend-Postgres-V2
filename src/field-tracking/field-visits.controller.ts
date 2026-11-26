@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import {
+  IsBoolean,
   IsInt,
   IsNumber,
   IsOptional,
@@ -43,6 +44,12 @@ class VisitDto {
     message: 'scheduledFor must be YYYY-MM-DD.',
   })
   scheduledFor?: string;
+  // True once the person assigning has seen the "employee already has a visit that day" warning and chose to go on.
+  @IsOptional() @IsBoolean() confirmDuplicate?: boolean;
+}
+
+class ReviewVisitDto {
+  @IsOptional() @IsString() @MaxLength(500) note?: string;
 }
 
 class CheckInDto {
@@ -103,6 +110,21 @@ export class FieldVisitsController {
     @CurrentUser() caller: Caller,
   ) {
     return this.visits.update(caller, id, dto);
+  }
+
+  // Approve / reject a visit an employee planned for themselves: Admin, HR, or a manager who looks after them.
+  @Post(':id/approve')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
+  approve(@Param('id') id: string, @Body() dto: ReviewVisitDto, @CurrentUser() caller: Caller) {
+    return this.visits.review(caller, id, 'APPROVED', dto.note);
+  }
+
+  @Post(':id/reject')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
+  reject(@Param('id') id: string, @Body() dto: ReviewVisitDto, @CurrentUser() caller: Caller) {
+    return this.visits.review(caller, id, 'REJECTED', dto.note);
   }
 
   @Delete(':id')

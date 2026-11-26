@@ -51,7 +51,18 @@ type Actor = Pick<User, 'id' | 'role' | 'organizationId' | 'name'> &
 export interface CreateVisitInput extends VisitInput {
   employeeId?: string;
   scheduledFor?: string;
+  /** Set by the app after the person assigning has seen the "already has a visit that day" warning and chose to go on. */
+  confirmDuplicate?: boolean;
 }
+
+// Visits that take up one of an employee's slots for a day: waiting for approval, confirmed, under way or done. Cancelled, rejected and
+// missed ones do not count toward the daily limit or the "already has a visit" warning.
+const ACTIVE_STATUSES: FieldVisitStatus[] = [
+  FieldVisitStatus.PENDING_APPROVAL,
+  FieldVisitStatus.PLANNED,
+  FieldVisitStatus.CHECKED_IN,
+  FieldVisitStatus.COMPLETED,
+];
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -115,6 +126,62 @@ export class FieldVisitsService {
     );
   }
 
+  // The employee's visits on one day that still count (see ACTIVE_STATUSES), optionally leaving one out (the visit being edited).
+  private visitsOn(client: Pick<ExtendedPrismaClient, 'fieldVisit'>, organizationId: string, employeeId: string, day: string, exceptId?: string) {
+    return client.fieldVisit.findMany({
+      where: {
+        organizationId,
+        employeeId,
+        scheduledFor: day,
+        status: { in: ACTIVE_STATUSES },
+        ...(exceptId ? { id: { not: exceptId } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+      include: { createdBy: { select: { id: true, name: true } } },
+    });
+  }
+
+  // The company's daily limit (Organisation settings > live tracking): refused when this visit would go over it. 0 = no limit.
+  private assertWithinDailyLimit(maxVisitsPerDay: number, day: string, existingCount: number) {
+    if (maxVisitsPerDay > 0 && existingCount >= maxVisitsPerDay) {
+      throw new BadRequestException(
+        `The daily limit of ${maxVisitsPerDay} client visit${maxVisitsPerDay === 1 ? '' : 's'} per employee is already reached for ${day}.`,
+      );
+    }
+  }
+
+  // Runs the check-then-write for one employee's day as a single transaction behind a per-employee-per-day lock, so two requests at the
+  // same moment (a double tap, an Admin and the employee) are handled one after the other: the second one sees the first one's visit
+  // and cannot slip past the daily limit or the duplicate warning.
+  private withDayLock<T>(organizationId: string, employeeId: string, day: string, fn: (tx: ExtendedPrismaClient) => Promise<T>): Promise<T> {
+    return this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`field-visit-day:${organizationId}:${employeeId}:${day}`}))`;
+      return fn(tx as unknown as ExtendedPrismaClient);
+    });
+  }
+
+  // Someone else (Admin / HR / a manager) assigning a visit on a day the employee already has one: stop with the details so the
+  // person can see them, and let the app resend with confirmDuplicate once they choose to go on.
+  private warnIfAlreadyAssigned(
+    existing: Awaited<ReturnType<FieldVisitsService['visitsOn']>>,
+    employeeName: string,
+    day: string,
+  ) {
+    throw new ConflictException({
+      code: 'FIELD_VISIT_ALREADY_ON_DATE',
+      message: `${employeeName} already has ${existing.some((e) => e.createdById === e.employeeId) ? 'a self-assigned field visit' : existing.length === 1 ? 'a field visit' : `${existing.length} field visits`} on ${day}.${existing.some((e) => e.createdById === e.employeeId) ? ' Review it before adding another.' : ''}`,
+      existing: existing.map((e) => ({
+        id: e.id,
+        clientName: e.clientName,
+        address: e.address,
+        status: e.status,
+        scheduledFor: e.scheduledFor,
+        assignedBy: e.createdBy?.name ?? null,
+        selfAssigned: e.createdById === e.employeeId,
+      })),
+    });
+  }
+
   async create(actor: Actor, input: CreateVisitInput) {
     await this.assertOn(actor.organizationId);
     const employeeId = input.employeeId || actor.id;
@@ -151,22 +218,36 @@ export class FieldVisitsService {
       throw new BadRequestException(
         `Plan at most ${VISIT.maxAheadDays} days ahead.`,
       );
-    const visit = await this.db.fieldVisit.create({
-      data: {
-        ...clean.value,
-        organizationId: actor.organizationId,
-        employeeId,
-        createdById: actor.id,
-        scheduledFor,
-      },
+    const { maxVisitsPerDay } = await this.tracking.getSettings(actor.organizationId);
+    // An employee planning a visit for themselves needs Admin / HR / manager approval before it counts as confirmed. Anyone who can
+    // approve (and anything assigned by them) is confirmed straight away.
+    const needsApproval = actor.role === Role.EMPLOYEE && employeeId === actor.id;
+    const visit = await this.withDayLock(actor.organizationId, employeeId, scheduledFor, async (tx) => {
+      const existing = await this.visitsOn(tx, actor.organizationId, employeeId, scheduledFor);
+      // Assigned by someone else: show what is already there first (the app asks the person to confirm and sends it again).
+      if (employeeId !== actor.id && existing.length > 0 && !input.confirmDuplicate) {
+        this.warnIfAlreadyAssigned(existing, person.name, scheduledFor);
+      }
+      this.assertWithinDailyLimit(maxVisitsPerDay, scheduledFor, existing.length);
+      return tx.fieldVisit.create({
+        data: {
+          ...clean.value,
+          organizationId: actor.organizationId,
+          employeeId,
+          createdById: actor.id,
+          scheduledFor,
+          status: needsApproval ? FieldVisitStatus.PENDING_APPROVAL : FieldVisitStatus.PLANNED,
+        },
+      });
     });
+    if (needsApproval) await this.askForApproval(actor, visit);
     await this.audit.log({
       actorId: actor.id,
       action: 'FIELD_VISIT_CREATED',
       module: 'EMPLOYEE',
       organizationId: actor.organizationId,
       targetId: visit.id,
-      details: { employeeId, scheduledFor, client: visit.clientName },
+      details: { employeeId, scheduledFor, client: visit.clientName, needsApproval },
     });
     if (employeeId !== actor.id) {
       try {
@@ -269,7 +350,7 @@ export class FieldVisitsService {
   async update(actor: Actor, id: string, input: CreateVisitInput) {
     await this.assertOn(actor.organizationId);
     const v = await this.load(actor, id);
-    if (v.status !== FieldVisitStatus.PLANNED)
+    if (v.status !== FieldVisitStatus.PLANNED && v.status !== FieldVisitStatus.PENDING_APPROVAL)
       throw new BadRequestException('Only a planned visit can be changed.');
     if (!(await this.mayChange(actor, v)))
       throw new ForbiddenException('You cannot change this visit.');
@@ -291,21 +372,39 @@ export class FieldVisitsService {
       throw new BadRequestException(
         'A visit cannot be planned for a past day.',
       );
-    await this.db.fieldVisit.updateMany({
-      where: {
-        id,
-        organizationId: actor.organizationId,
-        status: FieldVisitStatus.PLANNED,
-      },
-      data: { ...clean.value, scheduledFor },
+    const movedDay = scheduledFor !== v.scheduledFor;
+    const { maxVisitsPerDay } = await this.tracking.getSettings(actor.organizationId);
+    // An employee changing the client, place or day of their own approved visit sends it back for approval.
+    const selfEdit = actor.role === Role.EMPLOYEE && v.employeeId === actor.id;
+    const material = movedDay || clean.value.clientName !== v.clientName || clean.value.address !== v.address;
+    const backToApproval = selfEdit && v.status === FieldVisitStatus.PLANNED && material;
+    const res = await this.withDayLock(actor.organizationId, v.employeeId, scheduledFor, async (tx) => {
+      if (movedDay) {
+        const existing = await this.visitsOn(tx, actor.organizationId, v.employeeId, scheduledFor, id);
+        if (v.employeeId !== actor.id && existing.length > 0 && !input.confirmDuplicate) {
+          const who = await tx.user.findFirst({ where: { id: v.employeeId, organizationId: actor.organizationId }, select: { name: true } });
+          this.warnIfAlreadyAssigned(existing, who?.name ?? 'This employee', scheduledFor);
+        }
+        this.assertWithinDailyLimit(maxVisitsPerDay, scheduledFor, existing.length);
+      }
+      return tx.fieldVisit.updateMany({
+        where: {
+          id,
+          organizationId: actor.organizationId,
+          status: v.status,
+        },
+        data: { ...clean.value, scheduledFor, ...(backToApproval ? { status: FieldVisitStatus.PENDING_APPROVAL, reviewedById: null, reviewedAt: null, reviewNote: '' } : {}) },
+      });
     });
+    if (res.count === 0) throw new ConflictException('This visit was just changed. Reload and try again.');
+    if (backToApproval) await this.askForApproval(actor, await this.load(actor, id));
     return this.load(actor, id);
   }
 
   async cancel(actor: Actor, id: string, reason: string) {
     await this.assertOn(actor.organizationId);
     const v = await this.load(actor, id);
-    if (v.status !== FieldVisitStatus.PLANNED)
+    if (v.status !== FieldVisitStatus.PLANNED && v.status !== FieldVisitStatus.PENDING_APPROVAL)
       throw new BadRequestException('Only a planned visit can be cancelled.');
     if (!(await this.mayChange(actor, v)))
       throw new ForbiddenException('You cannot cancel this visit.');
@@ -313,7 +412,7 @@ export class FieldVisitsService {
       where: {
         id,
         organizationId: actor.organizationId,
-        status: FieldVisitStatus.PLANNED,
+        status: v.status,
       },
       data: { status: FieldVisitStatus.CANCELLED, outcome: `Cancelled: ${reason.trim()}` },
     });
@@ -324,6 +423,81 @@ export class FieldVisitsService {
       organizationId: actor.organizationId,
       targetId: id,
     });
+    return this.load(actor, id);
+  }
+
+  // Tell the people who approve (the employee's manager(s), else HR / Admin) that a self-planned visit is waiting.
+  private async askForApproval(
+    actor: Actor,
+    visit: { id: string; clientName: string; scheduledFor: string },
+  ) {
+    try {
+      await this.notifications.notifyReviewers({
+        organizationId: actor.organizationId,
+        requester: {
+          id: actor.id,
+          reportingManagerId: (actor.reportingManagerId as string | null | undefined) ?? null,
+          additionalReportingManagerIds: (actor.additionalReportingManagerIds as string[] | null | undefined) ?? [],
+        },
+        title: 'Field visit needs approval',
+        message: `${actor.name} planned a visit to ${visit.clientName} on ${visit.scheduledFor}. Open Team tracking to approve it.`,
+        category: NotificationCategory.ATTENDANCE,
+        managerFirst: true,
+      });
+    } catch {
+      /* a failed notice must not fail the plan */
+    }
+  }
+
+  // Approve or reject a visit an employee planned for themselves: Admin, HR, or a manager who looks after that employee (never the
+  // employee themselves). Only a visit still waiting can be decided; a rejection needs a reason.
+  async review(actor: Actor, id: string, decision: 'APPROVED' | 'REJECTED', note?: string) {
+    await this.assertOn(actor.organizationId);
+    if (actor.role === Role.EMPLOYEE) throw new ForbiddenException('Only Admin, HR or a manager can approve field visits.');
+    const v = await this.load(actor, id);
+    if (v.employeeId === actor.id && actor.role !== Role.ADMIN)
+      throw new ForbiddenException('You cannot approve your own field visit.');
+    if (!(await this.mayManage(actor, v.employeeId)))
+      throw new ForbiddenException('You can only decide visits of people you look after.');
+    if (v.status !== FieldVisitStatus.PENDING_APPROVAL)
+      throw new BadRequestException('This visit is not waiting for approval.');
+    const reason = (note ?? '').trim();
+    if (decision === 'REJECTED' && !reason) throw new BadRequestException('Add a reason for rejecting the visit.');
+    const today = await this.today(actor.organizationId);
+    if (decision === 'APPROVED' && v.scheduledFor < today)
+      throw new BadRequestException('This visit\'s day has passed; it can no longer be approved.');
+    const res = await this.db.fieldVisit.updateMany({
+      where: { id, organizationId: actor.organizationId, status: FieldVisitStatus.PENDING_APPROVAL },
+      data: {
+        status: decision === 'APPROVED' ? FieldVisitStatus.PLANNED : FieldVisitStatus.REJECTED,
+        reviewedById: actor.id,
+        reviewedAt: new Date(),
+        reviewNote: reason,
+      },
+    });
+    if (res.count === 0) throw new ConflictException('This visit was just decided. Reload and try again.');
+    await this.audit.log({
+      actorId: actor.id,
+      action: decision === 'APPROVED' ? 'FIELD_VISIT_APPROVED' : 'FIELD_VISIT_REJECTED',
+      module: 'EMPLOYEE',
+      organizationId: actor.organizationId,
+      targetId: id,
+      details: { employeeId: v.employeeId, scheduledFor: v.scheduledFor, ...(reason ? { note: reason } : {}) },
+    });
+    try {
+      await this.notifications.create({
+        organizationId: actor.organizationId,
+        userId: v.employeeId,
+        title: decision === 'APPROVED' ? 'Field visit approved' : 'Field visit not approved',
+        message:
+          decision === 'APPROVED'
+            ? `${actor.name} approved your visit to ${v.clientName} on ${v.scheduledFor}.`
+            : `${actor.name} did not approve your visit to ${v.clientName} on ${v.scheduledFor}. Reason: ${reason}`,
+        category: NotificationCategory.ATTENDANCE,
+      });
+    } catch {
+      /* a failed notice must not undo the decision */
+    }
     return this.load(actor, id);
   }
 
@@ -576,6 +750,11 @@ export class FieldVisitsService {
         },
         data: { status: FieldVisitStatus.MISSED },
       });
+      // A self-planned visit nobody approved before its day is over cannot happen any more.
+      const lapsed = await this.prisma.fieldVisit.updateMany({
+        where: { status: FieldVisitStatus.PENDING_APPROVAL, scheduledFor: { lt: new Date().toISOString().slice(0, 10) } },
+        data: { status: FieldVisitStatus.REJECTED, reviewNote: 'Not approved before the visit day.' },
+      });
       const stale = await this.prisma.fieldVisit.updateMany({
         where: {
           status: FieldVisitStatus.CHECKED_IN,
@@ -585,9 +764,9 @@ export class FieldVisitsService {
         },
         data: { status: FieldVisitStatus.COMPLETED, autoClosed: true },
       });
-      if (missed.count || stale.count)
+      if (missed.count || stale.count || lapsed.count)
         this.logger.log(
-          `Field visits: ${missed.count} marked missed, ${stale.count} auto-closed.`,
+          `Field visits: ${missed.count} marked missed, ${stale.count} auto-closed, ${lapsed.count} unapproved lapsed.`,
         );
     } catch (e) {
       this.logger.error(

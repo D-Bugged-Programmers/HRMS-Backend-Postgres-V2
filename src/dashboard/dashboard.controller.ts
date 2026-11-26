@@ -7,6 +7,7 @@ import { Role, User } from '@prisma/client';
 import { DashboardService } from './dashboard.service';
 import { DashboardRange } from './dashboard-date-math';
 import { PendingItemsQueryDto } from './dto/pending-items-query.dto';
+import { CompletedItemsQueryDto } from './dto/completed-items-query.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -53,6 +54,18 @@ export class DashboardController {
         ? { offset: query.offset, limit: query.limit }
         : undefined,
     );
+  }
+
+  // Requests the caller has already decided (the mobile Approvals "Completed" tab), most recently decided first, one page at a
+  // time: { items, total, hasMore }. Only the caller's own decisions; the pending lists above are the ones still waiting.
+  @Get('completed-items')
+  @Roles(Role.ADMIN, Role.HR, Role.MANAGER)
+  @UseGuards(RolesGuard)
+  completedItems(
+    @Query() query: CompletedItemsQueryDto,
+    @CurrentUser() caller: Caller,
+  ) {
+    return this.dashboardService.completedItems(caller, caller.organizationId, query);
   }
 
   @Get('hr')

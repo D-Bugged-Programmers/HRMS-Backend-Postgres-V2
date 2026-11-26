@@ -556,3 +556,26 @@ describe('tax regime: HR sets it', () => {
     ).rejects.toThrow(/Only HR or an Admin/);
   });
 });
+
+describe('declared amounts over the age and regime limits', () => {
+  it('refuses them and saves nothing', async () => {
+    const { service, store } = build();
+    await expect(
+      service.upsert(
+        { financialYear: FY, regimeChosen: 'OLD', homeLoanInterest: 200001, section80TTA: 10001 } as never,
+        employee,
+        'org1',
+      ),
+    ).rejects.toThrow('Home loan interest can be at most ₹2,00,000. Section 80TTA can be at most ₹10,000.');
+    expect(store).toHaveLength(0);
+  });
+  it('saves amounts exactly at the limits', async () => {
+    const { service, store } = build();
+    await service.upsert(
+      { financialYear: FY, regimeChosen: 'OLD', homeLoanInterest: 200000, section80TTA: 10000, section80D: 100000 } as never,
+      employee,
+      'org1',
+    );
+    expect(store).toHaveLength(1);
+  });
+});

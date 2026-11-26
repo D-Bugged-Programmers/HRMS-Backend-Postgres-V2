@@ -78,7 +78,7 @@ const SEGMENTS: Record<string, string[]> = {
   'module.statutory': ['statutory-config', 'tds', 'tax-slabs', 'tax-declarations'],
   'module.loans_reimbursements': ['loans', 'reimbursements'],
   'module.assets': ['assets'],
-  'module.performance': ['performance-ratings', 'company-performance'],
+  'module.performance': ['performance-ratings', 'company-performance', 'self-reviews'],
   'module.documents_letters': ['documents', 'letter-templates', 'letters'],
   'module.offboarding': ['offboarding', 'resignations', 'settlements'],
   'module.reports': ['reports'],

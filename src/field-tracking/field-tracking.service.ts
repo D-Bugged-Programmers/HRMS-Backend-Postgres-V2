@@ -141,7 +141,7 @@ export class FieldTrackingService {
     const before = await this.getSettings(actor.organizationId);
     await this.db.organization.updateMany({
       where: { id: actor.organizationId },
-      data: { fieldTrackingSettings: { ...settings } },
+      data: { fieldTrackingSettings: { ...before, ...settings } },
     });
     await this.audit.log({
       actorId: actor.id,
@@ -156,7 +156,7 @@ export class FieldTrackingService {
           .map((k) => [k, { from: before[k], to: settings[k] }]),
       ),
     });
-    return settings;
+    return { ...before, ...settings };
   }
 
   // What the phone needs to know: is tracking on for me, did I consent, am I on shift, and how to sample.
@@ -172,6 +172,7 @@ export class FieldTrackingService {
       intervalSeconds: cfg.intervalSeconds,
       minDistanceMeters: cfg.minDistanceMeters,
       retentionDays: cfg.retentionDays,
+      maxVisitsPerDay: cfg.maxVisitsPerDay,
     };
     if (!featureOn || !user.fieldTrackingEnabled)
       return { ...base, shiftActive: false };

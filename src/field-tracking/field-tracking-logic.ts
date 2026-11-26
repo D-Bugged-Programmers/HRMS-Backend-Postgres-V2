@@ -29,18 +29,23 @@ export const TRACKING_LIMITS = {
   intervalSeconds: { min: 120, max: 1800 },
   minDistanceMeters: { min: 50, max: 1000 },
   retentionDays: { min: 7, max: 365 },
+  /** Client visits one person may have on a single day; 0 = no limit. */
+  maxVisitsPerDay: { min: 0, max: 50 },
 } as const;
 
 export interface TrackingSettings {
   intervalSeconds: number;
   minDistanceMeters: number;
   retentionDays: number;
+  /** The most client visits one employee may have on a single day (planned, approved or done); 0 = no limit. */
+  maxVisitsPerDay: number;
 }
 
 export const DEFAULT_TRACKING_SETTINGS: TrackingSettings = {
   intervalSeconds: TRACKING.intervalSeconds,
   minDistanceMeters: TRACKING.minDistanceMeters,
   retentionDays: TRACKING.retentionDays,
+  maxVisitsPerDay: 0,
 };
 
 const clampInt = (v: unknown, min: number, max: number, fallback: number) => {
@@ -76,6 +81,12 @@ export function resolveTrackingSettings(raw: unknown): TrackingSettings {
       L.retentionDays.max,
       TRACKING.retentionDays,
     ),
+    maxVisitsPerDay: clampInt(
+      o.maxVisitsPerDay,
+      L.maxVisitsPerDay.min,
+      L.maxVisitsPerDay.max,
+      0,
+    ),
   };
 }
 
@@ -84,7 +95,7 @@ export function resolveTrackingSettings(raw: unknown): TrackingSettings {
  * (a save is refused rather than quietly adjusted).
  */
 export function validateTrackingSettingsInput(raw: unknown): {
-  settings?: TrackingSettings;
+  settings?: Omit<TrackingSettings, 'maxVisitsPerDay'> & { maxVisitsPerDay?: number };
   errors: string[];
 } {
   const o = (raw && typeof raw === 'object' ? raw : {}) as Record<
@@ -96,10 +107,13 @@ export function validateTrackingSettingsInput(raw: unknown): {
     intervalSeconds: 'Sharing interval (seconds)',
     minDistanceMeters: 'Early-point distance (metres)',
     retentionDays: 'Keep points for (days)',
+    maxVisitsPerDay: 'Client visits per employee per day (0 = no limit)',
   } as const;
   const out: Record<string, number> = {};
   for (const key of Object.keys(labels) as (keyof typeof labels)[]) {
     const v = o[key];
+    // The daily-visit limit is newer than the other settings: a client that does not send it keeps what is saved.
+    if (key === 'maxVisitsPerDay' && v === undefined) continue;
     const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
     const { min, max } = TRACKING_LIMITS[key];
     if (typeof n !== 'number' || !Number.isInteger(n) || n < min || n > max) {
@@ -110,7 +124,7 @@ export function validateTrackingSettingsInput(raw: unknown): {
   }
   return errors.length
     ? { errors }
-    : { settings: out as unknown as TrackingSettings, errors };
+    : { settings: out as unknown as Omit<TrackingSettings, 'maxVisitsPerDay'> & { maxVisitsPerDay?: number }, errors };
 }
 
 /** A person is Offline after missing about four samples (never sooner than the original 20 minutes). */

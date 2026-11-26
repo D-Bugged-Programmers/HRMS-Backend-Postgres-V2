@@ -179,6 +179,7 @@ describe('company tracking settings', () => {
       intervalSeconds: 300,
       minDistanceMeters: 200,
       retentionDays: 60,
+      maxVisitsPerDay: 0,
     });
     expect(
       resolveTrackingSettings({
@@ -190,7 +191,10 @@ describe('company tracking settings', () => {
       intervalSeconds: 120,
       minDistanceMeters: 1000,
       retentionDays: 60,
+      maxVisitsPerDay: 0,
     });
+    expect(resolveTrackingSettings({ maxVisitsPerDay: 99 }).maxVisitsPerDay).toBe(50);
+    expect(resolveTrackingSettings({ maxVisitsPerDay: 3 }).maxVisitsPerDay).toBe(3);
   });
 
   it('accepts whole numbers in range (as text too) and lists every problem otherwise', () => {

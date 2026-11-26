@@ -11,6 +11,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { PrivacyAuditService } from './privacy-audit.service';
@@ -208,11 +209,20 @@ export class PrivacyMeService {
     ctx: ReqCtx,
   ) {
     const data = { name: dto.name.trim(), relationship: dto.relationship?.trim() ?? '', email: dto.email?.trim() ?? '', phone: dto.phone?.trim() ?? '' };
-    await this.scopedPrisma.privacyNominee.upsert({
-      where: { organizationId_userId: { organizationId: actor.organizationId, userId: actor.id } },
-      create: { organizationId: actor.organizationId, userId: actor.id, ...data },
-      update: data,
+    // The tenant-scoped client refuses upsert (it takes a unique key, which cannot also carry the company), so this is a company-scoped
+    // update of the person's row, or a create when there is none; two saves at the same moment fall back to the update.
+    const { count } = await this.scopedPrisma.privacyNominee.updateMany({
+      where: { organizationId: actor.organizationId, userId: actor.id },
+      data,
     });
+    if (count === 0) {
+      try {
+        await this.scopedPrisma.privacyNominee.create({ data: { organizationId: actor.organizationId, userId: actor.id, ...data } });
+      } catch (err) {
+        if (!(err instanceof Prisma.PrismaClientKnownRequestError) || err.code !== 'P2002') throw err;
+        await this.scopedPrisma.privacyNominee.updateMany({ where: { organizationId: actor.organizationId, userId: actor.id }, data });
+      }
+    }
     await this.log(actor, ctx, 'NOMINEE_SAVED', 'CONSENT', { entity: 'PrivacyNominee', entityId: actor.id });
     return this.getNominee(actor);
   }

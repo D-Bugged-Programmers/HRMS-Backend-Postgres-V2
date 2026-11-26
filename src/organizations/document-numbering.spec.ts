@@ -4,6 +4,7 @@ import {
   previewDocumentNumber,
   formatDocumentNumber,
   issueDocumentNumber,
+  LETTER_DOC_TYPE,
   type DocumentNumberingEntry,
 } from './document-numbering';
 
@@ -143,6 +144,21 @@ describe('previewDocumentNumber', () => {
 });
 
 describe('issueDocumentNumber', () => {
+  it('numbers every letter from one shared REF/<year>/<counter> sequence, even for a company with its own per-type formats', async () => {
+    // A company that only has the old per-type entries (no "letter" entry) still gets the standard format, and two issues never repeat.
+    const stored: Record<string, unknown> = { offerLetter: { label: 'Offer', format: 'OL-{DD_MM_YYYY}-{00001}', resetRule: 'yearly', counter: 9, lastPeriodKey: '2026' } };
+    const tx = {
+      $queryRaw: jest.fn().mockImplementation(() => Promise.resolve([{ documentNumbering: stored }])),
+      organization: { update: jest.fn((args: { data: { documentNumbering: Record<string, unknown> } }) => { Object.assign(stored, args.data.documentNumbering); return Promise.resolve(undefined); }) },
+    };
+    const d = new Date(2026, 5, 1);
+    const first = await issueDocumentNumber(tx as never, 'org', LETTER_DOC_TYPE, d);
+    const second = await issueDocumentNumber(tx as never, 'org', LETTER_DOC_TYPE, d);
+    expect(first).toMatch(/^REF\/\d{4}\/00001$/);
+    expect(second).toMatch(/^REF\/\d{4}\/00002$/);
+    expect((stored.offerLetter as { counter: number }).counter).toBe(9);
+  });
+
   function fakeTx(documentNumbering: Record<string, unknown>) {
     const updateCalls: unknown[] = [];
     return {

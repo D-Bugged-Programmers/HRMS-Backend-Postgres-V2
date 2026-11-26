@@ -45,6 +45,7 @@ export const TENANT_SCOPED_MODELS = new Set([
   'StatutoryFiling',
   'CustomFieldDefinition',
   'PerformanceRating',
+  'SelfReview',
   'CompanyPerformance',
   'TdsChallan',
   'TdsStatement',

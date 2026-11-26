@@ -303,6 +303,7 @@ model Organization {
   statutoryFilings                 StatutoryFiling[]
   customFieldDefinitions           CustomFieldDefinition[]
   performanceRatings               PerformanceRating[]
+  selfReviews                      SelfReview[]
   companyPerformance               CompanyPerformance[]
   tdsChallans                      TdsChallan[]
   tdsStatements                    TdsStatement[]
@@ -634,6 +635,8 @@ model User {
   fieldVisitsCreated               FieldVisit[]                      @relation("FieldVisitCreator")
   overtimeRecordsApproved          OvertimeRecord[]                  @relation("OvertimeApprovedBy")
   performanceRatings               PerformanceRating[]               @relation("PerformanceRatingEmployee")
+  selfReviews                      SelfReview[]                      @relation("SelfReviewEmployee")
+  selfReviewsEvaluated             SelfReview[]                      @relation("SelfReviewEvaluator")
   performanceRatingsGiven          PerformanceRating[]               @relation("PerformanceRatingRatedBy")
   performanceRatingsApproved       PerformanceRating[]               @relation("PerformanceRatingApprovedBy")
   leaveEncashments                 LeaveEncashment[]                 @relation("LeaveEncashmentEmployee")
@@ -1244,6 +1247,10 @@ model LocationPing {
 }
 
 enum FieldVisitStatus {
+  // A visit an employee planned for themselves, waiting for Admin / HR / their manager to approve it; not confirmed (no check-in) until then.
+  PENDING_APPROVAL
+  // Turned down by the approver; keeps the reason.
+  REJECTED
   PLANNED
   CHECKED_IN
   COMPLETED
@@ -1275,6 +1282,11 @@ model FieldVisit {
   // YYYY-MM-DD in the company's time zone.
   scheduledFor String
   status       FieldVisitStatus @default(PLANNED)
+
+  // Who approved or rejected a self-planned visit, when, and the note (the reason when rejected).
+  reviewedById String?
+  reviewedAt   DateTime?
+  reviewNote   String    @default("")
 
   checkInAt             DateTime?
   checkInLatitude       Float?
@@ -2485,6 +2497,44 @@ model PerformanceRating {
   @@unique([organizationId, employeeId, financialYear])
   @@index([organizationId])
   @@map("performance_ratings")
+}
+
+// The employee's own year-end/appraisal reflection. One row per (employee, financialYear): a new financial year starts a
+// fresh review, so it "resets" every cycle by key, with no job. The employee can re-save while SUBMITTED; once the manager
+// evaluates it (REVIEWED) it is locked for that year.
+model SelfReview {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  employeeId String
+  employee   User   @relation("SelfReviewEmployee", fields: [employeeId], references: [id])
+  financialYear String
+
+  proud       String @default("")
+  grow        String @default("")
+  selfRating  Int
+  impact      String @default("")
+  support     String @default("")
+
+  status      SelfReviewStatus @default(SUBMITTED)
+  submittedAt DateTime         @default(now())
+
+  evaluatedById String?
+  evaluatedBy   User?     @relation("SelfReviewEvaluator", fields: [evaluatedById], references: [id])
+  evaluatedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, employeeId, financialYear])
+  @@index([organizationId, financialYear])
+  @@map("self_reviews")
+}
+
+enum SelfReviewStatus {
+  SUBMITTED
+  REVIEWED
 }
 
 enum PerformanceRatingStatus {

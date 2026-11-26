@@ -72,6 +72,7 @@ function build() {
     db as never,
     {} as never,
     { ensureSettings: async () => ({ deletionRules: {} }) } as never,
+    {} as never,
   );
   return { svc, calls };
 }

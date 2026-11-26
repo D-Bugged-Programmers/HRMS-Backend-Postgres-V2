@@ -34,7 +34,7 @@ import { AuditLogService } from '../audit-log/audit-log.service';
 import { readStoredFile, writeStoredFile } from '../files/file-storage.config';
 import { NotificationsService } from '../notifications/notifications.service';
 import { sanitizeRichText } from '../letter-templates/rich-text-sanitizer';
-import { issueDocumentNumber } from '../organizations/document-numbering';
+import { issueDocumentNumber, LETTER_DOC_TYPE } from '../organizations/document-numbering';
 import { formatDateDisplay } from '../payroll/format-date';
 import { amountInWords } from '../payroll/number-to-words';
 import { todayInOrgTz } from '../common/org-date';
@@ -126,26 +126,49 @@ const MONTHS = [
   'December',
 ];
 
+export const LETTER_HR_AUTHORISATION_REASON = 'HR authorization is needed for this letter — ask HR to make it available to you.';
+
+// Whether a visibility grant lets its holder have the letter. For a Manager's OWN non-payroll letter the grant must be a decision
+// someone else made in the app (every in-app switch records who made it, and only HR/Admin actions make one). The one-off
+// migration that made existing letters visible recorded nobody, so it is not HR authorisation for a manager to produce an
+// official letter about themselves. Pay and settlement letters, employees, and HR/Admin are as before.
+export function grantAllows(
+  grant: { enabled: boolean; enabledById?: string | null } | null | undefined,
+  actor: { id: string; role: Role },
+  employeeId: string,
+  dataProfile: LetterDataProfile,
+): boolean {
+  if (!grant?.enabled) return false;
+  const managerOwnLetter = actor.role === Role.MANAGER && actor.id === employeeId;
+  if (!managerOwnLetter || dataProfile === LetterDataProfile.PAYROLL || dataProfile === LetterDataProfile.SETTLEMENT) return true;
+  return !!grant.enabledById && grant.enabledById !== employeeId;
+}
+
 const PAID_OUT_STATUSES: PayrollRunStatus[] = [
   PayrollRunStatus.APPROVED,
   PayrollRunStatus.LOCKED,
   PayrollRunStatus.PAID,
 ];
 
-// Disciplinary/sensitive letter keys that must never be self-servable just
-// because the org's template for them is active — unlike every other
-// letter (Offer, NDA, ...), which stays visible/downloadable to the
-// employee by default. An employee only sees/downloads one of these once
-// HR/Admin explicitly grants it via EmployeeLetterAccess (see
-// setEmployeeAccess below) — presumably right after actually issuing one,
-// not as a standing self-service option. Only checked for actor.role ===
-// EMPLOYEE; HR/Admin/Manager acting on someone else's record always bypass
-// this (they're the ones who'd grant it in the first place).
+// Disciplinary/sensitive letter keys, flagged to HR/Admin/Manager as restricted. Every letter starts hidden from the person
+// it belongs to until HR/Admin grant it through EmployeeLetterAccess (see setEmployeeAccess below and ownerRulesApply).
 const RESTRICTED_LETTER_KEYS = new Set([
   'warningLetter',
   'suspensionLetter',
   'showCauseNotice',
 ]);
+export const LETTER_NOT_ISSUED_REASON = 'No letter of this kind has been issued to you.';
+
+// Letters that only mean something once one has really been issued: the disciplinary stage (including a company's own
+// templates placed there) and termination. An active template or a visibility grant alone is not such a letter.
+const isDisciplinaryLetter = (t: { key: string; isCustom: boolean; journeyStage?: string | null }) =>
+  RESTRICTED_LETTER_KEYS.has(t.key) || t.key === 'terminationLetter' || stageOfTemplate(t) === 'DISCIPLINARY';
+
+// Who gets a letter only once HR/Admin have made it visible to its owner: an Employee, and a Manager looking at their OWN
+// letters (a manager is the subject there, not the person who decides what is released). What a Manager may do with the
+// letters of the people they look after is unchanged, and so is HR/Admin access.
+const ownerRulesApply = (actor: { id: string; role: Role }, employeeId: string) =>
+  actor.role === Role.EMPLOYEE || (actor.role === Role.MANAGER && actor.id === employeeId);
 
 const EMPLOYEE_HISTORY_ACTIONS = ['LETTER_ISSUED', 'LETTER_EMAILED', 'LETTER_ACKNOWLEDGED', 'LETTER_APPROVED', 'LETTER_DECLINED'];
 // The letter's paragraphs as the HTML the editor works on: bold / italic / underline kept, everything else shown as plain text.
@@ -421,10 +444,10 @@ export class LettersService {
           .then(Boolean),
         this.scopedPrisma.employeeLetterAccess.findMany({
           where: { organizationId, employeeId },
-          select: { key: true, enabled: true },
+          select: { key: true, enabled: true, enabledById: true },
         }),
       ]);
-    const grantByKey = new Map(grants.map((g) => [g.key, g.enabled]));
+    const grantByKey = new Map(grants.map((g) => [g.key, g]));
 
     const UNLOCK_BY_PROFILE: Record<
       LetterDataProfile,
@@ -486,19 +509,18 @@ export class LettersService {
       // being un-hideable.
       // Every letter now starts hidden from the employee it belongs to: HR/Admin switch "Visible to employee" on once the
       // letter is ready (letters already visible when this rule began were granted by a one-off migration).
-      const accessEnabled = grantByKey.has(slotKey)
-        ? grantByKey.get(slotKey)!
-        : false;
-      // A plain EMPLOYEE also needs the (now-universal) grant, on top of
-      // the usual dataProfile unlock. HR/Admin/Manager are never subject
-      // to this — see the constant's own comment.
+      const grant = grantByKey.get(slotKey);
+      const accessEnabled = grant?.enabled ?? false;
+      // The owner also needs the grant, on top of the usual dataProfile unlock (see ownerRulesApply).
       const employeeGateBlocked =
-        actor.role === Role.EMPLOYEE && !accessEnabled;
+        ownerRulesApply(actor, employeeId) && !grantAllows(grant, actor, employeeId, t.dataProfile);
       const leavingBlocked = hiringLetterBlocked(t.key, employee);
       const eventBlocked = eventsMissing.has(t.key);
       const issuedOn = issuedOnByKey.get(slotKey) ?? null;
       const rec = savedIssues.find((r) => r.key === slotKey);
       const isLast = slotIndex === keys.length - 1;
+      // On anyone's own list (HR/Admin too), a disciplinary letter is never "available" unless one was issued to them.
+      const notIssued = actor.id === employeeId && isDisciplinaryLetter(t) && !issuedOn;
       const approvalStatus: 'APPROVED' | 'DECLINED' | 'SUPERSEDED' | 'AWAITING' | null = rec?.approvedAt
         ? 'APPROVED'
         : rec?.declinedAt
@@ -531,16 +553,19 @@ export class LettersService {
           gate.unlocked &&
           !employeeGateBlocked &&
           !leavingBlocked &&
-          !eventBlocked,
+          !eventBlocked &&
+          !notIssued,
         reason: leavingBlocked
           ? HIRING_LETTER_BLOCKED_REASON
           : eventBlocked
             ? EVENT_LETTER_REASON[t.key]
             : employeeGateBlocked
-              ? 'Not yet made available to you — contact HR.'
-              : gate.unlocked
-                ? null
-                : gate.reason,
+              ? actor.role === Role.MANAGER ? LETTER_HR_AUTHORISATION_REASON : 'Not yet made available to you — contact HR.'
+              : notIssued
+                ? LETTER_NOT_ISSUED_REASON
+                : gate.unlocked
+                  ? null
+                  : gate.reason,
         // Present for every key (not just restricted ones) so a
         // privileged caller's UI can render the "Visible to employee"
         // toggle everywhere, not only on the 3 disciplinary keys.
@@ -643,18 +668,19 @@ export class LettersService {
     ) {
       throw new BadRequestException(EVENT_LETTER_REASON[key]);
     }
-    if (actor.role === Role.EMPLOYEE) {
+    if (ownerRulesApply(actor, employeeId)) {
       const grant = await this.scopedPrisma.employeeLetterAccess.findFirst({
         where: { organizationId, employeeId, key: slot },
-        select: { enabled: true },
+        select: { enabled: true, enabledById: true },
       });
-      const accessEnabled = grant
-        ? grant.enabled
-        : false;
-      if (!accessEnabled) {
+      if (!grantAllows(grant, actor, employeeId, template.dataProfile)) {
         throw new ForbiddenException(
-          'This letter has not been made available to you yet — contact HR.',
+          actor.role === Role.MANAGER ? LETTER_HR_AUTHORISATION_REASON : 'This letter has not been made available to you yet — contact HR.',
         );
+      }
+      // Downloading must never create a disciplinary letter: only one already issued can be fetched.
+      if (isDisciplinaryLetter(template) && !issuedAt) {
+        throw new ForbiddenException(LETTER_NOT_ISSUED_REASON);
       }
     }
 
@@ -1114,15 +1140,21 @@ export class LettersService {
       throw new BadRequestException('Unknown stage.');
     }
     const items = (await this.listForEmployee(employeeId, actor, organizationId)).filter((l) => l.stage === stage && l.unlocked);
+    // Looked up only if needed: are these a Manager's letters? (See below.)
+    let isManager: boolean | undefined;
+    const managersLetters = async () =>
+      (isManager ??= (await this.scopedPrisma.user.findFirst({ where: { id: employeeId, organizationId }, select: { role: true } }))?.role === Role.MANAGER);
     let changed = 0;
     for (const l of items) {
       // An approved letter stays with the employee, so a stage switched off leaves it visible.
       if (!enabled && l.approvalStatus === 'APPROVED') continue;
       const before = await this.scopedPrisma.employeeLetterAccess.findFirst({
         where: { organizationId, employeeId, key: l.key },
-        select: { enabled: true },
+        select: { enabled: true, enabledById: true },
       });
-      if ((before?.enabled ?? false) === enabled) continue;
+      // Already in that state - except a manager's letter visible with nobody recorded (the one-off migration): switching it
+      // on here is HR's decision, so it is saved as theirs.
+      if ((before?.enabled ?? false) === enabled && !(enabled && before?.enabledById === null && (await managersLetters()))) continue;
       await this.writeAccess(employeeId, l.key, enabled, actor, organizationId, l.name, false);
       changed += 1;
     }
@@ -1441,7 +1473,7 @@ export class LettersService {
   // Who did what to one letter, newest first: issued, edited, date changed, emailed, switched on or off, confirmed.
   // An employee sees only the plain facts about their own switched-on letter (issued, emailed, confirmed read), not HR's edits.
   async history(employeeId: string, key: string, actor: Actor, organizationId: string) {
-    const asEmployee = actor.role === Role.EMPLOYEE;
+    const asEmployee = ownerRulesApply(actor, employeeId);
     if (asEmployee) {
       if (actor.id !== employeeId) throw new ForbiddenException('You can only see the history of your own letters.');
       const grant = await this.scopedPrisma.employeeLetterAccess.findFirst({ where: { organizationId, employeeId, key }, select: { enabled: true } });
@@ -1578,7 +1610,7 @@ export class LettersService {
     const documentNumber =
       issued?.documentNumber ??
       (await this.scopedPrisma.$transaction((tx) =>
-        issueDocumentNumber(tx, organizationId, baseKeyOf(key), issuedAt, employee.employeeId, employee.name),
+        issueDocumentNumber(tx, organizationId, LETTER_DOC_TYPE, issuedAt, employee.employeeId, employee.name),
       ));
     if (!issued) {
       await this.scopedPrisma.issuedLetter.createMany({

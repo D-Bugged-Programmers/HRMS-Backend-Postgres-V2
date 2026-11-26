@@ -19,11 +19,15 @@ import { PRISMA_CLIENT } from '../prisma/prisma.module';
 import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import { DocumentsService } from '../documents/documents.service';
 import { LettersService } from '../letters/letters.service';
+import { LeavesService } from '../leaves/leaves.service';
 import { detectIntents, periodLabel, searchPolicies, suggestionsFor, tokenize, toTsQuery, type AskIntent, type PolicyHit } from './ask-hr-logic';
+import { isNoticePeriodQuestion, namedDisciplinaryLetter, noticeAnswer, type NoticeFacts } from './notice-period';
+import { formatDateDisplay } from '../payroll/format-date';
 
 type Actor = Omit<User, 'password'>;
 const KEEP_QUERIES_DAYS = 90;
-const GENERIC_NAME_WORDS = new Set(['leave', 'letter', 'certificate', 'holiday', 'day', 'policy']);
+// "notice" and "period" are here because they are in letter names (Show-Cause Notice, Absconding Notice) without saying which is meant.
+const GENERIC_NAME_WORDS = new Set(['leave', 'letter', 'certificate', 'holiday', 'day', 'policy', 'notice', 'period']);
 
 type Line = { name: string; amount: number };
 
@@ -33,7 +37,9 @@ export type AskHrCard =
   | { kind: 'letters'; items: Array<{ name: string; available: boolean; reason: string | null }> }
   | { kind: 'onLeave'; date: string; items: Array<{ name: string; from: string; to: string }> }
   | { kind: 'payroll'; items: Array<{ period: string; gross: number; deductions: number; net: number; status: string }>; latest: { period: string; earnings: Line[]; deductions: Line[] } | null }
-  | { kind: 'policy'; hits: PolicyHit[]; unreadable: string[] };
+  | { kind: 'policy'; hits: PolicyHit[]; unreadable: string[] }
+  // A written answer from the person's records (the apps already show this kind). No sources = nothing was found.
+  | { kind: 'answer'; answer: string; sources: string[] };
 
 @Injectable()
 export class AskHrService {
@@ -45,12 +51,15 @@ export class AskHrService {
     private readonly lettersService: LettersService,
     private readonly prisma: PrismaService,
     private readonly privacyAudit: PrivacyAuditService,
+    private readonly leavesService: LeavesService,
   ) {}
 
   async ask(question: string, actor: Actor, organizationId: string): Promise<{ question: string; cards: AskHrCard[] }> {
     const q = question.trim();
     const today = await this.orgToday(organizationId);
-    const intents = detectIntents(q);
+    // A notice period question is answered from records. It never picks letters, leave types or holidays by a shared word.
+    const noticeQuestion = isNoticePeriodQuestion(q);
+    const intents = detectIntents(q).filter((i) => !(noticeQuestion && i === 'letters'));
     const cards: AskHrCard[] = [];
     // A module the company switched off is skipped, same as its own screens are hidden.
     const on = (m: string) => moduleEnabledFor(organizationId, m);
@@ -59,7 +68,7 @@ export class AskHrService {
     // ("casual"), a holiday name ("diwali") or a letter ("offer") - so a plain one-word search still finds it.
     const has = (i: AskIntent) => intents.includes(i);
     // Words that appear in almost every leave/letter/holiday name ("Casual Leave", "Offer Letter") say nothing about which one is meant.
-    const specific = terms.filter((t) => !GENERIC_NAME_WORDS.has(t));
+    const specific = noticeQuestion ? [] : terms.filter((t) => !GENERIC_NAME_WORDS.has(t));
     const hit = (names: string[]) => names.some((n) => specific.some((t) => n.toLowerCase().includes(t)));
     if (!has('balance') && (await on('module.leave'))) {
       const types = await this.scopedPrisma.leaveType.findMany({ where: { organizationId, isActive: true }, select: { name: true, code: true } });
@@ -74,17 +83,27 @@ export class AskHrService {
       if (hit(hs.map((h) => h.name))) intents.push('holiday');
     }
     let letterCard: AskHrCard | null = null;
-    if (await on('module.documents_letters')) {
-      if (has('letters')) letterCard = await this.lettersCard(actor, organizationId);
+    const named = namedDisciplinaryLetter(q);
+    let noSuchLetter: AskHrCard | null = null;
+    if (!noticeQuestion && (await on('module.documents_letters'))) {
+      if (named) {
+        // A named disciplinary letter: that one only, from the person's own list (which already applies their permissions).
+        const mine = (await this.lettersCard(actor, organizationId)) as Extract<AskHrCard, { kind: 'letters' }>;
+        const matched = mine.items.filter((l) => named.name.test(l.name));
+        if (matched.length) letterCard = { kind: 'letters', items: matched };
+        else noSuchLetter = { kind: 'answer', answer: `No ${named.label} letter is available to you in My Letters.`, sources: [] };
+      } else if (has('letters')) letterCard = await this.lettersCard(actor, organizationId);
       else {
         const all = (await this.lettersCard(actor, organizationId)) as Extract<AskHrCard, { kind: 'letters' }>;
         const matched = all.items.filter((l) => hit([l.name]));
         if (matched.length) letterCard = { kind: 'letters', items: matched };
       }
     }
+    if (noticeQuestion) cards.push(await this.noticeCard(q, actor, organizationId));
+    if (noSuchLetter) cards.push(noSuchLetter);
     // A pay question leads with the payslips, ahead of any letter whose name merely matches (e.g. "Salary Certificate").
     if (has('payroll') && (await on('module.payroll'))) cards.push(await this.payrollCard(actor, organizationId));
-    if (has('balance') && (await on('module.leave'))) cards.push(await this.balanceCard(actor, organizationId, today));
+    if (has('balance') && (await on('module.leave'))) cards.push(await this.balanceCard(actor, organizationId));
     if (has('holiday')) cards.push(await this.holidayCard(q, actor, organizationId, today));
     if (letterCard) cards.push(letterCard);
     if (intents.includes('onLeave')) {
@@ -94,11 +113,36 @@ export class AskHrService {
     const policy = await this.policyCard(q, actor, organizationId);
     if (policy.hits.length || !cards.length) cards.push(policy);
     // Remember the question and whether anything was found, so HR can see what is missing (see insights()).
-    const found = cards.some((c) => (c.kind === 'policy' ? c.hits.length > 0 : true));
+    const found = cards.some((c) => (c.kind === 'policy' ? c.hits.length > 0 : c.kind === 'answer' ? c.sources.length > 0 : true));
     void this.prisma.askHrQuery
       .create({ data: { organizationId, userId: actor.id, question: q.slice(0, 200), kinds: cards.map((c) => c.kind), answered: found } })
       .catch(() => undefined);
     return { question: q, cards };
+  }
+
+  /** The caller's own notice period, from their resignation if one is open, else the company default. Never anyone else's. */
+  private async noticeCard(question: string, actor: Actor, organizationId: string): Promise<AskHrCard> {
+    const [resignation, org] = await Promise.all([
+      this.scopedPrisma.resignation.findFirst({
+        where: { organizationId, employeeId: actor.id, status: { in: ['PENDING', 'APPROVED'] } },
+        orderBy: { submittedOn: 'desc' },
+        select: { status: true, noticePeriodDays: true, submittedOn: true },
+      }),
+      this.scopedPrisma.organization.findFirst({ where: { id: organizationId }, select: { policies: true } }),
+    ]);
+    const companyDefaultDays = Number((org?.policies as { defaultNoticeDays?: number } | null)?.defaultNoticeDays ?? 0) || 0;
+    return {
+      kind: 'answer',
+      ...noticeAnswer(
+        question,
+        {
+          resignation: resignation as NoticeFacts['resignation'],
+          companyDefaultDays,
+          onProbation: actor.employmentStatus === 'PROBATION' || actor.employmentStatus === 'EXTENDED_PROBATION',
+        },
+        (d) => formatDateDisplay(d, d),
+      ),
+    };
   }
 
   /** Today's date (YYYY-MM-DD) in the organization's own timezone, so "today" is right just after midnight in India too. */
@@ -117,18 +161,14 @@ export class AskHrService {
     return suggestionsFor({ leave, payroll, letters });
   }
 
-  private async balanceCard(actor: Actor, organizationId: string, today: string): Promise<AskHrCard> {
-    const year = Number(today.slice(0, 4));
-    const rows = await this.scopedPrisma.leaveBalance.findMany({
-      where: { organizationId, employeeId: actor.id, year },
-      include: { leaveType: { select: { name: true, isActive: true } } },
-    });
+  /** The caller's own balances, from the same calculation as the Leave screen (GET /leaves/balance): the company's leave year
+   *  (not the calendar year), with pending days held back and lapsed carried-in days left out. */
+  private async balanceCard(actor: Actor, organizationId: string): Promise<AskHrCard> {
+    const { balances, leaveYear } = await this.leavesService.getBalance(undefined, undefined, actor, organizationId);
     return {
       kind: 'balance',
-      year,
-      items: rows
-        .filter((r) => r.leaveType.isActive)
-        .map((r) => ({ leaveType: r.leaveType.name, available: round(r.closing - r.pending), used: round(r.availed), pending: round(r.pending) })),
+      year: leaveYear.year,
+      items: balances.map((r) => ({ leaveType: r.leaveType.name, available: round(r.available), used: round(r.availed), pending: round(r.pending) })),
     };
   }
 

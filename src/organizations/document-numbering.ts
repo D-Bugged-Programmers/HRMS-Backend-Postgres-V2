@@ -134,7 +134,16 @@ export function previewDocumentNumber(
   );
 }
 
+// Every letter and certificate is numbered from this ONE sequence, so each carries the same style of reference and no two share a
+// number (separate counters per letter type would repeat 00001 under the same format). A company can still change its format
+// by saving a documentNumbering.letter entry; without one, this default applies.
+export const LETTER_DOC_TYPE = 'letter';
+export const LETTER_NUMBER_FORMAT = 'REF/{YYYY}/{00001}';
+
 function defaultEntry(docType: string): DocumentNumberingEntry {
+  if (docType === LETTER_DOC_TYPE) {
+    return { label: 'Letters', format: LETTER_NUMBER_FORMAT, resetRule: 'yearly', counter: 0, lastPeriodKey: null };
+  }
   return {
     label: docType,
     format: `${docType.toUpperCase()}-{0001}`,

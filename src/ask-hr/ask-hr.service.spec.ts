@@ -14,6 +14,7 @@ function build() {
     leaveBalance: { findMany: jest.fn().mockResolvedValue([]) },
     leave: { findMany: jest.fn().mockResolvedValue([]) },
     payrollRun: { findMany: jest.fn().mockResolvedValue([]) },
+    resignation: { findFirst: jest.fn().mockResolvedValue(null) },
     policyDocument: { updateMany: jest.fn() },
   };
   const prisma: any = {
@@ -23,7 +24,8 @@ function build() {
   const docs: any = { findActivePoliciesRaw: jest.fn().mockResolvedValue([]) };
   const letters: any = { listForEmployee: jest.fn().mockResolvedValue([]) };
   const audit: any = { log: jest.fn().mockResolvedValue(undefined) };
-  return { svc: new AskHrService(db, docs, letters, prisma, audit), db, prisma, docs, audit };
+  const leaves: any = { getBalance: jest.fn().mockResolvedValue({ balances: [], leaveYear: { year: 2026 } }) };
+  return { svc: new AskHrService(db, docs, letters, prisma, audit, leaves), db, prisma, docs, audit, leaves };
 }
 
 describe('AskHrService', () => {
@@ -107,5 +109,18 @@ describe('AskHrService', () => {
     expect(r.cards.some((c) => c.kind === 'balance')).toBe(false);
     const r2 = await svc.ask('casual', actor('EMPLOYEE'), 'o1');
     expect(r2.cards.some((c) => c.kind === 'balance')).toBe(true);
+  });
+
+  it("takes leave balances from the Leave screen's own calculation, for the caller and the company's leave year", async () => {
+    const { svc, leaves, db } = build();
+    leaves.getBalance.mockResolvedValue({
+      leaveYear: { year: 2026 },
+      balances: [{ leaveType: { name: 'Earned Leave' }, available: 14.5, availed: 2.5, pending: 1 }],
+    });
+    const who = actor('HR');
+    const r = await svc.ask('how many leaves do I have left', who, 'o1');
+    expect(leaves.getBalance).toHaveBeenCalledWith(undefined, undefined, who, 'o1');
+    expect(db.leaveBalance.findMany).not.toHaveBeenCalled();
+    expect(r.cards.find((c) => c.kind === 'balance')).toEqual({ kind: 'balance', year: 2026, items: [{ leaveType: 'Earned Leave', available: 14.5, used: 2.5, pending: 1 }] });
   });
 });

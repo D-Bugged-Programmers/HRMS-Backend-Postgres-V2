@@ -272,6 +272,7 @@ describe('field tracking: company settings', () => {
       intervalSeconds: 300,
       minDistanceMeters: 200,
       retentionDays: 60,
+      maxVisitsPerDay: 0,
     });
   });
 
@@ -288,6 +289,7 @@ describe('field tracking: company settings', () => {
         intervalSeconds: 600,
         minDistanceMeters: 300,
         retentionDays: 90,
+        maxVisitsPerDay: 0,
       });
       expect(updates).toHaveLength(1);
       expect(audits[0]).toMatchObject({

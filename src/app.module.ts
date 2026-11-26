@@ -42,6 +42,7 @@ import { AttendanceModule } from './attendance/attendance.module';
 import { OvertimeModule } from './overtime/overtime.module';
 import { FieldTrackingModule } from './field-tracking/field-tracking.module';
 import { PerformanceRatingsModule } from './performance-ratings/performance-ratings.module';
+import { SelfReviewsModule } from './self-reviews/self-reviews.module';
 import { CompanyPerformanceModule } from './company-performance/company-performance.module';
 import { TdsComplianceModule } from './tds-compliance/tds-compliance.module';
 import { LeaveEncashmentsModule } from './leave-encashments/leave-encashments.module';
@@ -148,6 +149,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     OvertimeModule,
     FieldTrackingModule,
     PerformanceRatingsModule,
+    SelfReviewsModule,
     CompanyPerformanceModule,
     TdsComplianceModule,
     LeaveEncashmentsModule,
