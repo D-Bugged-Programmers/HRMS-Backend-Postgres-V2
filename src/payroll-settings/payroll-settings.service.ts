@@ -150,8 +150,25 @@ export class PayrollSettingsService {
       null,
       org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null,
     );
+    // The processing and payment days are set on the Payroll Calendar (Statutory Compliance); the version in force today wins over
+    // the older copy on this settings row, so a warning or a date shown here matches what HR saved there.
+    const calendarToday = new Date().toISOString().slice(0, 10);
+    const calendar = await this.scopedPrisma.statutoryConfigVersion.findFirst({
+      where: {
+        organizationId,
+        module: 'PAYROLL_CALENDAR',
+        effectiveFrom: { lte: calendarToday },
+        OR: [{ effectiveTo: null }, { effectiveTo: { gte: calendarToday } }],
+      },
+      orderBy: { effectiveFrom: 'desc' },
+      select: { config: true },
+    });
+    const cfg = (calendar?.config ?? {}) as { processingDay?: unknown; paymentDay?: unknown };
+    const processingDay = typeof cfg.processingDay === 'number' ? cfg.processingDay : settings.processingDay;
+    const paymentDay = typeof cfg.paymentDay === 'number' ? cfg.paymentDay : settings.paymentDay;
     return {
       settings,
+      calendarDays: { processingDay, paymentDay },
       // False when the Overtime Pay salary component is off. The settings screen locks the Overtime Rates then (they
       // feed only that component), and update() below ignores edits to them.
       overtimePayEnabled: await isOvertimePayEnabled(
@@ -160,13 +177,13 @@ export class PayrollSettingsService {
       ),
       resolvedForCurrentMonth: {
         processingDate: resolveDayOfMonth(
-          settings.processingDay,
+          processingDay,
           year,
           month,
           weeklyOffs,
         ),
         paymentDate: resolveDayOfMonth(
-          settings.paymentDay,
+          paymentDay,
           year,
           month,
           weeklyOffs,

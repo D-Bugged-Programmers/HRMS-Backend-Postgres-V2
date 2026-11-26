@@ -57,13 +57,13 @@ export class OrgHealthService {
     ]);
     const setup = buildSetupStatus({ workLocations, workSchedules, departments, designations, leaveTypes, holidaysThisYear, salaryComponents, documentRequirements, employees });
 
-    const { settings, resolvedForCurrentMonth } = await this.payrollSettings.getWithResolvedDates(organizationId);
+    const { settings, resolvedForCurrentMonth, calendarDays } = await this.payrollSettings.getWithResolvedDates(organizationId);
     const { weeklyOffs } = resolveShiftConfig(null, org?.attendancePayrollPrefs as OrganizationAttendancePrefs | null);
     const warnings = findSettingsClashes({
       processingDate: resolvedForCurrentMonth.processingDate,
       paymentDate: resolvedForCurrentMonth.paymentDate,
-      processingFixed: settings.processingDay !== 0,
-      paymentFixed: settings.paymentDay !== 0,
+      processingFixed: (calendarDays ?? settings).processingDay !== 0,
+      paymentFixed: (calendarDays ?? settings).paymentDay !== 0,
       weeklyOffs,
       pfEnabled: settings.pfEnabled,
       esiEnabled: settings.esiEnabled,

@@ -71,6 +71,7 @@ function build(
       count: async () => (opts.overtimePayOn === false ? 0 : 1),
     },
     statutoryConfigVersion: {
+      findFirst: async () => null,
       updateMany: async (a: Row) => {
         versionUpdates.push(a);
         return { count: 1 };

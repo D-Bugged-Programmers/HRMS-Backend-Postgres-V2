@@ -1,8 +1,8 @@
-// Purpose: which days an attendance import may not change. What is already marked stays: an import only fills in days
-//   nobody has marked.
+// Purpose: which days an attendance import may not change: leave and regularized days stay. Everything else takes the
+//   file's times, including days with biometric or mobile punches (the sheet is the record the admin chose to apply).
 // Responsibilities: says why a row is skipped (shown to whoever ran the import), and recognises a half-day leave's stamp.
-// Important: pure. Open to an import: no row, a day the system filled in by itself (Absent, Weekly Off, Holiday, Always
-//   present) and a day an earlier import wrote (a corrected file may fix it). A half day of leave is not skipped: its status
+// Important: pure. Open to an import: no row, a punched day (biometric / mobile), a day the system filled in by itself
+//   (Absent, Weekly Off, Holiday, Always present) and a day an earlier import wrote (a corrected file may fix it). A half day of leave is not skipped: its status
 //   stays, and the times worked in the other half are kept under it (see the caller).
 import { AttendanceSource, AttendanceStatus } from '@prisma/client';
 
@@ -32,16 +32,5 @@ export function importSkipReason(
     return 'Already regularized';
   }
   if (regularization === 'pending') return 'A regularization request is waiting';
-  if (existing.source === AttendanceSource.FACE_API && existing.inTime) {
-    return 'Already has a punch';
-  }
-  // A real punch a half-day leave was stamped over.
-  if (
-    isHalfLeaveStamp(existing) &&
-    existing.leaveOverriddenSource === AttendanceSource.FACE_API &&
-    existing.inTime
-  ) {
-    return 'Already has a punch';
-  }
   return null;
 }

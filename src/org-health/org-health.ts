@@ -85,7 +85,7 @@ export function findSettingsClashes(f: SettingsFacts): SettingsClash[] {
       key: 'pay-before-processing',
       title: 'Salary is paid before payroll is processed',
       detail: `Salary is paid on ${dmyText(f.paymentDate)}, but payroll is processed on ${dmyText(f.processingDate)}. Move the payment day after the processing day.`,
-      link: '/payroll-settings',
+      link: '/statutory-compliance?tab=payroll_calendar',
     });
   }
   if (f.paymentDate === f.processingDate) {
@@ -93,7 +93,7 @@ export function findSettingsClashes(f: SettingsFacts): SettingsClash[] {
       key: 'pay-same-as-processing',
       title: 'Salary is paid on the same day payroll is processed',
       detail: `Payroll is processed and salary is paid on ${dmyText(f.paymentDate)}, so there is no time between approving payroll and paying (for example sending the bank file). Move the payment day later.`,
-      link: '/statutory-compliance',
+      link: '/statutory-compliance?tab=payroll_calendar',
     });
   }
   if (f.processingFixed && isWeeklyOff(f.processingDate, f.weeklyOffs)) {
@@ -101,7 +101,7 @@ export function findSettingsClashes(f: SettingsFacts): SettingsClash[] {
       key: 'processing-on-weekly-off',
       title: 'Payroll processing day falls on a weekly off',
       detail: `Payroll is processed on ${dmyText(f.processingDate)}, which is a weekly off in the work schedule. Pick a working day, or use "last working day".`,
-      link: '/payroll-settings',
+      link: '/statutory-compliance?tab=payroll_calendar',
     });
   }
   if (f.paymentFixed && isWeeklyOff(f.paymentDate, f.weeklyOffs)) {
@@ -109,7 +109,7 @@ export function findSettingsClashes(f: SettingsFacts): SettingsClash[] {
       key: 'payment-on-weekly-off',
       title: 'Salary payment day falls on a weekly off',
       detail: `Salary is paid on ${dmyText(f.paymentDate)}, which is a weekly off in the work schedule. Pick a working day, or use "last working day".`,
-      link: '/payroll-settings',
+      link: '/statutory-compliance?tab=payroll_calendar',
     });
   }
   if (f.pfEnabled && blank(f.epfoEstablishmentCode)) {

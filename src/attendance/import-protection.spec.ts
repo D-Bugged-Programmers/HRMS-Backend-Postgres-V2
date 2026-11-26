@@ -22,20 +22,20 @@ describe('importSkipReason', () => {
     expect(importSkipReason(day({ status: St.PRESENT, source: Src.EXCEL_IMPORT, inTime: at }), null)).toBeNull();
   });
 
-  it('keeps leave, LWP included, regularizations and punches', () => {
+  it('keeps leave, LWP included, and regularizations; punched days take the file', () => {
     expect(importSkipReason(day({ status: St.ON_LEAVE }), null)).toBe('On approved leave');
     expect(importSkipReason(null, { isHalfDay: false })).toBe('On approved leave');
     expect(importSkipReason(day({ source: Src.REGULARIZED }), null)).toBe('Already regularized');
     expect(importSkipReason(day({ regularization: { status: 'pending' } }), null)).toBe('A regularization request is waiting');
     expect(importSkipReason(day({ regularization: { status: 'rejected' } }), null)).toBeNull();
-    expect(importSkipReason(day({ status: St.PRESENT, source: Src.FACE_API, inTime: at }), null)).toBe('Already has a punch');
+    expect(importSkipReason(day({ status: St.PRESENT, source: Src.FACE_API, inTime: at }), null)).toBeNull();
   });
 
-  it('a half day of leave is not skipped, unless a real punch lies under it', () => {
+  it('a half day of leave is not skipped, even with a real punch under it', () => {
     const stamp = day({ status: St.HALF_DAY });
     expect(isHalfLeaveStamp(stamp)).toBe(true);
     expect(importSkipReason(stamp, { isHalfDay: true })).toBeNull();
-    expect(importSkipReason({ ...stamp, inTime: at, leaveOverriddenSource: Src.FACE_API }, { isHalfDay: true })).toBe('Already has a punch');
+    expect(importSkipReason({ ...stamp, inTime: at, leaveOverriddenSource: Src.FACE_API }, { isHalfDay: true })).toBeNull();
     // A short day that was worked is not a stamp.
     expect(isHalfLeaveStamp(day({ status: St.HALF_DAY, source: Src.FACE_API }))).toBe(false);
   });
