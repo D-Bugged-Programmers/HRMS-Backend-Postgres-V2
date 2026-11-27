@@ -127,6 +127,14 @@ export const EVENT_META: Record<string, TimelineEventMeta> = {
     category: 'ATTENDANCE_LEAVE',
     title: 'Work From Home Rejected',
   },
+  WFH_EXPIRED: {
+    category: 'ATTENDANCE_LEAVE',
+    title: 'Work From Home Request Expired',
+  },
+  WFH_ESCALATED: {
+    category: 'ATTENDANCE_LEAVE',
+    title: 'Work From Home Request Escalated',
+  },
   WFH_WITHDRAWN: {
     category: 'ATTENDANCE_LEAVE',
     title: 'Work From Home Withdrawn',

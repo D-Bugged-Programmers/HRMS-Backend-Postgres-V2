@@ -75,6 +75,7 @@ export const FIELD_KINDS: Record<string, FieldKind> = {
   enableWFH: 'boolean',
   wfhAutoApproveIfNoAction: 'boolean',
   wfhAutoApproveHours: 'number',
+  wfhOverdueAction: 'requiredString',
   regularizationAutoApproveIfNoAction: 'boolean',
   regularizationAutoApproveHours: 'number',
   regularizationWindowDays: 'number',
@@ -747,6 +748,9 @@ export function validateSectionData(data: Record<string, unknown>) {
     );
   }
 
+  if (data.wfhOverdueAction !== undefined && !['NONE', 'ESCALATE', 'EXPIRE'].includes(String(data.wfhOverdueAction))) {
+    bad('wfhOverdueAction must be NONE, ESCALATE or EXPIRE.');
+  }
   for (const field of [
     'wfhAutoApproveHours',
     'regularizationAutoApproveHours',

@@ -27,7 +27,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { featureEnabledFor } from '../module-access/module-gate';
-import { inReviewerScope, reviewerScope } from '../common/dept-scope';
+import { inReviewerScope, lookedAfterScope } from '../common/dept-scope';
 import { dateStrInOrgTz, dayRangeInOrgTz } from '../common/org-date';
 import {
   FieldTrackingService,
@@ -269,7 +269,8 @@ export class FieldVisitsService {
     actor: Actor,
   ): Promise<{ employeeId?: { in: string[] } }> {
     if (actor.role === Role.EMPLOYEE) return { employeeId: { in: [actor.id] } };
-    const scope = await reviewerScope(
+    // The team's visits: the people the caller looks after, not their own (those are under Mine).
+    const scope = await lookedAfterScope(
       this.db,
       actor as never,
       actor.organizationId,

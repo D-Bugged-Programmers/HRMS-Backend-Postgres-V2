@@ -166,8 +166,9 @@ export class MyRequestsService {
       ds.sort((a, b) => a.date.localeCompare(b.date));
       const approved = ds.filter((d) => d.workArrangementStatus === WfhApprovalStatus.APPROVED).length;
       const rejected = ds.filter((d) => d.workArrangementStatus === WfhApprovalStatus.REJECTED).length;
-      const pending = ds.length - approved - rejected;
-      const status = pending > 0 ? 'PENDING' : rejected === 0 ? 'APPROVED' : approved === 0 ? 'REJECTED' : 'APPROVED';
+      const expired = ds.filter((d) => d.workArrangementStatus === WfhApprovalStatus.EXPIRED).length;
+      const pending = ds.length - approved - rejected - expired;
+      const status = pending > 0 ? 'PENDING' : approved > 0 ? 'APPROVED' : rejected > 0 ? 'REJECTED' : 'EXPIRED';
       const decidedRow = ds.find((d) => d.workArrangementReviewedAt);
       const note = ds.find((d) => d.workArrangementReviewComments)?.workArrangementReviewComments ?? '';
       await add({

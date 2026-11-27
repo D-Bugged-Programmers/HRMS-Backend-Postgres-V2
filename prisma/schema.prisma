@@ -115,6 +115,9 @@ model Organization {
   // for an org until HR/Admin explicitly turns it on and sets the window.
   wfhAutoApproveIfNoAction            Boolean @default(false)
   wfhAutoApproveHours                 Int     @default(24)
+  // What happens to a Work From Home request still undecided once its date has passed: NONE (default, nothing), ESCALATE (HR / Admin
+  // are told once; it stays pending) or EXPIRE (it becomes EXPIRED). Never approves or rejects.
+  wfhOverdueAction                    String  @default("NONE")
   regularizationAutoApproveIfNoAction Boolean @default(false)
   regularizationAutoApproveHours      Int     @default(24)
   // How many days back an employee may ask to regularize a day (1-31). Was a fixed 7.
@@ -2207,6 +2210,9 @@ enum WfhApprovalStatus {
   PENDING
   APPROVED
   REJECTED
+  // Still undecided after its date passed, and the company's overdue rule (Organization.wfhOverdueAction) is EXPIRE. Final: it is
+  // not a WFH day, and no longer counts as waiting for approval.
+  EXPIRED
 }
 
 enum AttendanceSource {
@@ -2304,6 +2310,8 @@ model Attendance {
   workArrangementReviewedById   String?
   workArrangementReviewedAt     DateTime?
   workArrangementReviewComments String?
+  // When a request undecided past its date was escalated (the ESCALATE rule); set once, the request stays PENDING.
+  workArrangementEscalatedAt    DateTime?
   // The employee's own reason for a Work From Home request (workArrangementReviewComments is the reviewer's comment).
   // Every day of a multi-day request carries the same text; cleared when the request is withdrawn.
   workArrangementReason         String?

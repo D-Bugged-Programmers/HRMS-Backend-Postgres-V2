@@ -587,7 +587,7 @@ export class LeaveTrackerService {
               workArrangement: WorkArrangement.WFH,
               // Only approved WFH counts as used; a request still waiting is reported as pending below.
               workArrangementStatus: {
-                notIn: [WfhApprovalStatus.PENDING, WfhApprovalStatus.REJECTED],
+                notIn: [WfhApprovalStatus.PENDING, WfhApprovalStatus.REJECTED, WfhApprovalStatus.EXPIRED],
               },
             },
             _count: { _all: true },
@@ -833,7 +833,7 @@ export class LeaveTrackerService {
               date: { gte: joinedOn(e), lte: wfhTo },
               workArrangement: WorkArrangement.WFH,
               workArrangementStatus: {
-                notIn: [WfhApprovalStatus.PENDING, WfhApprovalStatus.REJECTED],
+                notIn: [WfhApprovalStatus.PENDING, WfhApprovalStatus.REJECTED, WfhApprovalStatus.EXPIRED],
               },
             },
           });

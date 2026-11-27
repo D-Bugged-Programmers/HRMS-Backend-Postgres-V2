@@ -1336,6 +1336,11 @@ export class DashboardService {
         // Set once the reporting manager has signed off level 1 of a two-level leave type; the request then waits
         // for HR/Admin's final decision, so the list can say so instead of offering the manager Approve again.
         levelOneApprovedAt: l.level1ApprovedAt,
+        // What the reviewer needs to see the employee's balance for this leave type (GET /leaves/balance?employeeId=): the person's
+        // user id, the leave type and the days asked for (employeeId above is the employee code).
+        employeeUserId: l.employeeId,
+        leaveTypeId: l.leaveTypeId,
+        totalDays: l.totalDays,
         // The employee's remarks on the leave (a cancellation shows its own reason instead).
         reason: l.status === LeaveStatus.APPROVED ? null : l.remarks?.trim() || null,
         // The supporting document the employee attached, as a signed short-lived link, so the approver can open it.

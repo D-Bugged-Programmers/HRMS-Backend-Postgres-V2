@@ -47,6 +47,18 @@ export async function reviewerScope(
   return [...ids];
 }
 
+// The people a reviewer LOOKS AFTER: reviewerScope without themself (a manager's own id is in their scope so they can open their own
+// pages, but they are not one of their own reportees). Unscoped (Admin, HR who heads no department) stays null = everyone, as
+// before. Use this for team lists and pickers; keep reviewerScope for access checks where self-access is intended.
+export async function lookedAfterScope(
+  prisma: ExtendedPrismaClient,
+  actor: { id?: string; role: Role },
+  organizationId: string,
+): Promise<string[] | null> {
+  const scope = await reviewerScope(prisma, actor, organizationId);
+  return scope ? scope.filter((id) => id !== actor.id) : scope;
+}
+
 // Employee ids a scoped reviewer's list/query endpoints must be constrained to (see reviewerScope). Kept for the callers
 // that only ever pass a MANAGER, who is always scoped; an unscoped actor gets an empty list rather than everyone.
 export async function deptScopedEmployeeIds(

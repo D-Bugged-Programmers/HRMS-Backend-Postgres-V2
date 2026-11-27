@@ -12,6 +12,7 @@ export function showsAsWfh(row: {
   return (
     row.status === AttendanceStatus.PRESENT &&
     row.workArrangement === WorkArrangement.WFH &&
-    row.workArrangementStatus !== WfhApprovalStatus.REJECTED
+    row.workArrangementStatus !== WfhApprovalStatus.REJECTED &&
+    row.workArrangementStatus !== WfhApprovalStatus.EXPIRED
   );
 }

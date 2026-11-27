@@ -17,6 +17,7 @@ import { Cron } from '@nestjs/schedule';
 import {
   FieldVisitStatus,
   NotificationCategory,
+  Prisma,
   Role,
   type User,
 } from '@prisma/client';
@@ -27,7 +28,7 @@ import { AuditLogService } from '../audit-log/audit-log.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { EmployeeTimelineService } from '../employee-timeline/employee-timeline.service';
 import { featureEnabledFor } from '../module-access/module-gate';
-import { inReviewerScope, reviewerScope } from '../common/dept-scope';
+import { inReviewerScope, lookedAfterScope } from '../common/dept-scope';
 import { dateStrInOrgTz, dayRangeInOrgTz } from '../common/org-date';
 import {
   cleanPing,
@@ -42,6 +43,8 @@ import {
 } from './field-tracking-logic';
 
 export const FIELD_TRACKING_FLAG = 'feature.field_tracking';
+// How many of the newest location points the live view keeps for each person (the trail it works the status and position out of).
+const LIVE_TRAIL_POINTS = 2;
 
 type Actor = Pick<User, 'id' | 'role' | 'organizationId' | 'name'> &
   Partial<User>;
@@ -411,7 +414,8 @@ export class FieldTrackingService {
   // The live view for the people the caller looks after (Admin: everyone tracked).
   async live(actor: Actor, recordView = true) {
     await this.assertOn(actor.organizationId);
-    const scope = await reviewerScope(
+    // The people the caller looks after: never the caller themself (their own position is in My Route).
+    const scope = await lookedAfterScope(
       this.db,
       actor as never,
       actor.organizationId,
@@ -449,16 +453,33 @@ export class FieldTrackingService {
             orderBy: [{ employeeId: 'asc' }, { recordedAt: 'desc' }],
             distinct: ['employeeId'],
           }),
-          this.db.locationPing.findMany({
-            where: {
-              organizationId: actor.organizationId,
-              employeeId: { in: ids },
-              kind: 'POINT',
-              recordedAt: { gte: since },
-            },
-            orderBy: { recordedAt: 'desc' },
-            take: ids.length * 3,
-          }),
+          // The newest LIVE_TRAIL_POINTS points of EACH person, in one query: ranked newest-first within each employee, so someone who
+          // reports often cannot use up the points of anyone else (a single limit over everyone's points did). Uses the
+          // (organizationId, employeeId, recordedAt) index; points are the ones within the tracking window only.
+          this.db.$queryRaw<
+            {
+              employeeId: string;
+              recordedAt: Date;
+              latitude: number | null;
+              longitude: number | null;
+              accuracyMeters: number | null;
+              speedMps: number | null;
+              isMock: boolean;
+              kind: string;
+            }[]
+          >(Prisma.sql`
+            SELECT "employeeId", "recordedAt", "latitude", "longitude", "accuracyMeters", "speedMps", "isMock", "kind"
+            FROM (
+              SELECT "employeeId", "recordedAt", "latitude", "longitude", "accuracyMeters", "speedMps", "isMock", "kind",
+                     row_number() OVER (PARTITION BY "employeeId" ORDER BY "recordedAt" DESC) AS rn
+              FROM "location_pings"
+              WHERE "organizationId" = ${actor.organizationId}
+                AND "employeeId" = ANY(${ids})
+                AND "kind" = 'POINT'
+                AND "recordedAt" >= ${since}
+            ) ranked
+            WHERE rn <= ${LIVE_TRAIL_POINTS}
+            ORDER BY "employeeId", "recordedAt" DESC`),
           this.db.attendance.findMany({
             where: {
               organizationId: actor.organizationId,
@@ -475,7 +496,7 @@ export class FieldTrackingService {
     const pointsBy = new Map<string, typeof recentPoints>();
     for (const p of recentPoints) {
       const l = pointsBy.get(p.employeeId) ?? [];
-      if (l.length < 2) l.push(p);
+      if (l.length < LIVE_TRAIL_POINTS) l.push(p);
       pointsBy.set(p.employeeId, l);
     }
     const employees = tracked.map((t) => {
@@ -542,7 +563,8 @@ export class FieldTrackingService {
     const view = await this.live(actor, false);
     const count = (st: string) =>
       view.employees.filter((e) => e.status === st).length;
-    const scope = await reviewerScope(
+    // The people the caller looks after: never the caller themself (their own position is in My Route).
+    const scope = await lookedAfterScope(
       this.db,
       actor as never,
       actor.organizationId,

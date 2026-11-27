@@ -6068,6 +6068,122 @@ export class AttendanceService {
   // (Organization settings > Attendance reminders). A second fixed 15-minute 'Punch-Out Reminder' used to live here and sent
   // the same employee two notifications for the same moment, so it was removed.
 
+  // A Work From Home request still undecided once its date has passed. What happens is the company's choice
+  // (Organization.wfhOverdueAction, Organization Settings > Work Arrangement): NONE (the default - nothing, as before), ESCALATE
+  // (HR / Admin are told once; the request stays pending for them) or EXPIRE (it becomes EXPIRED, a final state that is not a WFH
+  // day). It never approves or rejects. "Past" is the request's own date against today in the company's time zone. Hourly and
+  // safe to repeat: each change is a compare-and-swap on PENDING (and, for escalation, on not yet escalated), so a request is
+  // changed, recorded and notified once, and a reviewer acting at the same moment always wins.
+  @Cron('10 * * * *')
+  async handleOverdueWorkArrangements() {
+    const all = await this.scopedPrisma.organization.findMany({
+      where: { isActive: true, wfhOverdueAction: { in: ['ESCALATE', 'EXPIRE'] } },
+      select: { id: true, timezone: true, wfhOverdueAction: true },
+    });
+    const organizations = await keepModuleEnabled(all, 'module.attendance');
+    for (const org of organizations) {
+      try {
+        await this.processOverdueWfhForOrg(org.id, org.timezone ?? 'Asia/Kolkata', org.wfhOverdueAction as 'ESCALATE' | 'EXPIRE');
+      } catch (err) {
+        this.logger.error(`handleOverdueWorkArrangements failed for org ${org.id}`, err instanceof Error ? err.stack : String(err));
+      }
+    }
+  }
+
+  async processOverdueWfhForOrg(organizationId: string, timezone: string, action: 'ESCALATE' | 'EXPIRE', now: Date = new Date()): Promise<{ changed: number }> {
+    const today = todayInOrgTz(timezone, now);
+    const rows = await this.scopedPrisma.attendance.findMany({
+      where: {
+        organizationId,
+        workArrangement: WorkArrangement.WFH,
+        workArrangementStatus: WfhApprovalStatus.PENDING,
+        date: { lt: today },
+        ...(action === 'ESCALATE' ? { workArrangementEscalatedAt: null } : {}),
+      },
+      include: { employee: true },
+      orderBy: { date: 'asc' },
+      take: 500,
+    });
+    if (rows.length === 0) return { changed: 0 };
+    const { dateFormat, timeZone } = await resolveOrgDateTimeFormat(this.scopedPrisma, organizationId);
+    // The audit log needs a user as its actor, and a sweep has none: the organisation's oldest active Admin stands in, and every
+    // entry is marked details.source = 'SCHEDULED' so it is never mistaken for something they did.
+    const systemActor = await this.scopedPrisma.user.findFirst({
+      where: { organizationId, isActive: true, role: Role.ADMIN },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+    let changed = 0;
+    for (const row of rows) {
+      try {
+        const dateText = formatDateDisplay(row.date, '', dateFormat, timeZone);
+        const { count } = await this.scopedPrisma.attendance.updateMany({
+          where: {
+            id: row.id,
+            organizationId,
+            workArrangementStatus: WfhApprovalStatus.PENDING,
+            ...(action === 'ESCALATE' ? { workArrangementEscalatedAt: null } : {}),
+          },
+          data:
+            action === 'EXPIRE'
+              ? {
+                  workArrangementStatus: WfhApprovalStatus.EXPIRED,
+                  workArrangementReviewedById: null,
+                  workArrangementReviewedAt: now,
+                  workArrangementReviewComments: 'Expired: no one decided this request before its date passed.',
+                }
+              : { workArrangementEscalatedAt: now },
+        });
+        if (count === 0) continue;
+        changed += 1;
+        await this.timelineService.logEvent({
+          organizationId,
+          employeeId: row.employeeId,
+          eventKey: action === 'EXPIRE' ? 'WFH_EXPIRED' : 'WFH_ESCALATED',
+          performedById: null,
+          description:
+            action === 'EXPIRE'
+              ? `Work From Home request for ${dateText} expired: still undecided after its date passed.`
+              : `Work From Home request for ${dateText} escalated: still undecided after its date passed.`,
+        });
+        if (systemActor) {
+          await this.auditLogService.log({
+            actorId: systemActor.id,
+            action: action === 'EXPIRE' ? 'WFH_REQUEST_EXPIRED' : 'WFH_REQUEST_ESCALATED',
+            module: 'ATTENDANCE',
+            organizationId,
+            targetId: row.id,
+            details: { source: 'SCHEDULED', employeeId: row.employeeId, date: row.date },
+          });
+        }
+        if (action === 'EXPIRE') {
+          await this.notificationsService.create({
+            organizationId,
+            userId: row.employeeId,
+            title: 'Work From Home Request Expired',
+            message: `Your Work From Home request for ${dateText} expired: no one decided it before the date passed.`,
+            category: NotificationCategory.ATTENDANCE,
+          });
+        } else {
+          // Higher up than the manager who has not acted: HR (assigned to this person) or Admin.
+          const to = await this.notificationsService.reviewersFor(organizationId, row.employee, false);
+          await this.notificationsService.createMany(
+            to.map((userId) => ({
+              organizationId,
+              userId,
+              title: 'Overdue Work From Home request',
+              message: `${row.employee.name}'s Work From Home request for ${dateText} is still undecided and its date has passed.`,
+              category: NotificationCategory.ATTENDANCE,
+            })),
+          );
+        }
+      } catch (err) {
+        this.logger.error(`Overdue WFH handling failed for attendance ${row.id}`, err instanceof Error ? err.stack : String(err));
+      }
+    }
+    return { changed };
+  }
+
   // Same "auto-approve after N hours with no reviewer action" idea
   // LeavesService.autoApprovePendingLeaves already gives HR per leave type
   // (LeaveType.autoApproveIfNoAction/autoApproveHours) — WFH and

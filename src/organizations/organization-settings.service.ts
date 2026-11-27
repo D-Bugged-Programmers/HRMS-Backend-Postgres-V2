@@ -173,6 +173,7 @@ const SECTION_FIELDS: Record<string, string[]> = {
     'enableWFH',
     'wfhAutoApproveIfNoAction',
     'wfhAutoApproveHours',
+    'wfhOverdueAction',
     'regularizationAutoApproveIfNoAction',
     'regularizationAutoApproveHours',
     'regularizationWindowDays',
@@ -337,6 +338,7 @@ export class OrganizationSettingsService {
     return {
       wfhAutoApproveIfNoAction: org.wfhAutoApproveIfNoAction,
       wfhAutoApproveHours: org.wfhAutoApproveHours,
+      wfhOverdueAction: org.wfhOverdueAction,
       regularizationAutoApproveIfNoAction:
         org.regularizationAutoApproveIfNoAction,
       regularizationAutoApproveHours: org.regularizationAutoApproveHours,
@@ -354,6 +356,7 @@ export class OrganizationSettingsService {
     const allowedFields = [
       'wfhAutoApproveIfNoAction',
       'wfhAutoApproveHours',
+      'wfhOverdueAction',
       'regularizationAutoApproveIfNoAction',
       'regularizationAutoApproveHours',
       'regularizationWindowDays',
