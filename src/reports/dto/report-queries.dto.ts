@@ -162,3 +162,11 @@ export class HeadcountReportQueryDto extends FormatQueryDto {
   @Max(120)
   months?: number;
 }
+
+// Reports > Salary structures: every active employee's structure as on a date (today when blank).
+export class SalaryStructuresReportQueryDto extends FormatQueryDto {
+  @ApiPropertyOptional({ example: '2026-11-27' })
+  @IsOptional()
+  @IsValidCalendarDateString()
+  asOf?: string;
+}

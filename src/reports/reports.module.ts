@@ -20,6 +20,7 @@ import { PrivacyModule } from '../privacy/privacy.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { AuditLogModule } from '../audit-log/audit-log.module';
 import { FieldTrackingModule } from '../field-tracking/field-tracking.module';
+import { EmployeeSalaryComponentsModule } from '../employee-salary-components/employee-salary-components.module';
 
 @Module({
   imports: [
@@ -29,6 +30,8 @@ import { FieldTrackingModule } from '../field-tracking/field-tracking.module';
     AuditLogModule,
     FieldTrackingModule,
     CompanyBrandsModule,
+    // Reports > Salary structures reuses the structure figures the printed Salary Structure shows.
+    EmployeeSalaryComponentsModule,
   ],
   controllers: [
     StatutoryFilingsController,

@@ -30,6 +30,7 @@ import { StatutoryConfigModule } from '../statutory-config/statutory-config.modu
   providers: [EmployeeSalaryComponentsService, SalaryStructurePdfService],
   // Exported so LeaveEncashmentsModule can inject it for
   // getCurrentMonthlyValue (the "current BASIC" rate calculation).
-  exports: [EmployeeSalaryComponentsService],
+  // SalaryStructurePdfService: Reports > Salary structures.
+  exports: [EmployeeSalaryComponentsService, SalaryStructurePdfService],
 })
 export class EmployeeSalaryComponentsModule {}

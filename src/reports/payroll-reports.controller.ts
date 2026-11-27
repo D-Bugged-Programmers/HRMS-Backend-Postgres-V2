@@ -23,7 +23,9 @@ import type { ExtendedPrismaClient } from '../prisma/prisma.module';
 import {
   PayrollAuditReportQueryDto,
   PayrollReportQueryDto,
+  SalaryStructuresReportQueryDto,
 } from './dto/report-queries.dto';
+import { SalaryStructurePdfService } from '../employee-salary-components/salary-structure-pdf.service';
 import { Form16ReportQueryDto } from './dto/form16-report-query.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -57,7 +59,22 @@ export class PayrollReportsController {
   constructor(
     private readonly payrollReportsService: PayrollReportsService,
     @Inject(PRISMA_CLIENT) private readonly scopedPrisma: ExtendedPrismaClient,
+    private readonly salaryStructurePdf: SalaryStructurePdfService,
   ) {}
+
+  // Every active employee's current salary structure in one file (not tied to a payroll run).
+  @Get('salary-structures')
+  async salaryStructures(
+    @Query() query: SalaryStructuresReportQueryDto,
+    @CurrentUser() caller: Caller,
+    @Res() res: Response,
+  ) {
+    const report = await this.salaryStructurePdf.bulkReport(caller.organizationId, query.asOf);
+    await sendReportBranded(res, this.scopedPrisma, caller.organizationId, {
+      ...report,
+      format: query.format ?? 'xlsx',
+    });
+  }
 
   @Get('salary-register')
   async salaryRegister(
